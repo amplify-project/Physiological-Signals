@@ -1,0 +1,113 @@
+@echo off
+title Setup - Concert Engagement AR
+echo ============================================================
+echo  Concert Engagement AR System - First-time Setup
+echo ============================================================
+echo.
+
+cd /d "%~dp0"
+
+REM ---------------------------------------------------------------
+REM Find a compatible Python (3.10, 3.11, or 3.12) via py launcher.
+REM Python 3.13+ is BLOCKED - mediapipe holistic API was removed.
+REM ---------------------------------------------------------------
+set "PYEXE="
+
+py -3.12 --version >nul 2>&1
+if not errorlevel 1 set "PYEXE=py -3.12"
+if defined PYEXE goto :found_python
+
+py -3.11 --version >nul 2>&1
+if not errorlevel 1 set "PYEXE=py -3.11"
+if defined PYEXE goto :found_python
+
+py -3.10 --version >nul 2>&1
+if not errorlevel 1 set "PYEXE=py -3.10"
+if defined PYEXE goto :found_python
+
+echo.
+echo ERROR: No compatible Python found.
+echo.
+echo This system requires Python 3.10, 3.11, or 3.12.
+echo Python 3.13+ is NOT supported (mediapipe incompatible).
+echo.
+echo Install Python 3.12 from:
+echo   https://www.python.org/downloads/release/python-3128/
+echo During install tick "Add Python to PATH" and "tcl/tk and IDLE"
+pause
+exit /b 1
+
+:found_python
+for /f "tokens=*" %%v in ('%PYEXE% --version 2^>^&1') do echo Using: %%v
+echo.
+
+REM Wipe any previous broken venv for a clean install
+if exist .venv (
+    echo Found existing .venv - removing for a clean install...
+    rmdir /s /q .venv
+)
+
+echo [1/5] Creating virtual environment...
+%PYEXE% -m venv .venv
+call .venv\Scripts\activate.bat
+pip install --upgrade pip --quiet
+
+echo.
+echo [2/5] Installing PyTorch 2.6.0 (CUDA 12.4)...
+echo       (must be installed first from the PyTorch index)
+pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+
+echo.
+echo [3/5] Installing remaining dependencies...
+echo       (constraints.txt locks torch so pip cannot downgrade it)
+pip install -r requirements.txt -c constraints.txt --extra-index-url https://download.pytorch.org/whl/cu124
+
+echo.
+echo [4/5] Installing facenet-pytorch (face ID model)...
+echo       (installed separately: its metadata has an outdated torch constraint)
+echo       (the code is runtime-compatible with torch 2.6.0)
+pip install facenet-pytorch==2.6.0 --no-deps
+
+echo.
+echo [5/5] Ensuring face ID weights are available locally...
+if not exist model mkdir model
+if exist model\20180402-114759-vggface2.pt (
+    echo       Face ID weights already present.
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri 'https://github.com/timesler/facenet-pytorch/releases/download/v2.2.9/20180402-114759-vggface2.pt' -OutFile 'model\\20180402-114759-vggface2.pt' } catch { Write-Error $_; exit 1 }"
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Could not download the Face ID weights.
+        echo.
+        echo Download this file manually and place it here:
+        echo   model\20180402-114759-vggface2.pt
+        echo URL:
+        echo   https://github.com/timesler/facenet-pytorch/releases/download/v2.2.9/20180402-114759-vggface2.pt
+        pause
+        exit /b 1
+    )
+)
+
+echo.
+echo ============================================================
+echo  Verifying key package versions...
+echo ============================================================
+pip list | findstr /i "torch torchvision torchaudio facenet ultralytics mediapipe pillow numpy opencv"
+
+echo.
+echo ============================================================
+echo  SETUP COMPLETE
+echo ============================================================
+echo.
+echo NOTE: If you see "facenet-pytorch has requirement torch less than 2.3.0"
+echo       this is a known false alarm. The code is fully compatible with
+echo       torch 2.6.0. Ignore it.
+echo.
+echo Done!
+echo.
+echo  To run the system:
+echo    1_START_REDIS.bat       - start Redis (keep this window open)
+echo    2_START_EMOTIBIT.bat    - start EmotiBit physiological publisher
+echo    3_START_ENGAGEMENT.bat  - start camera + AI engagement inference
+echo.
+pause
