@@ -1,0 +1,31 @@
+# Quick reference for launching 8-GPU DDP training
+
+cd ~/concert_engagement
+
+# Method 1: Use launch script (recommended)
+bash scripts/launch_ddp_v2_8gpus.sh
+
+# Method 2: Direct torchrun command
+source venv/bin/activate
+torchrun --nproc_per_node=8 \
+    scripts/train_action_transformer_ddp_v2.py \
+    --features-dir data/processed/features_kinetics700 \
+    --epochs 100 --batch-size 32 \
+    > logs/training_ddp_v2_8gpus.log 2>&1 &
+
+# Monitor training
+tail -f logs/training_ddp_v2_8gpus.log
+watch -n 1 nvidia-smi
+
+# Check process status
+ps aux | grep train_action_transformer_ddp_v2
+
+# Stop training
+pkill -9 -f train_action_transformer_ddp_v2
+
+# Expected performance
+# - 8 GPUs: ~5-6 hours for 100 epochs
+# - Effective batch size: 256 (32 per GPU × 8)
+# - Backend: Gloo (CPU-based communication)
+# - GPU utilization: 18-25% per GPU (normal with Gloo)
+# - CPU utilization: 100%+ per rank (Gloo uses CPU)

@@ -1,0 +1,48 @@
+flowchart LR
+  classDef redundant fill:#FF6B35,color:#fff,stroke:#CC4400,stroke-width:2px
+
+  subgraph IN[ ]
+    direction TB
+    CAM["📷 Camera"]
+    EMO["📡 EmotiBit ×3"]
+  end
+
+  subgraph VIS["Vision Pipeline"]
+    direction TB
+    CAP["Frame Capture"] --> DET["YOLO11\nDetect + Track"] --> POSE["MediaPipe\nKeypoints"] --> BUF["Per-Person Buffer\n⚠ stale buffers"] --> CLS["Temporal\nTransformer"] --> AGG["Crowd Score\nAggregation"]
+    DET --> FACEID["FaceIdentifier\nMTCNN + InceptionResNet"] --> AGG
+  end
+
+  subgraph PHY["Physio Pipeline"]
+    direction TB
+    UDP["UDP Intake"] --> FILT["EDA / HR Filter"] --> RF["Random Forest\nValence / Arousal"]
+    FILT --> MPLT["🔴 Matplotlib Live Plot\nEDA + HR — duplicate display"]
+    RF --> MPLT
+  end
+
+  REDIS[("Redis\nPub/Sub")]
+
+  subgraph OUT["Outputs"]
+    direction TB
+    GLASSES["🎸 Musician\nAR Glasses"]
+    GUI["🖥 Technician\nOpenCV GUI\nBoxes + Scores + EmotiBit Sidebar"]
+    LOG["🔬 Researcher\nSession Logging\nJSONL + NPZ"]
+  end
+
+  CAM --> CAP
+  EMO --> UDP
+
+  AGG --> REDIS
+  FILT --> REDIS
+  RF --> REDIS
+
+  REDIS --> GLASSES
+  REDIS --> GUI
+
+  CAP --> LOG
+  POSE --> LOG
+  AGG --> LOG
+  RF --> LOG
+
+  class MPLT redundant
+  class BUF redundant

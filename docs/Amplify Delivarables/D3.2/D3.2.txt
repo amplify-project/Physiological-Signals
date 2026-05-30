@@ -1,0 +1,366 @@
+ 
+
+Grant Agreement No.: 101177413
+Call: HORIZON-CL2-2024-HERITAGE-01
+Topic: HORIZON-CL2-2024-HERITAGE-01-03
+Type of action: HORIZON-IA HORIZON Innovation Actions
+
+
+D3.2 Technological components of AMPLIFY PORTABLE
+
+
+Work package	WP3
+Task	T3.1-T3.5
+Due date	31/01/2026
+Submission date	dd/mm/yyyy
+Deliverable lead	TUS
+Version	0.1
+Authors	Ronan Flynn (TUS)
+Reviewers	Name Surname (Partner Y)
+Abstract	The aim of AMPLIFY PORTABLE is to deliver a suite of light tools to assist artists in terms of creation and experiences using audio-visual information and multimodal sensing of the user and context. This deliverable presents the system architecture for AMPLIFY PORTABLE and the methodology followed that helped to define it. A range of inputs to the system, including physiological, behavioural, environmental and context, are captured for artificial intelligence (AI)-processing to support participant engagement and experience creation. Through unimodal and multimodal processing, the AI element of the system uses the inputs to understand the participants in the different use cases. The AI-based decisions are used in the output block to implement and generate the required outputs and functionality, such as graphic music notation, as determined through a user-centred process, facilitating bespoke and personalised phygital social experiences.
+Keywords	Data capture, unimodal and multimodal analysis, artificial intelligence, graphic music notation
+
+Document Revision History
+Version	Date	Description of change	List of contributors
+0.1	12/12/2025	Table of contents	Ronan Flynn (TUS)
+0.2	14/01/2026	Initial chapters	Ronan Flynn (TUS)
+0.3	16/01/2026	Chapters by partners	CWI, SALSA, TUS, VICOM
+0.4	22/01/2026	Full Draft of the deliverable, including all the sections	Ronan Flynn (TUS)
+0.5	25/01/2026	Reviewed	Ronan Flynn (TUS)
+1.0	29/01/2026	Final version of the deliverable 	Ronan Flynn (TUS)
+2.0	31/01/2026	Deliverable ready for submission	Mikel Zorrilla (VICOM)
+
+
+DISCLAIMER
+Co-funded by the European Union. Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or the European Research Executive Agency (REA). Neither the European Union nor the granting authority can be held responsible for them.
+COPYRIGHT NOTICE
+© AMPLIFY Consortium, 2024
+This deliverable contains original unpublished work except where clearly indicated otherwise. Acknowledgement of previously published material and of the work of others has been made through appropriate citation, quotation or both. Reproduction is authorised provided the source is acknowledged.
+ 
+The AMPLIFY Consortium is the following:
+Participant number	Participant 
+organisation name	Short name	Country
+1	FUNDACION CENTRO DE TECNOLOGIAS DE INTERACCION VISUAL Y COMUNICACIONES VICOMTECH	VICOM	Spain
+2	FUNDACIO DEL GRAN TEATRE DEL LICEU	LICEU	Spain
+3	COOPERATIVA PAULO LAMEIRO CRL	CPL	Portugal
+4	TOSCANA PRODUZIONE MUSICA ETS	TPM	Italia
+5	FEISEAN NAN GAIDHEAL	FEI	United Kingdom
+6	STICHTING NEDERLANDSE WETENSCHAPPELIJK ONDERZOEK INSTITUTEN	CWI	Netherlands
+7	TECHNOLOGICAL UNIVERSITY OF THE SHANNON: MIDLANDS MIDWEST	TUS	Ireland
+8	SALSA SOUND LTD	SAL	United Kingdom
+9	NORGES TEKNISK-NATURVITENSKAPELIGE UNIVERSITET	NTNU	Norway
+10	MATARASSO FRANCOIS LOUIS ANDRE	FM	France
+11	EUROPE JAZZ NETWORK	EJN	France
+12	F6S NETWORK IRELAND LIMITED	FS6	Ireland
+13	LAST TOUR CONCERTS SL	LTC	Spain
+14	STICHTING NEDERLANDS INSTITUUT VOORBEELD EN GELUID	NISV	Netherlands
+Executive summary (Ronan)
+Deliverable D3.1 2 presents  the AMPLIFY PORTABLE architecture. AMPLIFY PORTABLE is an AI-driven tool designed to provide video and audio auto-mixing mechanisms along with enhanced understanding and phygital (physical-digital) engagement of artists and audiences through multimodal sensing capabilities and data processing techniques. The AMPLIFY PORTABLE architecture includes several components that provide the necessary functionality to implement the following:
+•	Capture, record, deliver and render audio/video using quality adaptation to address network and device constraints.
+•	Use artificial intelligence (AI) algorithms to process audio/video streams, automate mixing/production and provide novel experiences.
+•	Capture a range of different user, context and environment modalities, including physiological and behavioural based metrics, to understand in an empathic manner the different participants in the AMPLIFY PORTABLE use cases.
+•	Enable artist-to-artist and audience-to-artist interaction, taking care of the orchestration and synchronisation requirements.
+The functionality highlighted above is achieved by the following in the architecture: 
+•	Multimodal data capture: Using cameras, microphones and different sensor types, data is captured from participants in the form of audio, video, movement and physiological inputs.
+•	Processing and AI-based decision making: The captured data is used to detect, for example, crowd sentiment and movement parameters (from video), pitch and temperament (from speech), music analysis (from audio) and engagement (from physiological). 
+•	Output visualisation: Based on the decisions and predictions made by the AI algorithms, a form of music notation, which reflects an individual’s or the audience sentiment, is generated for musicians to respond to. Other visualisations include changing light patterns that reflect levels of engagement or movement.
+•	Audio-video management: Application of tools and techniques to enable the creation of pleasant and coherent phygital experiences for audiences and artists integrated in the spaces where they take place.   
+Table of Contents
+
+1	INTRODUCTION (RONAN)	9
+2	DEVELOPMENT ENVIRONMENT (TOM)	10
+2.1	Folder Structure	10
+2.2	Working Together	10
+3	COMPONENTS STATUS (ALL)	11
+3.1	Babies & Families (CWI/TUS/SAL/VICOM)	13
+3.2	Sound Objects (CWI)	13
+3.3	Musicians (VICOM)	14
+3.4	AI-based Decision Making (SAL/TUS)	14
+3.5	Output Visualisation (TUS)	15
+3.6	Multimodal Media Orchestration and Distribution (VICOM)	15
+3.7	Sound and Vision Mixing (VICOM)	16
+3.8	2D Rendering (VICOM)	16
+3.9	Immersive Audio (SAL)	18
+3.10	Communication Backbone (CWI)	18
+4	MAPPING COMPONENTS TO PILOTS (ALL)	20
+4.1	Pilot 3: Next Stage by TPM (SALSA)	20
+4.2	Pilot 4: Revealing Opera by LICEU (CWI)	20
+5	CONCLUSION (RONAN)	22
+
+
+ 
+LIST OF FIGURES
+FIGURE 1: ARCHITECTURE OF AMPLIFY PORTABLE.	11
+
+
+
+
+LIST OF TABLES
+TABLE 1: BABIES & FAMILIES	13
+TABLE 2: SOUND OBJECTS	13
+TABLE 3: MUSICIANS	14
+TABLE 4: AI-based DECISION MAKING	15
+TABLE 5: OUTPUT VISUALISATION	15
+TABLE 6: MULTIMODAL MEDIA ORCHESTRATION AND DISTRIBUTION	16
+TABLE 7: SOUND AND VISION MIXING	16
+TABLE 8: 2D RENDERING	17
+TABLE 9: IMMERSIVE AUDIO	18
+TABLE 10: COMMUNICATION BACKBONE	19
+TABLE 11: ARCHITECTURE COMPONENTS USED IN PILOT 1	20
+TABLE 12: ARCHITECTURE COMPONENTS USED IN PILOT 2	21
+ABBREVIATIONS
+AI		Artificial Intelligence
+AR		Augmented Reality
+CWI		Stichting Nederlandse Wetenschappelijk Onderzoek Instituten
+CPL		Cooperativa Paulo Lameiro
+FEI		Fèisean nan Gàidheal
+LED		Light Emitting Diode
+Liceu		Gran Teatre del Liceu
+SAL		Salsa Sound Ltd
+TUS		Technological University of the Shannon: Midlands Midwest
+VICOM		Fundacion Centro De Tecnologias De Interaccion Visual Y Comunicaciones Vicomtech
+ 
+1	Introduction (Ronan)
+This deliverable presents the system architecture  for AMPLIFY PORTABLE. The architecture description is presented in two stages, firstly, a high-level overview and block diagram, and secondly, a detailed description of all the different components in the block diagram. How the architecture relates to Pilot 1 (Renewing Tradition) and Pilot 2 (Music for Babies) is also explained.
+The AMPLIFY PORTABLE architecture design followed a human-centred co-design methodology as described in deliverable D2.1, Ethical and Human-Centric Framework. Central to the architecture design process was the involvement of the Pilot 1 and Pilot 2 leaders and key stakeholders Fèisean nan Gàidheal (FEI) and Cooperativa Paulo Lameiro (CPL), respectively. The focus of the architecture design for AMPLIFY PORTABLE was to develop an architecture driven by the stakeholders in both Pilot 1 and Pilot 2, with the emphasis on their user requirements, and not by the technology partners. The result is an adaptable architecture that can benefit cultural and creative industries.
+The rest of this deliverable document is structured as follows. Section 2 describes the methodology and the different stages in the creation of the AMPLIFY PORTABLE architecture. This is followed in Section 3 with the architecture block diagram and a high-level overview. A short description of the individual technological components in the block diagram components are described in detail in Section 4 and this is followed in Section 5 with an explanation of how the architecture components relate to Pilot 1 and Pilot 2. Final conclusions are presented in Section 6.
+
+
+ 
+2	Development Environment (Tom)
+Please provide information about the development environment (and folders) and the way of working, including screenshots (Pablo made up some subsections)
+
+2.1	Folder Structure
+
+2.2	Working Together
+
+
+
+ 
+3	Components Status (All)
+We provide a summary of the developments of PORTABLE and the components; starting with the architecture.
+  
+FIGURE 1: ARCHITECTURE OF AMPLIFY PORTABLE.
+ 
+Following is a brief overview of the different blocks presented in Figure 1:
+•	Musicians: Pilot 1 multimodal data capture, audio/video, (Renewing Tradition).
+•	Babies & Families: Pilot 2 multimodal data capture, audio/video/sensors, (Music for Babies).
+•	AI-based Decision Making: Unimodal and multimodal analysis to detect, participant’s emotion, crowd sentiment and movement parameters (from video), pitch and temperament (from speech) and music analysis (from audio).
+•	Output Visualisation: For example, graphic music notation, to reflect an individual’s or the audience’s sentiment, and LED patterns to reflect level of engagement or connectedness.
+•	Immersive Audio: Using MIXaiR™   to facilitate the automatic creation of immersive listening experiences using standard microphone setups.
+•	Media Stage - Multimodal Media Orchestration and Distribution: Orchestration of complementary information with the audio and video, distribution of the media based on context. This component is built on top of the open-source An example of a platform that supports such functionality is LiveKit  framework .
+•	Sound and Vision Mixing: Content analysis, segmentation and mixing techniques to enable the creation of pleasant and coherent phygital experiences for audiences and artists integrated in the spaces where they take place. 
+•	2D Rendering: Live video capture and rendering suitable for a home, rehearsal room or small theatre with a limited number of cameras
+Although not explicitly shown in Figure 1, the real-time transfer of data between the different blocks is implemented through the use of a Communications Backbone. Details on this block, together with the details of the blocks in Figure 1, are presented in the following sections.
+ 
+3.1	Babies & Families (CWI/TUS/SAL/VICOM)
+COMPONENT NAME	BABIES & FAMILIES
+Responsible partner(s)	CWI, TUS, SAL, VICOM
+Use cases	CPL
+Description	Capturing audio, video, movement and physiological data from babies and their parents/guardians. Cameras, microphones, smart mattresses, wearable sensors and sound objects are all deployed in a non-intrusive fashion so as not to distract from the performance.
+
+TUS Contribution - Audience Pose Engagement Analysis:
+The TUS contribution to Babies & Families focuses on real-time video-based engagement estimation of audience members (parents/guardians and families). The system processes live video feeds to extract anonymised skeletal keypoint data and classify engagement behaviours.
+
+Data Collected:
+• Video Data: Live RGB video frames (720p/1080p) from venue cameras - processed in real-time and NOT stored
+• Skeletal Keypoints: 543 anonymised 3D coordinates per person extracted via MediaPipe Holistic:
+  - Body Pose: 33 keypoints (shoulders, elbows, wrists, hips, knees, ankles)
+  - Facial Landmarks: 468 geometric points (head orientation, NOT facial recognition)
+  - Hand Landmarks: 42 points (gesture detection, e.g., clapping)
+• Temporal Sequences: 64-frame windows (~2 seconds) for motion pattern analysis
+
+Privacy by Design:
+• Raw video frames are discarded immediately after keypoint extraction
+• No facial images, biometric templates, or identifiable features are retained
+• Keypoint data cannot be reverse-engineered to reconstruct identities
+• Session-only tracking IDs reset when system restarts
+• On-premises processing only - no cloud transmission required
+
+[INSERT FIGURE: Binary Engagement Classification Pipeline - from Amplify_Portable_AudiencePose document Figure 2]
+
+Status	Complete. The Audience Pose system has been developed, trained, and validated with 82.75% accuracy on the Kinetics-700 dataset (43,981 training samples). The system was deployed and tested during Pilot 0 activities. Real-time multi-person tracking supports up to ~20 simultaneous participants per camera feed.
+Licence	MIT License (TUS components). Dependent libraries: PyTorch (BSD), MediaPipe (Apache 2.0), YOLOv8 (AGPL-3.0), OpenCV (Apache 2.0).
+TABLE 1: BABIES & FAMILIES
+3.2	Sound Objects (CWI)
+COMPONENT NAME	SOUND OBJECTS
+Responsible partner(s)	CWI
+Use cases	CPL
+Description	The sound objects fall under Babies & Families. For example, a sound object could be a single-stringed musical instrument. These basic hardware objects are designed for the children to play with during specific points in the Music for Babies performance. The sound objects are equipped with a variety of sensors that transform physical interactions with the object (plucking the object’s string, striking the object) into data that is wirelessly fed into the communication backbone and made available to other components in the architecture, such as LED strips sewn into the costumes of the concert performers.
+Status	
+Licence	
+TABLE 2: SOUND OBJECTS
+ 
+
+3.3	Musicians (VICOM)
+COMPONENT NAME	MUSICIANS
+Responsible partner(s)	VICOM
+Use cases	FEI
+Description	CAPTURING VIDEO AND AUDIO DATA FROM STUDENTS AND TUTORS IN AN ONLINE MUSIC CLASS USING VIDEO CAMERAS AND MICROPHONES. EACH STUDENT AND TUTOR WILL HAVE AT LEAST ONE CAMERA AND ONE MICROPHONE.
+Status	
+Licence	
+TABLE 3: MUSICIANS
+3.4	AI-based Decision Making (SAL/TUS)
+COMPONENT NAME	AI-based DECISION MAKING
+Responsible partner(s)	SAL, TUS
+Use cases	CPL, FEI
+Description	AI algorithms process the different input streams individually (unimodal) and in different combinations (multimodal) to make classifications and predictions based on data gathered from the Babies & Families and Musicians blocks.
+For the children and parents/guardians participating in a concert performance, facial images captured from video can be used to classify/predict emotion of individuals and the overall sentiment of the audience. Crowd parameters such as movement, engagement can also be characterised from audio and video. Physiological signals can be used to predict levels of comfort and explore correlations between the reactions of babies and guardians, and movement and music tempo.
+For the musicians in an online music lesson, both the audio coming from the microphones and the video coming from the cameras is analysed. The position and movement of the fingers on the musical instrument and the body position and posture can be analysed, which can be used by the tutor to provide feedback to the student. Also, a comparison can be made between the student’s playing of a piece and the tutor’s playing of the same piece to check accuracy of tempo etc.
+
+TUS Contribution - Binary Engagement Classification System:
+
+The TUS AI-based decision making component implements a four-stage processing pipeline for real-time audience engagement classification:
+
+Stage 1: Person Detection
+• Technology: YOLOv8n (Ultralytics)
+• Purpose: Detect bounding boxes around each person in video frame
+• Output: Bounding box coordinates (x, y, width, height) per person
+• Multi-person: Supports up to ~20 simultaneous detections with persistent tracking IDs
+
+Stage 2: Pose Estimation
+• Technology: MediaPipe Holistic (Google)
+• Purpose: Extract 543 skeletal keypoints from each detected person
+• Output: Normalised 3D coordinates (x, y, z) for body, face, and hand landmarks
+• Anonymisation: Original pixel data discarded - only geometric skeleton retained
+
+Stage 3: Temporal Engagement Classification
+• Technology: Temporal Transformer Neural Network (custom architecture)
+• Architecture: 4-layer Transformer encoder with 8 attention heads, 256 dimensions, dropout 0.3
+• Input: 64-frame sequence of 543 keypoints per person (temporal buffer ~2 seconds)
+• Output: Binary engagement probability score (0.0 = disengaged, 1.0 = engaged)
+• Training: Kinetics-700 public dataset, 43,981 videos, 54 action classes mapped to binary
+• Validation Accuracy: 82.75% (best at epoch 38/50)
+• Training Infrastructure: 12× Tesla T4 GPUs, 50 epochs, ~42 seconds/epoch
+
+Stage 4: Aggregation and Streaming
+• Technology: Redis (in-memory data store)
+• Processing: Calculates mean engagement score across all detected persons
+• Output: Single crowd-average engagement score (0.0-1.0)
+• Transmission: Published to Redis pub/sub channel at 1 Hz (1 message/second)
+• Latency: <2 seconds end-to-end from video capture to score output
+
+[INSERT FIGURE: Binary Engagement Classification Pipeline - from Amplify_Portable_AudiencePose document Figure 2]
+
+Engaged Behaviour Recognition (42 classes):
+• Applause & Clapping: applauding, clapping
+• Dancing: 16 styles including breakdancing, salsa, tango, country line dancing
+• Cheering: cheerleading, headbanging, crowd surfing
+• Singing: singing along to performance
+• Playing Instruments: 13 instruments (guitar, drums, piano, violin, etc.)
+• Attentive Behaviours: staring at stage/performers, gazing
+
+Disengaged Behaviour Recognition (12 classes):
+• Phone Distraction: texting, talking on phone, checking phone
+• Passive Behaviours: yawning, sleeping, reading
+• Negative Body Language: frowning, rolling eyes, shaking head
+• Checking Time: looking at watch, impatience
+
+[INSERT FIGURE: Example of Engaged Detection - Green overlay with high score - from Amplify_Portable_AudiencePose document Figure 3]
+
+[INSERT FIGURE: Example of Disengaged Detection - Red overlay with low score - from Amplify_Portable_AudiencePose document Figure 4]
+
+Software Stack:
+• Programming Language: Python 3.11
+• Deep Learning Framework: PyTorch 2.7.1 (CUDA 11.8)
+• Computer Vision: OpenCV 4.11.0.86
+• Person Detection: YOLOv8 (Ultralytics) 8.3.229
+• Pose Estimation: MediaPipe Holistic (Google) 0.10.21
+• Data Streaming: Redis 7.0.1
+• GPU Acceleration: NVIDIA CUDA Toolkit 11.8+
+
+Status	Complete. The Binary Engagement Classification system has been developed, trained to 82.75% validation accuracy, and deployed for Pilot 0. The system operates in real-time on consumer GPU hardware (e.g., RTX 3080 Ti) or with reduced performance on CPU. Integration with AR applications via Redis pub/sub has been validated. Source code available at: https://github.com/amplify-project/Audience-Pose
+Licence	MIT License (TUS components). Dependent libraries: PyTorch (BSD), MediaPipe (Apache 2.0), YOLOv8 (AGPL-3.0), OpenCV (Apache 2.0), Redis (BSD).
+TABLE 4: AI-based DECISION MAKING
+3.5	Output Visualisation (TUS)
+COMPONENT NAME	OUTPUT VISUALISATION
+Responsible partner(s)	TUS
+Use cases	CPL, FEI
+Description	Visualisations that are specific to the requirements of the two use cases, Renewing Tradition and Music for babies, are presented. For example, in the case of Music for Babies, the requirement is that graphic music notation based on the emotion classification/prediction of individual participants, or the overall sentiment of the audience, is presented to the concert musicians. This notation, based on those present at a performance, inspires the musicians in the improvisation of what they are playing. In the case of Renewing Tradition, posture and instrument positioning are examples of outputs that might be used by a tutor to guide students.
+Status	
+Licence	
+TABLE 5: OUTPUT VISUALISATION
+3.6	Media Stage - Multimodal Media Orchestration and Distribution (VICOM)
+COMPONENT NAME	MEDIA STAGE - MULTIMODAL MEDIA ORCHESTRATION AND DISTRIBUTION
+Responsible partner(s)	VICOM
+Use cases	CPL, FEI
+Description	THIS MODULE WILL HAVE HAS SEVERAL INPUTS. ON THE ONE HAND, THE AUDIO AND VIDEO COMING, AND ON THE OTHER HAND, THE AI-BASED DECISION-MAKING OUTPUT. WITH ALL THIS INFORMATION, THIS BLOCK WILL FIRST PROVIDE THE MEDIA ORCHESTRATION, THANKS TO AN ORCHESTRATION ENGINE BASED ON LIVEKIT, AND WILL SECONDLY DISTRIBUTE THE MEDIA CONTENT ACCORDING TO THE CONTEXT. THE MEDIA DISTRIBUTION USES THE WILL BE BASED ON WEBRTC PROTOCOLS UNDER THE LIVEKIT FRAMEWORK.  FURTHERMORE, IT AND WILL USES THE DATA CHANNEL TO ADD COMPLEMENTARY INFORMATION TO BE ORCHESTRATE ORCHESTRATED TOGETHER WITH THE AUDIO AND THE VIDEO IN THE BEST WAY ACCORDING TO THE CONTEXT OF THE DIFFERENT PARTICIPANTS..
+Status	A COMPLETE VERSION OF THIS MODULE IS DEVELOPED AND BEING USED IN THE INTENSIVE PILOTING ACTIVITIES DURING JANUARY AND FEBRUARY 2026 IN PILOT 1 (FEI).
+Licence	UNDER DISCUSSION, BUT ESTIMATING A GPLV3 OPEN-SOURCE LICENSE. LiveKit has an Apache License Version 2.0. 
+TABLE 6: MEDIA STAGE - MULTIMODAL MEDIA ORCHESTRATION AND DISTRIBUTION
+3.7	Sound and Vision Mixing (VICOM)
+COMPONENT NAME	SOUND AND VISION MIXING
+Responsible partner(s)	VICOM
+Use cases	FEI
+Description	THIS COMPONENT IMPLEMENTS THE SOUND AND IMAGE MIXING, COMBINING MULTIPLE VIDEO AND AUDIO ELEMENTS TO ENHANCE PARTICIPANT EXPERIENCE. FOR INSTANCE, THE COMPONENT CAN SEGMENT MUSICIANS FROM DIFFERENT VIDEOS AND CREATE A VIEW WHERE ALL THE MUSICIANS ARE IN THE SAME SPACE FOR A REMOTE PARTICIPANT. EQUALLY, DIFFERENT AUDIO SOURCES CAN BE MIXED DIFFERENTLY FOR EACH PARTICIPANT.
+Status	CPL, FEITHIS MODULE IS IMPLEMENTED AS AN INITIAL VERSION, ALTHOUGH ALL THE PERSONALISED AND INTELLIGENT MIXING WILL BE FURTHER IMPLEMENTED IN THE FOLLOWING releases.
+Licence	Under discussion, but estimating a GPLv3 open-source license. 
+TABLE 7: SOUND AND VISION MIXING
+3.8	2D Rendering (VICOM)
+COMPONENT NAME	2D RENDERING
+Responsible partner(s)	VICOM
+Use cases	FEI
+Description	THIS COMPONENT ENABLES A WEB BROWSER TO RENDER THE VISUAL AND AUDIO PARTS, WITH THE OUTPUT OF THE SOUND AND VISION MIXING COMPONENT, INCLUDING VIDEO COMPOSITIONS, AUDIO MIXING AND OTHER KIND OF INFORMATION (SUCH AS MUSICAL NOTATION, NOTATION FOR A TEACHER, ETC.).
+Status	A complete version of this module is developed and being used in the intensive piloting activities during January and February 2026 in Pilot 1 (FEI).
+Licence	Under discussion, but estimating a GPLv3 open-source license. LiveKit has an Apache License Version 2.0. 
+TABLE 8: 2D RENDERING
+ 
+3.9	Immersive Audio (SAL)
+COMPONENT NAME	IMMERSIVE AUDIO
+Responsible partner(s)	SAL
+Use cases	FEI
+Description	This component uses a variety of microphones (spatial and point source) to capture all the salient audio sources in the space in an object-based manner such that the rendering can easily be adapted/mixed to meet specific listener requirements. The capture will include recording of the instrumentalists, the infants, and the parents and will also include an immersive capture of the background/ambience of the environment.
+Status	
+Licence	
+TABLE 9: IMMERSIVE AUDIO
+3.10	Communication Backbone (CWI)
+COMPONENT NAME	COMMUNICATION BACKBONE
+Responsible partner(s)	CWI
+Use cases	CPL, FEI
+Description	The communication backbone is responsible for relaying real-time data between components of the system in a non-blocking and performant manner. In essence, this takes the shape of a centralised publish-subscribe service, where data-producers (e.g. sound objects, data processing algorithms) publish real-time data to different channels and interested data-consumers (e.g. output devices) can subscribe to these channels to receive continuous updates. The consumers can make use of the data themselves (e.g. change the colour or intensity of an LED strip) or take in the data to further process it and submit it to different channels (e.g. an emotion recognition algorithm which takes in image frames and send out timestamped JSON messages with emotion labels).
+There is no direct point-to-point communication between producers and consumers of data. Instead, all communication happens in an asynchronous manner through publish-subscribe channels. This has the advantage of making all components in the system completely independent from one another. There should, however, be a method for service discovery, such that a new device joining the network can locate the central data relay and the type of communication channels that it supports.
+Status	
+Licence	.
+TABLE 10: COMMUNICATION BACKBONE
+
+
+ 
+4	Mapping Components to Pilots (All)
+The following sections summarise which of the components described in Section 4 apply to the two AMPLIFY PORTABLE pilots, Renewing Tradition and Music for Babies.
+4.1	Pilot 1 Renewing Tradition (VICOM)
+COMPONENTS	COMMENT
+Musicians	AUDIO AND VIDEO DATA CAPTURE.
+AI-based Decision Making	ALGORITHMS TAILORED TO THE PILOT REQUIREMENTS. AT THE MOMENT, INCLUDING HAND TRACKING FOR VIDEO ZOOMING.
+Output visualisation	PILOT DEPENDENT. EXAMPLES MIGHT INCLUDE MUSICIAN POSTURE AND HAND POSITIONS ON INSTRUMENTS. DYNAMIC ORCHESTRATION MECHANISMS ARE BEING DESIGNED TO BE INCLUDED IN FUTURE RELEASES.
+Immersive Audio	AUDIO FORMAT TAILORED TO THE PILOT REQUIREMENTS.
+Multimodal Media Orchestration and Distribution	TAILORED TO THE PILOT REQUIREMENTS.
+Sound and Vision Mixing	TAILORED TO THE PILOT REQUIREMENTS.
+2D Rendering	TAILORED TO THE PILOT REQUIREMENTS.
+Communication Backbone	TAILORED TO THE PILOT REQUIREMENTS.
+TABLE 11: ARCHITECTURE COMPONENTS USED IN PILOT 1
+ 
+4.2	Pilot 2 Music for Babies (TUS)
+COMPONENTS	COMMENT
+Babies & Families	Audio, video and sensor data capture.
+Sound Objects	A form of toy or object that the children in Babies & Family component interact with.
+AI-based Decision Making	Algorithms tailored to the pilot requirements.
+Output visualisation	Pilot dependent. Examples might include graphic music notation and changing LED patterns on costumes.
+Immersive Audio	Audio format tailored to pilot requirements.
+Multimodal Media Orchestration and Distribution	Tailored to the pilot requirements.
+Sound and Vision Mixing	Tailored to the pilot requirements.
+2D Rendering	Tailored to the pilot requirements.
+Communication Backbone	Tailored to the pilot requirements.
+TABLE 12: ARCHITECTURE COMPONENTS USED IN PILOT 2
+ 
+
+4.3	Future Directions: 360° Camera Support (TUS)
+
+The TUS AudiencePose system is designed for extensibility and continued development. A key area of future work is support for 360° camera inputs, which would enable comprehensive audience coverage from a single camera position—particularly valuable in immersive performance environments.
+
+The current pipeline (YOLOv8 person detection, MediaPipe pose estimation) is trained on standard perspective imagery. To accommodate 360° equirectangular video, the planned approach is "virtual camera extraction": programmatically extracting multiple perspective views (e.g., front, left, right, rear) from the 360° feed, processing each view through the existing pipeline, and aggregating the engagement scores across all extracted views.
+
+This approach leverages existing trained models without retraining, maintains real-time performance through parallel view processing, and provides a natural path to full-venue audience analysis. Implementation is estimated at 1-2 weeks of development effort using established libraries such as py360convert or OpenCV's equirectangular projection tools.
+5	Conclusion (Ronan)
+This deliverable presents the architecture for AMPLIFY PORTABLE, which is designed to meet the requirements of Pilot 1 and Pilot 2, Renewing Tradition and Music for Babies, respectively. The architecture is designed around a series of component blocks that are common to both pilots; the component blocks can be easily adapted to meet the specific requirements of each pilot. The architecture represents a solid foundation in the ongoing development of AMPLIFY PORTABLE.
+The development and implementation of the AMPLIFY PORTABLE architecture will proceed over the coming months. The lessons learned from Pilot 0 by all parties involved played an important part in the successful development of the architecture presented in this document, they will continue to do so as the AMPLIFY project evolves.
+

@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Data files (too large for GitHub)
+data/raw/
+data/processed/features_*/
+data/sessions/*.jsonl
+data/sessions/*_summary.json
+data/sessions/20*_*/
+*.npy
+*.avi
+*.mp4
+
+# Model checkpoints (managed by Git LFS)
+# *.pth and *.pt now tracked by Git LFS - see .gitattributes
+models/*.h5
+models/*.pkl
+
+# Results and logs
+results/
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SSH keys
+Enter
+Enter.pub
+
+# Environment variables
+.env
+.env.local
+
+# Colleague repo clone (reference only, not submodule)
+sowmya/
+
+# Camera cache
+.last_camera
+
+# Face enrollment embeddings (user-specific, contains biometric data)
+.face_enrollments/
+
+# EmotiBit session recordings (runtime data)
+emotibit_recordings/
+
+# Handover package (self-contained export, not part of main repo)
+handover_ar/
+
+# Handover docs at root (copies for laptop testing)
+KNOWN_ISSUES.md
+README_HANDOVER.md

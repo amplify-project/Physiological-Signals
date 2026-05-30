@@ -1,0 +1,165 @@
+Data Collection and Processing Technologies
+Audience Pose - Concert Engagement Analysis System
+Document Date: November 26, 2025
+1. System Overview
+The Audience Pose system processes video data to estimate audience engagement during live performances. This document details all technologies, data types, and processing methods used for data protection compliance purposes.
+2. Data Collected from Audience Members
+2.1 Video Data (Raw Input)
+Source: Live video feed from cameras capturing audience area
+Format: RGB video frames (typically 720p or 1080p resolution)
+Collection: Real-time streaming from venue cameras
+Retention: Raw video is NOT stored - processed in real-time and discarded
+2.2 Derived Skeletal Keypoint Data (Anonymised)
+The system extracts the following anonymised skeletal keypoint coordinates:
+
+Body Pose Key points: 33 points (MediaPipe Holistic)
+  • Examples: nose, shoulders, elbows, wrists, hips, knees, ankles
+  • 3D coordinates (x, y, z) per key point
+  • Total: 33 keypoints × 3 coordinates = 99 values
+
+Facial Landmarks: 468 points (MediaPipe Face Mesh)
+  • Captures facial geometry for head orientation and expression
+  • 3D coordinates (x, y, z) per landmark
+  • Total: 468 landmarks × 3 coordinates = 1,404 values
+  • NOTE: These are geometric points, NOT facial images or identifiable features
+
+Hand Landmarks: 21 points per hand × 2 hands = 42 points
+  • Captures hand gestures (e.g., clapping, waving)
+  • 3D coordinates (x, y, z) per landmark
+  • Total: 42 landmarks × 3 coordinates = 126 values
+
+TOTAL KEYPOINTS PER PERSON: 543 spatial coordinates (3D points in camera space)
+2.3 Temporal Sequence Data
+Processing Window: 300 consecutive video frames (~10 seconds at 30 FPS)
+Purpose: Analyse motion patterns over time to classify engagement behaviours
+Total Data Points: 543 key points × 3 coordinates × 300 frames = 488,700 values per person per inference (up to 20 people)
+3. Data Processing Pipeline
+ 
+Figure 2: Binary Engagement Classification Pipeline
+3.1 Stage 1: Person Detection
+Technology	YOLOv8n (Ultralytics)
+Purpose	Detect bounding boxes around each person in video frame
+Output	Bounding box coordinates (x, y, width, height) per person
+Data Privacy	No facial recognition - only spatial location of persons
+
+3.2 Stage 2: Pose Estimation
+Technology	MediaPipe Holistic (Google)
+Purpose	Extract 543 skeletal keypoints from each detected person
+Processing	Runs on each person's bounding box independently
+Output	Normalised 3D coordinates (x, y, z) for 543 keypoints
+Anonymisation	Original pixel data is discarded - only geometric skeleton retained
+3.3 Stage 3: Engagement Classification
+Technology	Temporal Transformer Neural Network
+Architecture	4-layer Transformer (8 attention heads, 256 dimensions)
+Input	64-frame sequence of 543 keypoints (104,256 values)
+Output	Binary engagement score: 0.0-1.0 (disengaged to engaged)
+Training Data	Kinetics-700 public dataset (43,981 videos, 54 action classes)
+Accuracy	82.75% validation accuracy
+3.4 Stage 4: Aggregation and Streaming
+Technology	Redis (In-Memory Data Store)
+Multi-Person Detection	System processes up to ~20 people simultaneously per camera feed
+Processing	Calculates mean (average) engagement score across all detected persons
+Output	Single crowd-average engagement score (0.0-1.0)
+Transmission	Published to Redis channel at 1 Hz (1 message/second)
+
+ 
+3.5 Visual Output Examples
+ 
+Figure 3: Example of Engaged Detection (Green overlay, high score)
+
+ 
+Figure 4: Example of Disengaged Detection (Red overlay, low score)
+Note: The system displays color-coded bounding boxes and engagement scores in real-time. Green indicates engaged behaviour, red indicates disengaged behaviour. The visual overlay is for operator monitoring only and is not stored.
+4. Technologies and Platforms
+4.1 Software Stack
+Component	Technology	Version/Details
+Programming Language	Python	3.11
+Deep Learning Framework	PyTorch	2.7.1 (CUDA 11.8)
+Computer Vision	OpenCV	4.11.0.86
+Person Detection	YOLOv8 (Ultralytics)	8.3.229
+Pose Estimation	MediaPipe Holistic (Google)	0.10.21
+Data Streaming	Redis	7.0.1
+Numerical Computing	NumPy	1.26.4
+Video Processing	FFmpeg	Latest
+GPU Acceleration	CUDA Toolkit	11.8+
+Operating System	Windows 11 / Linux	Cross-platform
+4.2 Hardware Requirements
+Component	Specification
+GPU (Recommended)	NVIDIA with CUDA 11.8+ (e.g., RTX 3080 Ti, Tesla T4)
+RAM	16GB minimum (8GB absolute minimum)
+Camera	720p or higher resolution (1080p recommended)
+CPU Fallback	System can run on CPU only (reduced performance)
+5. Data Privacy and Protection Measures
+5.1 Anonymisation
+• Raw video frames are NOT stored - processed in real-time and immediately discarded
+• Only skeletal keypoint coordinates are extracted (geometric points in space)
+• No facial images, biometric templates, or identifiable features are retained
+• Keypoint data cannot be reverse-engineered to reconstruct faces or identities
+5.2 Data Minimisation
+• System only extracts skeletal geometry necessary for engagement analysis
+• No audio recording
+• No persistent tracking of individuals across sessions
+• Tracking IDs are session-only and reset when system restarts
+5.3 Data Retention
+• Raw Video: NOT stored (real-time processing only)
+• Skeletal Keypoints: Retained in memory for 2 seconds (64 frames), then discarded
+• Engagement Scores: Published to Redis (ephemeral, no persistent storage by default)
+• Logs: System logs contain no personal data - only technical metrics (FPS, errors)
+5.4 Data Flow Summary
+1. Camera → Video Frame (RGB image)
+2. Video Frame → YOLOv8 → Bounding Boxes (spatial coordinates)
+3. Bounding Boxes → MediaPipe → Skeletal Keypoints (543 × 3 coordinates)
+4. Keypoints → Transformer Model → Engagement Score (0.0-1.0)
+5. Engagement Scores → Redis → AR Application
+6. All intermediate data discarded after processing
+6. Engagement Behaviour Classifications
+6.1 Engaged Behaviours (42 classes)
+The system recognises these behaviours as 'engaged':
+
+• Applause & Clapping: applauding, clapping
+• Dancing: 16 dance styles (breakdancing, salsa, tango, etc.)
+• Cheering: cheerleading, headbanging, crowd surfing
+• Singing: singing along
+• Playing Instruments: 13 instruments (guitar, drums, piano, etc.)
+• Drinking/Socialising: drinking, toasting, opening bottles
+• Attentive: staring at stage/performers
+6.2 Disengaged Behaviours (12 classes)
+The system recognises these behaviours as 'disengaged':
+
+• Phone Distraction: texting, talking on phone, checking phone
+• Passive: yawning, sleeping, reading
+• Negative Body Language: frowning, rolling eyes, shaking head
+• Checking Time: looking at watch, impatience
+7. Training Dataset
+Dataset	Kinetics-700 (Public Dataset)
+Source	YouTube videos (Creative Commons / Public Domain)
+Training Samples	43,981 videos
+Classes Used	54 action classes → 2 binary (engaged/disengaged)
+Training Infrastructure	12× Tesla T4 GPUs, 50 epochs (~35 minutes total)
+Validation Accuracy	82.75%
+8. Deployment Architecture
+Location: On-premises processing at venue (no cloud transmission)
+Network: Local network only - no internet connectivity required
+Real-Time: Processing occurs in real-time with <2 second latency
+Output: Engagement scores published to local Redis server (localhost:6379)
+AR Integration: Unity application subscribes to Redis channel for visualisation
+9. Future Model Improvement Considerations
+9.1 Potential Feedback Learning (Not Currently Implemented)
+Current Status: The system currently operates using a pre-trained model only. No audience data is retained for retraining.
+
+Future Possibility: A future version may include optional feedback learning, where anonymised skeletal keypoint data from real audience sessions could be used to fine-tune the model for specific venue contexts. This would improve accuracy for the particular characteristics of a given audience.
+
+If implemented, this would require:
+• Explicit consent from audience members for data retention
+• Clear opt-in mechanisms with the ability to withdraw consent
+• Defined retention periods for training data
+• Transparent communication about how data would be used
+• Continued anonymisation safeguards (no raw video, only keypoint coordinates)
+• Compliance with GDPR and relevant data protection regulations
+
+Important: This feedback learning capability is NOT currently active. The present system discards all keypoint data after real-time processing and does not retain any audience information for model training.
+
+
+Document prepared for data protection compliance purposes
+Project: Amplify Portable - Audience Pose (GitHub: amplify-project/AudiencePose)
+Generated: 2025-11-26 15:28:46

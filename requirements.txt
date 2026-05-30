@@ -1,0 +1,63 @@
+# =============================================================================
+# Concert Engagement Analysis - Requirements
+# =============================================================================
+# 
+# IMPORTANT: PyTorch with CUDA must be installed FIRST before other packages.
+# Use the setup script (setup.ps1 or setup.sh) for automated installation.
+#
+# MANUAL INSTALLATION:
+# --------------------
+# 1. Create and activate virtual environment:
+#    python -m venv .venv
+#    .venv\Scripts\activate       (Windows)
+#    source .venv/bin/activate    (Mac/Linux)
+#
+# 2. Install PyTorch with GPU support:
+#    - NVIDIA GPU (Windows/Linux):
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#    - Apple Silicon (macOS):
+#      pip install torch torchvision torchaudio
+#    - CPU only:
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+# 3. Install remaining dependencies:
+#    pip install -r requirements.txt
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Computer Vision & Pose Estimation
+# -----------------------------------------------------------------------------
+opencv-contrib-python>=4.8.0  # mediapipe needs contrib; do NOT install opencv-python alongside
+mediapipe>=0.10.0,<0.10.15    # 0.10.15+ removed mp.solutions.holistic API
+ultralytics>=8.3.0          # YOLO26 for person detection (end-to-end, NMS-free)
+lap>=0.5.12                 # Required by ultralytics tracker (not auto-installed in venvs)
+py360convert>=0.1.0         # 360° equirectangular to perspective conversion
+
+# -----------------------------------------------------------------------------
+# Numerical Computing
+# -----------------------------------------------------------------------------
+numpy>=1.24.0
+scipy>=1.10.0,<1.17.0       # Required by ultralytics
+
+# -----------------------------------------------------------------------------
+# Visualization (required by mediapipe)
+# -----------------------------------------------------------------------------
+matplotlib>=3.7.0,<3.11.0
+
+# -----------------------------------------------------------------------------
+# Configuration & Utilities
+# -----------------------------------------------------------------------------
+pyyaml>=6.0.0
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+
+# -----------------------------------------------------------------------------
+# Face Identification
+# -----------------------------------------------------------------------------
+# facenet-pytorch declares an outdated torch dependency, so setup.ps1/setup.sh
+# install it separately with --no-deps after PyTorch has been installed.
+
+# -----------------------------------------------------------------------------
+# Redis (for engagement score streaming)
+# -----------------------------------------------------------------------------
+redis>=5.0.0
