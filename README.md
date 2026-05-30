@@ -4,6 +4,21 @@ Real-time audience engagement estimation for live performances using pose-based 
 
 ---
 
+## Current Working Repository
+
+This repository is now the shared source of truth for the concert engagement system.
+
+Work should proceed from Sowmya's `amplify-project/Physiological-Signals` remote rather than the earlier standalone Audience Pose / local `concert_engagement` repository. The previously independent parts of the pipeline have been ported into this project so development can continue from one combined codebase:
+
+- Computer-vision engagement inference, multi-person tracking, face registration, 360-video support, logging, analysis, and training utilities are now in the project-level `scripts/`, `src/`, `models/`, and `docs/` folders.
+- Sowmya's newer EmotiBit physiological pipeline is now the project-level Physio implementation in `physio/multiemotibit_UDP_SD_RFv2.py`.
+- The multiperson GUI consumes the new physiological standard-deviation stream (`eda_sd` and `hr_sd`) from `device:{serial}:physio_metrics`.
+- `Handover_JuneSession/` remains as the up-to-date handover package and reference copy for the demo-ready workflow.
+
+In short: clone and work from this repository for future changes to either the vision or physiological parts of the pipeline.
+
+---
+
 ## 🚀 Quick Start
 
 ### Automated Setup (Recommended)
