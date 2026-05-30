@@ -15,8 +15,8 @@
 ## 3. Valence/Arousal values exceeding 0–2 range (e.g. 7.40, 8.39)
 
 **Status:** Fixed  
-**Cause:** `predict_proba()` on the Random Forest models (`rf_valence_full.pkl`, `rf_arousal_full.pkl`) returned raw leaf-node frequency counts that did **not** sum to 1.0 (e.g. `[1.84, 1.795, 2.515]`, sum = 6.15). The dot product `np.dot(proba, [0, 1, 2])` then produced values well above 2.  
-**Fix:** Added normalization before the dot product in `multiemotibit_redis_MAC.py`:
+**Cause:** The legacy Random Forest models (`rf_valence_full.pkl`, `rf_arousal_full.pkl`) returned raw leaf-node frequency counts that did **not** sum to 1.0 (e.g. `[1.84, 1.795, 2.515]`, sum = 6.15). The dot product `np.dot(proba, [0, 1, 2])` then produced values well above 2.  
+**Fix:** Added normalization before the dot product in the legacy Physio script. The active pipeline is now `multiemotibit_UDP_SD_RFv2.py` with `rf_valence_full_v2.pkl` and `rf_arousal_full_v2.pkl`:
 ```python
 val_proba = val_proba / val_proba.sum()
 aro_proba = aro_proba / aro_proba.sum()

@@ -399,11 +399,11 @@ Face identification is currently **disabled in 360° mode** (`not is_360` guard 
 - [ ] Implement 360° face registration using per-view perspective crops
 - [ ] Test with actual 360° hardware
 
-**Integration with EmotiBit Physiological Sensors:** ✅ Implemented (April 2026)
-- ✅ `physio/emotibit_publisher.py` — direct UDP EmotiBit discovery, no LSL or Oscilloscope dependency
-- ✅ Filtered EDA (1 Hz lowpass) and HR (0.5 Hz lowpass) streamed to Redis at 1 Hz per device
-- ✅ Random Forest continuous valence/arousal predictions from EDA + HR features
-- ✅ Sidebar panel (280px, hstacked): per-participant EDA spline with auto-scaling y-axis + HR readout
+**Integration with EmotiBit Physiological Sensors:** ✅ Implemented (April 2026; SD/RF v2 update May 2026)
+- ✅ `physio/multiemotibit_UDP_SD_RFv2.py` — direct UDP EmotiBit discovery, no LSL or Oscilloscope dependency
+- ✅ EDA/HR-derived standard-deviation metrics streamed to Redis at 1 Hz per device on `device:{serial}:physio_metrics`
+- ✅ Random Forest continuous valence/arousal predictions from EDA + HR features using the v2 RF models
+- ✅ Sidebar panel (280px, hstacked): per-participant `EDA SD` and `HR SD` readouts from the SD metrics stream
 - ✅ Up to 6 EmotiBit devices simultaneously — dynamic compact row heights
 - ✅ R key opens picklist of detected-but-unassigned serials; serial becomes persistent participant label
 - ✅ Mouse click on sidebar row sets focus_target; magenta bounding box appears on focused participant only

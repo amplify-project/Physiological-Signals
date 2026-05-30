@@ -246,7 +246,7 @@ python scripts/inference/console_subscriber.py
 
 ### EmotiBit Physiological Integration
 
-The project-level Physio pipeline now uses Sowmya's SD/RF v2 EmotiBit implementation: `physio/multiemotibit_UDP_SD_RFv2.py`. The previous `physio/multiemotibit_redis_MAC.py` entry point is kept as a compatibility launcher, but it delegates to the SD v2 script.
+The project-level Physio pipeline uses Sowmya's SD/RF v2 EmotiBit implementation: `physio/multiemotibit_UDP_SD_RFv2.py`. Older project-level Physio entry points and non-v2 RF model files have been removed so the project has one active physiological pipeline.
 
 **Running the full stack:**
 ```powershell
@@ -262,7 +262,6 @@ Start-Process -FilePath "redis\redis-server.exe" -ArgumentList "redis\redis.wind
 
 **Key features:**
 - `physio/multiemotibit_UDP_SD_RFv2.py` - UDP-based multi-device EmotiBit discovery and SD/RF streaming (no LSL/Oscilloscope required)
-- `physio/multiemotibit_redis_MAC.py` remains as a compatibility entry point and runs the SD v2 pipeline
 - Discovers EmotiBit devices automatically via UDP broadcast on port 3131
 - Filters EDA (1 Hz lowpass) and HR (0.5 Hz lowpass) in real time
 - Random Forest predictions for continuous valence and arousal from EDA + HR features (models: `physio/rf_valence_full_v2.pkl`, `physio/rf_arousal_full_v2.pkl`)
