@@ -79,6 +79,16 @@ from pathlib import Path
 import shutil
 from face_identifier import FaceIdentifier, IDENTIFIED_COLOR
 
+# Shared async logger (writes to data/logs/engagement/<ts>.log).
+# Imported via a sys.path insert so the script still works when launched
+# directly (not as a package).
+import sys as _sys
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root / 'src') not in _sys.path:
+    _sys.path.insert(0, str(_repo_root / 'src'))
+from applog import setup_logging, install_excepthook  # noqa: E402import logging as _logging
+log = _logging.getLogger('engagement')
+
 # Optional: 360° support
 try:
     import py360convert
@@ -1217,7 +1227,18 @@ def main():
     # Detect platform and device
     platform_info = get_platform_info()
     actual_device = get_best_device() if args.device == 'auto' else args.device
-    
+
+    # Wire up the shared async logger first so everything below is captured.
+    setup_logging('engagement', extra_context={
+        'camera': str(args.camera) if args.camera is not None else (
+            'video:' + args.video if args.video else 'auto'),
+        'redis': f"{args.redis_host}:{args.redis_port}",
+        'device': args.device,
+        'save': str(args.save or args.save_engagement or args.save_keypoints),
+    })
+    install_excepthook(log)
+    log.info('Engagement inference starting (args=%s)', vars(args))
+
     print(f"🖥️  Platform: {platform_info['os']} ({platform_info['machine']})")
     if args.video:
         print(f"🎥 Video File: {args.video}")
