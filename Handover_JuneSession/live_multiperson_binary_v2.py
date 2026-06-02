@@ -1119,21 +1119,47 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
         # HR — same line as label, right-aligned area
         with emotibit_lock:
-            snap_eda = list(emotibit_data.get(serial, {}).get('eda', []))
-            snap_hr  = list(emotibit_data.get(serial, {}).get('hr',  []))
-            snap_metrics = dict(emotibit_data.get(serial, {}).get('metrics', {}))
+            d = emotibit_data.get(serial, {})
+            snap_eda    = list(d.get('eda', []))
+            snap_hr     = list(d.get('hr',  []))
+            snap_eda_sd = list(d.get('eda_sd', []))
+            snap_hr_sd  = list(d.get('hr_sd',  []))
+            snap_metrics = dict(d.get('metrics', {}))
         if snap_hr:
             hr_text = f"{snap_hr[-1]:.0f}bpm"
             hr_col  = (100, 210, 100)
-        elif 'hr_sd' in snap_metrics:
-            hr_text = f"HR SD {snap_metrics['hr_sd']:.2f}"
+        elif snap_hr_sd:
+            hr_text = f"HR SD {snap_hr_sd[-1]:.2f}"
             hr_col  = (100, 210, 100)
         else:
             hr_text = "--"
             hr_col  = (80, 80, 80)
         cv2.putText(sidebar, hr_text, (sidebar_w - 86, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
-        # EDA spline plot — fills remaining vertical space
+        # Temp ROC SD — small secondary readout right under HR
+        temp_roc = snap_metrics.get('temperature_roc_sd')
+        if temp_roc is not None:
+            cv2.putText(sidebar, f"Ṫ SD {temp_roc:.3f}",
+                        (sidebar_w - 86, y0 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (170, 170, 220), 1, cv2.LINE_AA)
+        # EDA spline plot — fills remaining vertical space.
+        # Prefer raw EDA stream when available; otherwise plot the EDA SD stream
+        # (which is what the SD-pipeline publishes since May 28 2026).
+        if snap_eda:
+            plot_arr   = snap_eda
+            plot_label = "EDA"
+            plot_unit  = "µS"
+            line_col   = (80, 200, 255)
+        elif snap_eda_sd:
+            plot_arr   = snap_eda_sd
+            plot_label = "EDA SD"
+            plot_unit  = ""
+            line_col   = (80, 200, 255)
+        else:
+            plot_arr = []
+            plot_label = "EDA"
+            plot_unit = ""
+            line_col = (80, 200, 255)
         plot_x  = 4
         plot_y  = y0 + 22
         plot_pw = sidebar_w - 8
@@ -1141,8 +1167,8 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         if plot_ph > 12:
             cv2.rectangle(sidebar, (plot_x, plot_y),
                           (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
-            if len(snap_eda) > 2:
-                arr = np.array(snap_eda, dtype=np.float32)
+            if len(plot_arr) > 2:
+                arr = np.array(plot_arr, dtype=np.float32)
                 mn, mx = float(arr.min()), float(arr.max())
                 rng = (mx - mn) if mx != mn else 1.0
                 xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
@@ -1151,37 +1177,21 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                       - ((arr - mn) / rng * (plot_ph - 4))).round().astype(np.int32)
                 ys = np.clip(ys, plot_y, plot_y + plot_ph - 2)
                 pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
-                cv2.polylines(sidebar, [pts], False, (80, 200, 255), 1, cv2.LINE_AA)
-                # y-axis: label + max (top-left), min (bottom-left), current (top-right)
+                cv2.polylines(sidebar, [pts], False, line_col, 1, cv2.LINE_AA)
                 lbl_col = (75, 120, 150)
-                cv2.putText(sidebar, f"EDA {mx:.2f}µS",
+                cv2.putText(sidebar, f"{plot_label} {mx:.2f}{plot_unit}",
                             (plot_x + 2, plot_y + 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
                 cv2.putText(sidebar, f"{mn:.2f}",
                             (plot_x + 2, plot_y + plot_ph - 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                eda_now = f"{arr[-1]:.3f}"
-                cv2.putText(sidebar, eda_now,
+                cv2.putText(sidebar, f"{arr[-1]:.3f}",
                             (sidebar_w - 46, plot_y + 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, (80, 200, 255), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, line_col, 1, cv2.LINE_AA)
             else:
-                metric_items = [
-                    ("EDA SD", snap_metrics.get('eda_sd')),
-                    ("HR SD", snap_metrics.get('hr_sd')),
-                    ("Temp ROC SD", snap_metrics.get('temperature_roc_sd')),
-                    ("SCR SD", snap_metrics.get('scr_frequency_sd')),
-                    ("IBI SD", snap_metrics.get('ibi_sd')),
-                ]
-                metric_items = [(name, value) for name, value in metric_items if value is not None]
-                if metric_items:
-                    for row_idx, (name, value) in enumerate(metric_items[:5]):
-                        cv2.putText(sidebar, f"{name}: {value:.3f}",
-                                    (plot_x + 4, plot_y + 12 + row_idx * 12),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, (90, 180, 210), 1, cv2.LINE_AA)
-                else:
-                    cv2.putText(sidebar, "Physio: no signal",
-                                (plot_x + 4, plot_y + plot_ph // 2 + 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
+                cv2.putText(sidebar, "Physio: no signal",
+                            (plot_x + 4, plot_y + plot_ph // 2 + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
         if i < n - 1:
             cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
     return sidebar
@@ -1322,6 +1332,8 @@ def main():
                             emotibit_data[serial] = {
                                 'eda': deque(maxlen=125),
                                 'hr':  deque(maxlen=125),
+                                'eda_sd': deque(maxlen=180),
+                                'hr_sd':  deque(maxlen=180),
                                 'metrics': {},
                             }
                         if 'EDA_filtered' in data:
@@ -1341,7 +1353,12 @@ def main():
                             }
                             for source_key, target_key in metric_aliases.items():
                                 if source_key in data:
-                                    emotibit_data[serial]['metrics'][target_key] = float(data[source_key])
+                                    v = float(data[source_key])
+                                    emotibit_data[serial]['metrics'][target_key] = v
+                                    if target_key == 'eda_sd':
+                                        emotibit_data[serial]['eda_sd'].append(v)
+                                    elif target_key == 'hr_sd':
+                                        emotibit_data[serial]['hr_sd'].append(v)
                 except Exception:
                     pass
         except Exception as e:
