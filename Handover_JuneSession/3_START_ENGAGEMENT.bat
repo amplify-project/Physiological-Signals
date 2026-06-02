@@ -8,5 +8,5 @@ call .venv\Scripts\activate.bat 2>nul || (
     pause
     exit /b 1
 )
-python live_multiperson_binary_v2.py --save %*
+python live_multiperson_binary_v2.py --select-camera --save %*
 pause

@@ -1803,15 +1803,11 @@ def main():
     # Use prefetcher for 360° mode (large frame decode benefits from overlap)
     prefetcher = FramePrefetcher(cap) if is_360 else None
 
-    # Create the main display window as resizable BEFORE the first imshow.
-    # Without this OpenCV defaults to WINDOW_AUTOSIZE, which on smaller laptop
-    # screens makes the window larger than the display: the title bar is off-
-    # screen (so it can't be moved/closed and can lose keyboard focus, which
-    # breaks the 'q' shortcut), and the physio sidebar (RHS) and FPS overlay
-    # (bottom) get clipped off the visible area.
+    # Name of the main display window. The window itself is created lazily on
+    # the first imshow below (with WINDOW_NORMAL) so that any earlier OpenCV
+    # windows (e.g. the --select-camera preview) finish cleanly first and we
+    # don't leave a grey placeholder window on screen.
     _WIN_NAME = 'Concert Engagement System'
-    cv2.namedWindow(_WIN_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(_WIN_NAME, 1280, 720)
 
     while True:
         frame_start_time = time.time()
@@ -2138,6 +2134,15 @@ def main():
             face_id.enrolled_names if face_id and not is_360 else [],
             emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
         )
+        # Lazily create the main window as resizable on the very first frame.
+        # Doing this here (after any --select-camera preview has been torn
+        # down) avoids a stray empty grey window on screen during startup.
+        # Without WINDOW_NORMAL OpenCV defaults to WINDOW_AUTOSIZE, which on
+        # smaller laptop screens pushes the title bar, physio sidebar (RHS)
+        # and FPS overlay (bottom) off-screen and breaks the 'q' shortcut.
+        if not _mouse_cb_set[0]:
+            cv2.namedWindow(_WIN_NAME, cv2.WINDOW_NORMAL)
+
         cv2.imshow(_WIN_NAME, np.hstack([display_frame, _sidebar]))
         if not _mouse_cb_set[0]:
             cv2.setMouseCallback(_WIN_NAME, on_mouse)
