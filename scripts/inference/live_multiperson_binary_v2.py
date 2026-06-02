@@ -1789,7 +1789,17 @@ def main():
     
     # Use prefetcher for 360° mode (large frame decode benefits from overlap)
     prefetcher = FramePrefetcher(cap) if is_360 else None
-    
+
+    # Create the main display window as resizable BEFORE the first imshow.
+    # Without this OpenCV defaults to WINDOW_AUTOSIZE, which on smaller laptop
+    # screens makes the window larger than the display: the title bar is off-
+    # screen (so it can't be moved/closed and can lose keyboard focus, which
+    # breaks the 'q' shortcut), and the physio sidebar (RHS) and FPS overlay
+    # (bottom) get clipped off the visible area.
+    _WIN_NAME = 'Concert Engagement System'
+    cv2.namedWindow(_WIN_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(_WIN_NAME, 1280, 720)
+
     while True:
         frame_start_time = time.time()
         
@@ -2115,11 +2125,17 @@ def main():
             face_id.enrolled_names if face_id and not is_360 else [],
             emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
         )
-        cv2.imshow('Concert Engagement System', np.hstack([display_frame, _sidebar]))
+        cv2.imshow(_WIN_NAME, np.hstack([display_frame, _sidebar]))
         if not _mouse_cb_set[0]:
-            cv2.setMouseCallback('Concert Engagement System', on_mouse)
+            cv2.setMouseCallback(_WIN_NAME, on_mouse)
             video_w_box[0] = w
             _mouse_cb_set[0] = True
+            # Fit the window to the composited frame width on first frame,
+            # but cap at 1600px so it never opens larger than typical laptop screens.
+            _full_w = w + SIDEBAR_W
+            _init_w = min(_full_w, 1600)
+            _init_h = int(h * (_init_w / _full_w))
+            cv2.resizeWindow(_WIN_NAME, _init_w, _init_h)
 
         key = cv2.waitKey(1) & 0xFF
         
@@ -2181,7 +2197,7 @@ def main():
                         emotibit_data, emotibit_lock, focus_target,
                         sidebar_radio_rects, SIDEBAR_W,
                     )
-                    cv2.imshow('Concert Engagement System', np.hstack([overlay, _sb_reg]))
+                    cv2.imshow(_WIN_NAME, np.hstack([overlay, _sb_reg]))
                     k = cv2.waitKey(50) & 0xFF
                     if k == 27:                        # Esc — cancel
                         input_cancelled = True
