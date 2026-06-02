@@ -1186,6 +1186,10 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-Person Engagement Detection with Redis Streaming')
     parser.add_argument('--camera', type=int, default=None,
                         help='Force specific camera index (skips auto-detection)')
+    parser.add_argument('--select-camera', '-s', action='store_true', default=False,
+                        help='Always show the camera-selection preview (ignores last-used cache). '
+                             'Useful when an external webcam is plugged in and the user wants '
+                             'to pick it instead of the built-in laptop camera.')
     parser.add_argument('--video', type=str, default=None,
                         help='Path to video file (overrides --camera)')
     parser.add_argument('--redis-host', type=str, default=DEFAULT_REDIS_HOST,
@@ -1219,8 +1223,10 @@ def main():
         print(f"🎥 Video File: {args.video}")
     elif args.camera is not None:
         print(f"🎥 Camera: index {args.camera} (manual)")
+    elif args.select_camera:
+        print(f"🎥 Camera: interactive selection (--select-camera)")
     else:
-        print(f"🎥 Camera: auto-detect")
+        print(f"🎥 Camera: auto-detect  (tip: re-run with --select-camera to pick a different one)")
     print(f"📡 Redis Server: {args.redis_host}:{args.redis_port}")
     print(f"💻 Device: {actual_device} {'(auto-detected)' if args.device == 'auto' else ''}")
     
@@ -1391,7 +1397,7 @@ def main():
         # Non-Windows: default backend
         return cv2.VideoCapture(index)
 
-    def select_camera_interactively(detected_cameras, default_camera):
+    def select_camera_interactively(detected_cameras, default_camera, force=False):
         """
         Show a live tiled preview of all detected cameras and let the user
         choose one via a keypress.
@@ -1402,8 +1408,10 @@ def main():
             Q / Escape     — quit application
 
         Returns the chosen camera dict from detected_cameras.
+        When force=False (default) the selector is skipped for a single camera;
+        set force=True (via --select-camera) to always show it.
         """
-        if len(detected_cameras) == 1:
+        if len(detected_cameras) == 1 and not force:
             return detected_cameras[0]
 
         TILE_W, TILE_H = 320, 240
@@ -1526,8 +1534,11 @@ def main():
         skipped_virtual = 0
 
         # --- Phase 1: Try cached camera (fast path, 3 test frames) ---
+        # When --select-camera is set, skip the cache entirely so the user
+        # always gets a full scan + selector (e.g. they just plugged in a
+        # USB webcam and want to pick it).
         cached_idx = None
-        if CAMERA_CACHE_FILE.exists():
+        if not args.select_camera and CAMERA_CACHE_FILE.exists():
             try:
                 cached_idx = int(CAMERA_CACHE_FILE.read_text().strip())
             except (ValueError, OSError):
@@ -1640,13 +1651,15 @@ def main():
         if skipped_virtual > 0:
             print(f"   ({skipped_virtual} virtual cameras filtered out)")
 
-        if len(detected_cameras) > 1:
-            selected = select_camera_interactively(detected_cameras, default_camera)
+        if len(detected_cameras) > 1 or args.select_camera:
+            selected = select_camera_interactively(
+                detected_cameras, default_camera, force=args.select_camera,
+            )
         else:
             selected = default_camera
             icon = "\U0001f310" if selected['is_360'] else "\U0001f4f7"
             kind = "360\u00b0" if selected['is_360'] else "2D"
-            print(f"\n{icon} {kind} camera auto-selected: index {selected['index']} ({selected['resolution']})") 
+            print(f"\n{icon} {kind} camera auto-selected: index {selected['index']} ({selected['resolution']})")
         
         # Cache selected camera for next startup
         try:
