@@ -23,6 +23,16 @@ import pandas as pd
 import joblib
 import redis
 
+# Shared async logger (writes to data/logs/emotibit/<ts>.log).
+# In the handover folder applog.py sits beside this script.
+import sys as _sys
+_here = Path(__file__).resolve().parent
+if str(_here) not in _sys.path:
+    _sys.path.insert(0, str(_here))
+from applog import setup_logging, install_excepthook  # noqa: E402
+import logging as _logging
+log = _logging.getLogger('emotibit')
+
 # ----------------------------- SETTINGS -----------------------------
 COLUMNS = ["EDA", "HeartRate"]  # For feature extraction (used for predictions)
 WINDOW_SECONDS = 5
@@ -133,7 +143,7 @@ class DataLogger:
         signal_columns = sorted(self.signal_types.keys())
         computed_metrics = [
             "valence", "arousal",
-            "edl_sd", "temperature_roc_sd", "scr_frequency_sd", "hr_sd", "ibi_sd",
+            "edl_sd", "eda_sd", "temperature_roc_sd", "scr_frequency_sd", "hr_sd", "ibi_sd",
             "processing_time_ms"
             # Note: end_to_end_latency_ms removed - unreliable without proper clock sync
         ]
@@ -310,6 +320,7 @@ class DeviceAggregator:
             
             # Add SD metrics (for CSV storage)
             signal_dict["edl_sd"] = edl_sd
+            signal_dict["eda_sd"] = edl_sd
             signal_dict["temperature_roc_sd"] = temp_roc_sd
             signal_dict["scr_frequency_sd"] = scr_freq_sd
             signal_dict["hr_sd"] = hr_sd
@@ -330,6 +341,7 @@ class DeviceAggregator:
             # 1. Standard deviation of Tonic EDA (EDL)
             if edl_sd is not None:
                 physio_metrics["edl_sd"] = edl_sd
+                physio_metrics["eda_sd"] = edl_sd
             
             # 2. Standard deviation of Temperature Rate of Change
             if temp_roc_sd is not None:
@@ -364,7 +376,7 @@ class DeviceAggregator:
             # Print for first 3 seconds, then every 30 seconds
             if elapsed <= 3.0 or (current_time - self.last_print_time) >= self.print_interval:
                 sd_metrics = [f"{k}={v:.3f}" for k, v in [
-                    ("edl_sd", edl_sd), ("temp_roc_sd", temp_roc_sd), ("scr_freq_sd", scr_freq_sd),
+                    ("eda_sd", edl_sd), ("temp_roc_sd", temp_roc_sd), ("scr_freq_sd", scr_freq_sd),
                     ("hr_sd", hr_sd), ("ibi_sd", ibi_sd)
                 ] if v is not None]
                 metrics_str = ", ".join(sd_metrics) + f", proc={processing_time_ms:.1f}ms"
@@ -678,6 +690,13 @@ def _ensure_firewall_rules():
 
 # ----------------------------- MAIN -----------------------------
 def main():
+    setup_logging('emotibit', extra_context={
+        'redis': f'{REDIS_HOST}:{REDIS_PORT}',
+        'window_seconds': str(WINDOW_SECONDS),
+        'emit_rate_hz': str(EMIT_RATE_HZ),
+    })
+    install_excepthook(log)
+    log.info('EmotiBit pipeline starting')
     _ensure_firewall_rules()
 
     print("Loading models...")

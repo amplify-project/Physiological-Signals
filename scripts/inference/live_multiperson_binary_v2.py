@@ -86,7 +86,8 @@ import sys as _sys
 _repo_root = Path(__file__).resolve().parents[2]
 if str(_repo_root / 'src') not in _sys.path:
     _sys.path.insert(0, str(_repo_root / 'src'))
-from applog import setup_logging, install_excepthook  # noqa: E402import logging as _logging
+from applog import setup_logging, install_excepthook  # noqa: E402
+import logging as _logging
 log = _logging.getLogger('engagement')
 
 # Optional: 360° support

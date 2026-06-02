@@ -65,6 +65,7 @@ import mediapipe as mp
 from ultralytics import YOLO
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import redis
@@ -77,6 +78,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 from face_identifier import FaceIdentifier, IDENTIFIED_COLOR
+
+# Shared async logger (writes to data/logs/engagement/<ts>.log).
+# In the handover folder applog.py sits beside this script.
+import sys as _sys
+_here = Path(__file__).resolve().parent
+if str(_here) not in _sys.path:
+    _sys.path.insert(0, str(_here))
+from applog import setup_logging, install_excepthook  # noqa: E402
+import logging as _logging
+log = _logging.getLogger('engagement')
 
 # Optional: 360° support
 try:
@@ -217,21 +228,11 @@ DEFAULT_REDIS_PORT = 6379
 REDIS_CHANNEL = 'engagement_score'  # Channel to publish to
 
 # Cross-platform paths using pathlib
-SCRIPT_DIR = Path(__file__).parent.resolve()  # scripts/inference/ or handover root
+SCRIPT_DIR = Path(__file__).parent.resolve()  # scripts/inference/
 PROJECT_ROOT = SCRIPT_DIR.parent.parent  # Go up 2 levels: scripts/ -> project root
-
-# Model path: check local handover layout first, then dev layout
-_LOCAL_MODEL = SCRIPT_DIR / 'model' / 'best_model.pth'
-_DEV_MODEL = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
-MODEL_PATH = _LOCAL_MODEL if _LOCAL_MODEL.exists() else _DEV_MODEL
-
-_LOCAL_YOLO = SCRIPT_DIR / 'yolo11n.pt'
-_DEV_YOLO = PROJECT_ROOT / 'yolo11n.pt'
-YOLO_MODEL_PATH = _LOCAL_YOLO if _LOCAL_YOLO.exists() else _DEV_YOLO
-
-_LOCAL_YOLO_FB = SCRIPT_DIR / 'yolo26n.pt'
-_DEV_YOLO_FB = PROJECT_ROOT / 'yolo26n.pt'
-YOLO_FALLBACK_PATH = _LOCAL_YOLO_FB if _LOCAL_YOLO_FB.exists() else _DEV_YOLO_FB
+MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
+YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
+YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
 
 # Default session data directory: relative to CWD (not __file__)
 # This ensures compatibility when packaged as an executable (PyInstaller etc.)
@@ -255,6 +256,7 @@ MIN_INFERENCE_FRAMES = 30           # Minimum frames before first estimate (~1s 
 NUM_360_VIEWS = 4                   # Number of perspective views to extract from 360° video
 VIEW_FOV = (90, 90)                 # Field of view (horizontal, vertical) in degrees
 VIEW_OUTPUT_SIZE = (480, 640)       # Output resolution (height, width) per view
+EQUIRECT_MAX_WIDTH = 2880           # Downscale equirect source before e2p (saves ~4x CPU)
 
 # =============================================================================
 # 360° VIDEO DETECTION AND PROCESSING
@@ -297,30 +299,90 @@ def extract_perspective_views(equirect_frame, num_views=NUM_360_VIEWS, fov=VIEW_
     if not HAS_360_SUPPORT:
         raise RuntimeError("py360convert not installed. Run: pip install py360convert")
     
+    # Downscale equirectangular source to reduce e2p CPU cost
+    h_src, w_src = equirect_frame.shape[:2]
+    if w_src > EQUIRECT_MAX_WIDTH:
+        scale = EQUIRECT_MAX_WIDTH / w_src
+        new_w = EQUIRECT_MAX_WIDTH
+        new_h = int(h_src * scale)
+        # Ensure 2:1 ratio is maintained
+        new_h = new_w // 2
+        equirect_frame = cv2.resize(equirect_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
     views = []
     yaw_angles = []
     
-    for i in range(num_views):
-        yaw = i * (360 / num_views)  # 0°, 90°, 180°, 270° for 4 views
-        yaw_angles.append(yaw)
-        
-        # Extract perspective view
-        # py360convert.e2p: equirectangular to perspective
-        perspective = py360convert.e2p(
+    def _extract_single(yaw):
+        return py360convert.e2p(
             equirect_frame,
             fov_deg=fov,
-            u_deg=yaw,      # Horizontal rotation (yaw)
-            v_deg=0,        # Vertical rotation (pitch) - 0 = horizon level
+            u_deg=yaw,
+            v_deg=0,
             out_hw=out_hw,
             mode='bilinear'
         )
-        views.append(perspective)
+    
+    for i in range(num_views):
+        yaw_angles.append(i * (360 / num_views))
+    
+    # Parallel e2p — numpy releases the GIL so threads get true parallelism
+    with ThreadPoolExecutor(max_workers=num_views) as pool:
+        views = list(pool.map(_extract_single, yaw_angles))
     
     return views, yaw_angles
 
 # =============================================================================
 # DISK SPACE CHECK
 # =============================================================================
+
+# Frame prefetch — reads & decodes the next video frame while the main
+# thread processes the current one.  Saves ~15-30 ms per iteration on
+# high-res equirectangular files.
+import queue as _queue
+
+class FramePrefetcher:
+    """Reads frames from a cv2.VideoCapture in a background thread."""
+    
+    def __init__(self, cap):
+        self.cap = cap
+        self._q = _queue.Queue(maxsize=2)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+    
+    def _reader(self):
+        while not self._stop.is_set():
+            ret, frame = self.cap.read()
+            self._q.put((ret, frame))
+            if not ret:
+                break
+    
+    def read(self):
+        return self._q.get()
+    
+    def stop(self):
+        self._stop.set()
+        # Drain queue so reader thread can finish if blocked on put
+        try:
+            while not self._q.empty():
+                self._q.get_nowait()
+        except _queue.Empty:
+            pass
+    
+    def restart(self):
+        """Restart after a video loop / seek."""
+        self.stop()
+        self._thread.join(timeout=2)
+        self._stop.clear()
+        # Drain any stale frames
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except _queue.Empty:
+                break
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
 
 ESTIMATED_SESSION_GB_LOW  = 5.0   # lower bound estimate (GB per 30-min, 50 people)
 ESTIMATED_SESSION_GB_HIGH = 7.0   # upper bound estimate
@@ -702,6 +764,148 @@ class MultiPersonEngagementSystem:
         # { track_id: score }
         self.person_scores = {}
         
+        # Per-view YOLO trackers for 360° mode (avoids cross-view ID confusion)
+        self._view_yolos = {}
+        self._view_holistcs = {}
+        
+        # Persistent thread pool for parallel MediaPipe across views
+        self._view_pool = ThreadPoolExecutor(max_workers=4)
+    
+    def _get_view_yolo(self, view_idx):
+        """Get or create a YOLO tracker dedicated to a specific 360° view."""
+        if view_idx not in self._view_yolos:
+            if YOLO_MODEL_PATH.exists():
+                self._view_yolos[view_idx] = YOLO(str(YOLO_MODEL_PATH))
+            elif YOLO_FALLBACK_PATH.exists():
+                self._view_yolos[view_idx] = YOLO(str(YOLO_FALLBACK_PATH))
+            else:
+                self._view_yolos[view_idx] = YOLO('yolo11n.pt')
+        return self._view_yolos[view_idx]
+    
+    def _get_view_holistic(self, view_idx):
+        """Get or create a MediaPipe Holistic instance for a specific view."""
+        if view_idx not in self._view_holistcs:
+            self._view_holistcs[view_idx] = self.mp_holistic.Holistic(
+                static_image_mode=False,
+                model_complexity=0,
+                enable_segmentation=False,
+                refine_face_landmarks=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+        return self._view_holistcs[view_idx]
+    
+    def detect_view(self, frame_bgr, view_idx):
+        """Phase 1: Run YOLO detection on a single view (GPU, sequential).
+        
+        Returns list of (track_id, bbox) detections for this view.
+        """
+        yolo = self._get_view_yolo(view_idx)
+        results = yolo.track(frame_bgr, persist=True, verbose=False, classes=[0], conf=0.15)
+        
+        detections = []
+        if results and results[0].boxes and results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            track_ids = results[0].boxes.id.int().cpu().numpy()
+            for box, raw_id in zip(boxes, track_ids):
+                track_id = f"v{view_idx}_{raw_id}"
+                x1, y1, x2, y2 = map(int, box)
+                if track_id not in self.person_buffers:
+                    self.person_buffers[track_id] = deque(maxlen=self.sequence_length)
+                    self.person_scores[track_id] = 0.0
+                detections.append((track_id, (x1, y1, x2, y2)))
+        return detections
+    
+    def extract_and_infer_person(self, frame_rgb, track_id, bbox, view_idx):
+        """Phase 2: MediaPipe features + engagement inference for one person (CPU-heavy).
+        
+        Safe to call from multiple threads — each view has its own holistic instance.
+        """
+        holistic = self._get_view_holistic(view_idx)
+        features, padded_bbox = self._extract_features_with_holistic(frame_rgb, bbox, holistic)
+        features_flat = features.flatten()
+        self.person_buffers[track_id].append(features_flat)
+        
+        buf_len = len(self.person_buffers[track_id])
+        if buf_len >= MIN_INFERENCE_FRAMES:
+            buf_array = np.array(self.person_buffers[track_id])
+            if buf_len < self.sequence_length:
+                pad_rows = self.sequence_length - buf_len
+                padding = np.zeros((pad_rows, buf_array.shape[1]), dtype=buf_array.dtype)
+                buf_array = np.concatenate([padding, buf_array], axis=0)
+            
+            input_tensor = torch.tensor(
+                buf_array, dtype=self.tensor_dtype, device=self.device
+            ).unsqueeze(0)
+            
+            with torch.no_grad():
+                logits = self.model(input_tensor)
+                probs = torch.softmax(logits, dim=1)
+                score = probs[0][1].item()
+                self.person_scores[track_id] = score
+        
+        return {
+            'bbox': bbox,
+            'padded_bbox': padded_bbox,
+            'id': track_id,
+            'score': self.person_scores[track_id],
+            'buffer_fill': len(self.person_buffers[track_id]) / self.sequence_length,
+            'keypoints': features,
+        }
+    
+    def process_view(self, frame_bgr, view_idx, frame_rgb=None):
+        """Process a single 360° view (sequential fallback)."""
+        if frame_rgb is None:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        
+        detections = self.detect_view(frame_bgr, view_idx)
+        current_frame_data = []
+        for track_id, bbox in detections:
+            person = self.extract_and_infer_person(frame_rgb, track_id, bbox, view_idx)
+            current_frame_data.append(person)
+        
+        if current_frame_data:
+            weighted_sum = sum(d['score'] * d['buffer_fill'] for d in current_frame_data
+                              if len(self.person_buffers[d['id']]) >= MIN_INFERENCE_FRAMES)
+            weight_total = sum(d['buffer_fill'] for d in current_frame_data
+                              if len(self.person_buffers[d['id']]) >= MIN_INFERENCE_FRAMES)
+            crowd_average = weighted_sum / weight_total if weight_total > 0 else 0.0
+        else:
+            crowd_average = 0.0
+        
+        return current_frame_data, crowd_average
+    
+    def _extract_features_with_holistic(self, frame_rgb, bbox, holistic):
+        """Extract MediaPipe features using a specific holistic instance."""
+        x1, y1, x2, y2 = bbox
+        h, w = frame_rgb.shape[:2]
+        pad_h = int((y2 - y1) * 0.2)
+        pad_w = int((x2 - x1) * 0.2)
+        x1 = max(0, x1 - pad_w)
+        y1 = max(0, y1 - pad_h)
+        x2 = min(w, x2 + pad_w)
+        y2 = min(h, y2 + pad_h)
+        padded_bbox = (x1, y1, x2, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return np.zeros((543, 3)), padded_bbox
+        
+        person_crop = frame_rgb[y1:y2, x1:x2]
+        results = holistic.process(person_crop)
+        
+        keypoints = np.zeros((543, 3))
+        
+        def get_landmarks(landmarks, offset):
+            if landmarks:
+                for i, lm in enumerate(landmarks.landmark):
+                    keypoints[offset + i] = [lm.x, lm.y, lm.visibility if hasattr(lm, 'visibility') else 1.0]
+        
+        get_landmarks(results.pose_landmarks, 0)
+        get_landmarks(results.face_landmarks, 33)
+        get_landmarks(results.left_hand_landmarks, 33 + 468)
+        get_landmarks(results.right_hand_landmarks, 33 + 468 + 21)
+        
+        return keypoints, padded_bbox
 
     
     def update_sequence_length(self, new_length):
@@ -778,7 +982,7 @@ class MultiPersonEngagementSystem:
         
         # 1. YOLO Tracking — pass BGR frame (YOLO expects BGR, converts internally)
         # persist=True is crucial for ID tracking across frames
-        results = self.yolo.track(frame, persist=True, verbose=False, classes=[0])
+        results = self.yolo.track(frame, persist=True, verbose=False, classes=[0], conf=0.15)
         
         current_frame_data = [] # List of (bbox, track_id, score)
         
@@ -917,13 +1121,17 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         with emotibit_lock:
             snap_eda = list(emotibit_data.get(serial, {}).get('eda', []))
             snap_hr  = list(emotibit_data.get(serial, {}).get('hr',  []))
+            snap_metrics = dict(emotibit_data.get(serial, {}).get('metrics', {}))
         if snap_hr:
             hr_text = f"{snap_hr[-1]:.0f}bpm"
+            hr_col  = (100, 210, 100)
+        elif 'hr_sd' in snap_metrics:
+            hr_text = f"HR SD {snap_metrics['hr_sd']:.2f}"
             hr_col  = (100, 210, 100)
         else:
             hr_text = "--"
             hr_col  = (80, 80, 80)
-        cv2.putText(sidebar, hr_text, (sidebar_w - 52, y0 + 16),
+        cv2.putText(sidebar, hr_text, (sidebar_w - 86, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
         # EDA spline plot — fills remaining vertical space
         plot_x  = 4
@@ -957,9 +1165,23 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                             (sidebar_w - 46, plot_y + 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, (80, 200, 255), 1, cv2.LINE_AA)
             else:
-                cv2.putText(sidebar, "EDA: no signal",
-                            (plot_x + 4, plot_y + plot_ph // 2 + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
+                metric_items = [
+                    ("EDA SD", snap_metrics.get('eda_sd')),
+                    ("HR SD", snap_metrics.get('hr_sd')),
+                    ("Temp ROC SD", snap_metrics.get('temperature_roc_sd')),
+                    ("SCR SD", snap_metrics.get('scr_frequency_sd')),
+                    ("IBI SD", snap_metrics.get('ibi_sd')),
+                ]
+                metric_items = [(name, value) for name, value in metric_items if value is not None]
+                if metric_items:
+                    for row_idx, (name, value) in enumerate(metric_items[:5]):
+                        cv2.putText(sidebar, f"{name}: {value:.3f}",
+                                    (plot_x + 4, plot_y + 12 + row_idx * 12),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, (90, 180, 210), 1, cv2.LINE_AA)
+                else:
+                    cv2.putText(sidebar, "Physio: no signal",
+                                (plot_x + 4, plot_y + plot_ph // 2 + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
         if i < n - 1:
             cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
     return sidebar
@@ -974,6 +1196,10 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-Person Engagement Detection with Redis Streaming')
     parser.add_argument('--camera', type=int, default=None,
                         help='Force specific camera index (skips auto-detection)')
+    parser.add_argument('--select-camera', '-s', action='store_true', default=False,
+                        help='Always show the camera-selection preview (ignores last-used cache). '
+                             'Useful when an external webcam is plugged in and the user wants '
+                             'to pick it instead of the built-in laptop camera.')
     parser.add_argument('--video', type=str, default=None,
                         help='Path to video file (overrides --camera)')
     parser.add_argument('--redis-host', type=str, default=DEFAULT_REDIS_HOST,
@@ -1001,14 +1227,27 @@ def main():
     # Detect platform and device
     platform_info = get_platform_info()
     actual_device = get_best_device() if args.device == 'auto' else args.device
-    
+
+    # Wire up the shared async logger first so everything below is captured.
+    setup_logging('engagement', extra_context={
+        'camera': str(args.camera) if args.camera is not None else (
+            'video:' + args.video if args.video else 'auto'),
+        'redis': f"{args.redis_host}:{args.redis_port}",
+        'device': args.device,
+        'save': str(args.save or args.save_engagement or args.save_keypoints),
+    })
+    install_excepthook(log)
+    log.info('Engagement inference starting (args=%s)', vars(args))
+
     print(f"🖥️  Platform: {platform_info['os']} ({platform_info['machine']})")
     if args.video:
         print(f"🎥 Video File: {args.video}")
     elif args.camera is not None:
         print(f"🎥 Camera: index {args.camera} (manual)")
+    elif args.select_camera:
+        print(f"🎥 Camera: interactive selection (--select-camera)")
     else:
-        print(f"🎥 Camera: auto-detect")
+        print(f"🎥 Camera: auto-detect  (tip: re-run with --select-camera to pick a different one)")
     print(f"📡 Redis Server: {args.redis_host}:{args.redis_port}")
     print(f"💻 Device: {actual_device} {'(auto-detected)' if args.device == 'auto' else ''}")
     
@@ -1045,7 +1284,7 @@ def main():
     focus_target = 'all'
 
     # EmotiBit physio data — populated by subscriber thread
-    emotibit_data = {}        # {serial: {'eda': deque(maxlen=125), 'hr': deque(maxlen=125)}}
+    emotibit_data = {}        # {serial: {'eda': deque, 'hr': deque, 'metrics': dict}}
     emotibit_lock = threading.Lock()
     sidebar_radio_rects = []  # [(y_top, y_bot, serial), ...] updated each frame
     video_w_box    = [0]      # video pixel width, set on first frame
@@ -1068,7 +1307,7 @@ def main():
         try:
             r_sub = redis.Redis(host=args.redis_host, port=args.redis_port, db=0)
             ps = r_sub.pubsub()
-            ps.psubscribe('device:*:eda_filtered', 'device:*:hr_filtered')
+            ps.psubscribe('device:*:eda_filtered', 'device:*:hr_filtered', 'device:*:physio_metrics')
             for msg in ps.listen():
                 if msg['type'] != 'pmessage':
                     continue
@@ -1083,11 +1322,26 @@ def main():
                             emotibit_data[serial] = {
                                 'eda': deque(maxlen=125),
                                 'hr':  deque(maxlen=125),
+                                'metrics': {},
                             }
                         if 'EDA_filtered' in data:
                             emotibit_data[serial]['eda'].append(float(data['EDA_filtered']))
                         if 'HR_filtered' in data:
                             emotibit_data[serial]['hr'].append(float(data['HR_filtered']))
+                        if ch.endswith(':physio_metrics'):
+                            metric_aliases = {
+                                'edl_sd': 'eda_sd',
+                                'eda_sd': 'eda_sd',
+                                'EDA_sd': 'eda_sd',
+                                'hr_sd': 'hr_sd',
+                                'HR_sd': 'hr_sd',
+                                'temperature_roc_sd': 'temperature_roc_sd',
+                                'scr_frequency_sd': 'scr_frequency_sd',
+                                'ibi_sd': 'ibi_sd',
+                            }
+                            for source_key, target_key in metric_aliases.items():
+                                if source_key in data:
+                                    emotibit_data[serial]['metrics'][target_key] = float(data[source_key])
                 except Exception:
                     pass
         except Exception as e:
@@ -1104,31 +1358,7 @@ def main():
     CAMERA_CACHE_FILE = Path(__file__).parent / '.last_camera'
     cap = None
     video_source_name = ""
-
-    def _open_camera(index, try_msmf_fallback=True):
-        """Open camera trying DSHOW first (faster on most Windows), fall back to default (MSMF).
-        Verifies the backend actually produces non-black frames before committing.
-        Set try_msmf_fallback=False for scanning (avoids slow MSMF timeouts on non-existent cameras)."""
-        if platform.system() == 'Windows':
-            c = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-            if c.isOpened():
-                ret, frame = c.read()
-                if ret and frame is not None and np.mean(frame) > 5:
-                    # DSHOW works and produces real frames — keep it
-                    return c
-                # DSHOW opened but returns black frames
-                c.release()
-                if try_msmf_fallback:
-                    c = cv2.VideoCapture(index)
-                    return c
-                # No fallback requested — return a closed capture
-                return cv2.VideoCapture()
-            else:
-                c.release()
-                return cv2.VideoCapture()  # closed cap — no camera at this index
-        # Non-Windows: default backend
-        return cv2.VideoCapture(index)
-
+    
     def is_real_camera(cap, num_test_frames=3):
         """
         Check if a camera produces real, changing video content.
@@ -1164,7 +1394,31 @@ def main():
         
         return True, last_frame
 
-    def select_camera_interactively(detected_cameras, default_camera):
+    def _open_camera(index, try_msmf_fallback=True):
+        """Open camera trying DSHOW first (faster on most Windows), fall back to default (MSMF).
+        Verifies the backend actually produces non-black frames before committing.
+        Set try_msmf_fallback=False for scanning (avoids slow MSMF timeouts on non-existent cameras)."""
+        if platform.system() == 'Windows':
+            c = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if c.isOpened():
+                ret, frame = c.read()
+                if ret and frame is not None and np.mean(frame) > 5:
+                    # DSHOW works and produces real frames — keep it
+                    return c
+                # DSHOW opened but returns black frames
+                c.release()
+                if try_msmf_fallback:
+                    c = cv2.VideoCapture(index)
+                    return c
+                # No fallback requested — return a closed capture
+                return cv2.VideoCapture()
+            else:
+                c.release()
+                return cv2.VideoCapture()  # closed cap — no camera at this index
+        # Non-Windows: default backend
+        return cv2.VideoCapture(index)
+
+    def select_camera_interactively(detected_cameras, default_camera, force=False):
         """
         Show a live tiled preview of all detected cameras and let the user
         choose one via a keypress.
@@ -1175,8 +1429,10 @@ def main():
             Q / Escape     — quit application
 
         Returns the chosen camera dict from detected_cameras.
+        When force=False (default) the selector is skipped for a single camera;
+        set force=True (via --select-camera) to always show it.
         """
-        if len(detected_cameras) == 1:
+        if len(detected_cameras) == 1 and not force:
             return detected_cameras[0]
 
         TILE_W, TILE_H = 320, 240
@@ -1299,8 +1555,11 @@ def main():
         skipped_virtual = 0
 
         # --- Phase 1: Try cached camera (fast path, 3 test frames) ---
+        # When --select-camera is set, skip the cache entirely so the user
+        # always gets a full scan + selector (e.g. they just plugged in a
+        # USB webcam and want to pick it).
         cached_idx = None
-        if CAMERA_CACHE_FILE.exists():
+        if not args.select_camera and CAMERA_CACHE_FILE.exists():
             try:
                 cached_idx = int(CAMERA_CACHE_FILE.read_text().strip())
             except (ValueError, OSError):
@@ -1413,13 +1672,15 @@ def main():
         if skipped_virtual > 0:
             print(f"   ({skipped_virtual} virtual cameras filtered out)")
 
-        if len(detected_cameras) > 1:
-            selected = select_camera_interactively(detected_cameras, default_camera)
+        if len(detected_cameras) > 1 or args.select_camera:
+            selected = select_camera_interactively(
+                detected_cameras, default_camera, force=args.select_camera,
+            )
         else:
             selected = default_camera
             icon = "\U0001f310" if selected['is_360'] else "\U0001f4f7"
             kind = "360\u00b0" if selected['is_360'] else "2D"
-            print(f"\n{icon} {kind} camera auto-selected: index {selected['index']} ({selected['resolution']})") 
+            print(f"\n{icon} {kind} camera auto-selected: index {selected['index']} ({selected['resolution']})")
         
         # Cache selected camera for next startup
         try:
@@ -1560,14 +1821,35 @@ def main():
     last_adaptation_time = time.time()
     adaptation_interval = 2.0  # Adapt every 2 seconds
     
+    # Use prefetcher for 360° mode (large frame decode benefits from overlap)
+    prefetcher = FramePrefetcher(cap) if is_360 else None
+
+    # Name of the main display window. The window itself is created lazily on
+    # the first imshow below (with WINDOW_NORMAL) so that any earlier OpenCV
+    # windows (e.g. the --select-camera preview) finish cleanly first and we
+    # don't leave a grey placeholder window on screen.
+    _WIN_NAME = 'Concert Engagement System'
+
     while True:
         frame_start_time = time.time()
         
-        ret, frame = cap.read()
+        if prefetcher:
+            ret, frame = prefetcher.read()
+        else:
+            ret, frame = cap.read()
         if not ret:
             if args.video:
-                # Loop video file
+                # Loop video file — reset capture and tracker state
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if prefetcher:
+                    prefetcher.restart()
+                system.person_buffers.clear()
+                system.person_scores.clear()
+                system.yolo.predictor = None  # Reset main YOLO tracker
+                # Reset per-view YOLO trackers (360° mode)
+                for vy in system._view_yolos.values():
+                    vy.predictor = None
+                print("\n\U0001f501 Video looped — tracker reset")
                 continue
             break
         
@@ -1576,29 +1858,58 @@ def main():
         # =====================================================================
         if is_360:
             # Convert to RGB for py360convert
+            t0 = time.time()
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             # Extract perspective views
             views, yaw_angles = extract_perspective_views(frame_rgb)
+            t_e2p = time.time()
             
-            # Process each view and aggregate results
+            # === PHASE 1: YOLO detection — sequential on GPU ===
+            view_detections = []   # list of (view_idx, yaw, view_rgb, detections)
+            for view_idx, (view_rgb, yaw) in enumerate(zip(views, yaw_angles)):
+                view_bgr = cv2.cvtColor(view_rgb, cv2.COLOR_RGB2BGR)
+                dets = system.detect_view(view_bgr, view_idx)
+                view_detections.append((view_idx, yaw, view_rgb, dets))
+            t_yolo = time.time()
+            
+            # === PHASE 2: MediaPipe + engagement — parallel per-view on CPU ===
+            # Each view's holistic instance is used by exactly one thread.
+            def _process_view_detections(view_idx, view_rgb, dets):
+                results = []
+                for track_id, bbox in dets:
+                    results.append(
+                        system.extract_and_infer_person(view_rgb, track_id, bbox, view_idx)
+                    )
+                return results
+            
             all_people_data = []
             all_scores = []
             
-            for view_idx, (view, yaw) in enumerate(zip(views, yaw_angles)):
-                # Convert back to BGR for processing
-                view_bgr = cv2.cvtColor(view, cv2.COLOR_RGB2BGR)
-                
-                # Process view
-                view_people, view_crowd_avg = system.process_frame(view_bgr)
-                
-                # Tag people with view info
-                for person in view_people:
+            n_people = sum(len(d[3]) for d in view_detections)
+            futures = []
+            for view_idx, yaw, view_rgb, dets in view_detections:
+                if dets:
+                    fut = system._view_pool.submit(_process_view_detections, view_idx, view_rgb, dets)
+                    futures.append((fut, view_idx, yaw))
+            
+            for fut, view_idx, yaw in futures:
+                for person in fut.result():
                     person['view'] = view_idx
                     person['yaw'] = yaw
                     all_people_data.append(person)
                     if person['score'] > 0:
                         all_scores.append(person['score'])
+            t_mp = time.time()
+            
+            # Print timing every 30 frames
+            if hasattr(system, '_profile_counter'):
+                system._profile_counter += 1
+            else:
+                system._profile_counter = 0
+            if system._profile_counter % 30 == 0:
+                print(f"  [PROFILE] e2p={(t_e2p-t0)*1000:.0f}ms  yolo={(t_yolo-t_e2p)*1000:.0f}ms  mp+eng={(t_mp-t_yolo)*1000:.0f}ms  people={n_people}  total={(t_mp-t0)*1000:.0f}ms")
+            
             
             # Aggregate crowd average across all views
             if all_scores:
@@ -1608,11 +1919,14 @@ def main():
             
             people_data = all_people_data
             
-            # Create visualization mosaic (2x2 grid of views)
+            # Create visualization mosaic (2x2 grid of views with border)
             h, w = views[0].shape[:2]
-            mosaic = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
+            border = 2  # pixels between views
+            mosaic = np.zeros((h * 2 + border, w * 2 + border, 3), dtype=np.uint8)
+            mosaic[h:h + border, :] = (128, 128, 128)
+            mosaic[:, w:w + border] = (128, 128, 128)
             
-            view_labels = ['Front (0°)', 'Right (90°)', 'Back (180°)', 'Left (270°)']
+            view_labels = ['Front (0 deg)', 'Left (90 deg)', 'Right (180 deg)', 'Back (270 deg)']
             
             for view_idx, (view, label) in enumerate(zip(views, view_labels)):
                 view_bgr = cv2.cvtColor(view, cv2.COLOR_RGB2BGR)
@@ -1643,7 +1957,9 @@ def main():
                 
                 # Place in mosaic
                 row, col = view_idx // 2, view_idx % 2
-                mosaic[row * h:(row + 1) * h, col * w:(col + 1) * w] = view_bgr
+                y_off = row * (h + border)
+                x_off = col * (w + border)
+                mosaic[y_off:y_off + h, x_off:x_off + w] = view_bgr
             
             # Use mosaic as display frame
             display_frame = mosaic
@@ -1776,7 +2092,7 @@ def main():
         cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), avg_color, -1)
         
         # Engagement Text
-        mode_str = "360°" if is_360 else "2D"
+        mode_str = "360" if is_360 else "2D"
         text = f"CROWD ENGAGEMENT ({mode_str}): {crowd_avg:.1%}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         tx = (w - tw) // 2
@@ -1839,11 +2155,26 @@ def main():
             face_id.enrolled_names if face_id and not is_360 else [],
             emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
         )
-        cv2.imshow('Concert Engagement System', np.hstack([display_frame, _sidebar]))
+        # Lazily create the main window as resizable on the very first frame.
+        # Doing this here (after any --select-camera preview has been torn
+        # down) avoids a stray empty grey window on screen during startup.
+        # Without WINDOW_NORMAL OpenCV defaults to WINDOW_AUTOSIZE, which on
+        # smaller laptop screens pushes the title bar, physio sidebar (RHS)
+        # and FPS overlay (bottom) off-screen and breaks the 'q' shortcut.
         if not _mouse_cb_set[0]:
-            cv2.setMouseCallback('Concert Engagement System', on_mouse)
+            cv2.namedWindow(_WIN_NAME, cv2.WINDOW_NORMAL)
+
+        cv2.imshow(_WIN_NAME, np.hstack([display_frame, _sidebar]))
+        if not _mouse_cb_set[0]:
+            cv2.setMouseCallback(_WIN_NAME, on_mouse)
             video_w_box[0] = w
             _mouse_cb_set[0] = True
+            # Fit the window to the composited frame width on first frame,
+            # but cap at 1600px so it never opens larger than typical laptop screens.
+            _full_w = w + SIDEBAR_W
+            _init_w = min(_full_w, 1600)
+            _init_h = int(h * (_init_w / _full_w))
+            cv2.resizeWindow(_WIN_NAME, _init_w, _init_h)
 
         key = cv2.waitKey(1) & 0xFF
         
@@ -1905,7 +2236,7 @@ def main():
                         emotibit_data, emotibit_lock, focus_target,
                         sidebar_radio_rects, SIDEBAR_W,
                     )
-                    cv2.imshow('Concert Engagement System', np.hstack([overlay, _sb_reg]))
+                    cv2.imshow(_WIN_NAME, np.hstack([overlay, _sb_reg]))
                     k = cv2.waitKey(50) & 0xFF
                     if k == 27:                        # Esc — cancel
                         input_cancelled = True
@@ -1973,6 +2304,8 @@ def main():
     # =========================================================================
     # CLEANUP
     # =========================================================================
+    if prefetcher:
+        prefetcher.stop()
     cap.release()
     cv2.destroyAllWindows()
     

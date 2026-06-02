@@ -10,7 +10,7 @@
 # =============================================================================
 
 # --- Computer Vision & Pose Estimation ---
-opencv-contrib-python==4.11.0.86
+opencv-contrib-python==4.10.0.84
 lap>=0.5.12
 mediapipe==0.10.21
 ultralytics==8.3.229
