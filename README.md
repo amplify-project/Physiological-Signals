@@ -488,11 +488,15 @@ Completed work against this roadmap, in commit order:
 - [ ] Facial identification currently works reliably only at less than about 10 feet.
 - [ ] Improve recognition performance for stage-mounted camera distances in live venues.
 - [ ] Target practical operation for performance-area conditions (approximately 8 m^2).
+- [ ] Documented detector/recogniser limits (facenet-pytorch, MTCNN `min_face_size=40`, InceptionResnetV1 trained on 160×160 crops): detection floor ≈ 40 px face, recognition usable from ~80 px, reliable from ~120 px. On a 1080p / ~60° FOV webcam this maps to ≈ 7.3 m / 3.7 m / 2.4 m respectively; halve for the Insta360 5.7K equirectangular feed.
+- [ ] Enrollment distance bounds runtime range: a far enrollment (≤100 px face) stores an upsampled/low-information embedding that no runtime crop can rescue. Effective runtime range ≈ min(enrollment quality, runtime crop quality).
 
 **Proposed solutions**
 - [ ] Standard practice: make face ID optional and non-blocking so core engagement remains stable at long range.
 - [ ] Standard practice: use higher-resolution crops and match only on stable frontal frames.
 - [ ] Standard practice: maintain person identity between sparse face matches using tracker continuity.
+- [ ] Standard practice: **multi-angle / multi-shot enrollment.** Capture 3–5 crops per person at enrollment (frontal + slight left/right yaw, ideally at ≤ 1.5 m on 2D / ≤ 1 m on 360°), store as a small per-person gallery, and match runtime crops against the nearest-neighbour in the gallery (or against a quality-weighted average embedding). Cheap to implement on top of the existing `facenet-pytorch` path, no model retrain, and is the standard fix for the "enrollment ceiling" failure mode.
+- [ ] Standard practice: enforce an enrollment quality gate (minimum face-pixel size, frontal pose, sharpness) and prompt the user to re-enrol if not met, so the runtime envelope is predictable.
 - [ ] State-of-the-art: fuse face and body re-identification embeddings for longer-range identity persistence.
 
 ### 6. Data saving overhead not yet demo-validated
