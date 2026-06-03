@@ -202,6 +202,9 @@ If data saving has to stop because the disk or memory is full, the live engageme
 | `FaceIdentifier init failed` | Re-run `SETUP.bat` so it installs the Face ID weights, or place `model/20180402-114759-vggface2.pt` in the project manually |
 | Live plot window doesn't open | Python was installed without Tcl/Tk — reinstall Python and tick "tcl/tk and IDLE" |
 | `Model not found` | Make sure `model/best_model.pth`, `yolo26n.pt`, `rf_valence_full_v2.pkl`, `rf_arousal_full_v2.pkl` are all present in the folder |
+| `WeightsUnpickler error: Unsupported operand …` when loading `best_model.pth` | The repo's `best_model.pth` was overwritten with a full training checkpoint instead of a slim `state_dict`. Run `git lfs pull` to refresh, or re-export it with `python scripts/utils/reexport_checkpoint.py <bundle.pth> -o models/.../best_model.pth`. **Do not** patch the code to pass `weights_only=False` — see the Model Checkpoint section in the project root `README.md`. |
+| `best_model.pth` resolves to a path outside the repo (e.g. `C:\Users\<name>\AMPLIFY\models\...`) | You're on a pre-`5590200` commit. `git pull` on `GUI_Bug_Fix` to get the path-detection fix. |
+| `git pull` overwrote local edits | Always `git stash -u` (or commit) **before** `git checkout` / `git pull`. Recovery: `git reflog` for committed work, VS Code Timeline (`View → Open View → Timeline`) for unsaved-to-git edits. |
 | PyTorch CUDA not detected | Check NVIDIA drivers are up to date; run `python -c "import torch; print(torch.cuda.is_available())"` |
 
 ---

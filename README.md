@@ -157,6 +157,34 @@ python scripts/inference/console_subscriber.py
 
 **Output**: Engagement score (0.0–1.0) published to Redis at 1 Hz
 
+### 📦 Checkpoint Format (PyTorch 2.6+)
+
+`models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth` is stored
+as a **slim `state_dict`** (just the 55 model tensors, ~14 MB) — not the full
+training-time bundle. This is deliberate:
+
+- PyTorch 2.6 changed `torch.load`'s default to `weights_only=True`, which uses a
+  restricted unpickler that rejects optimiser state, argparse `Namespace`
+  objects, numpy scalars, etc. A full training checkpoint trips this with
+  `WeightsUnpickler error: Unsupported operand …`.
+- A bare `state_dict` (a `dict[str, Tensor]`) loads cleanly under the strict
+  default, with no `weights_only=False` opt-out and no security trade-off.
+
+**When re-training**, run the re-export utility before committing the new
+checkpoint so end-users on torch 2.6+ are not blocked:
+
+```bash
+python scripts/utils/reexport_checkpoint.py \
+  path/to/training_checkpoint.pth \
+  -o models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth
+```
+
+The script verifies the output round-trips under `weights_only=True` before
+overwriting. **Do not** revert the loader to `weights_only=False` to "fix" a
+load error — re-export the checkpoint instead.
+
+The pinned stack is `torch==2.6.0+cu124` (see `Handover_JuneSession/constraints.txt`).
+
 ---
 
 ## ✨ Features
