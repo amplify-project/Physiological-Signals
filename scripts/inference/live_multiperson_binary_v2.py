@@ -290,6 +290,23 @@ MODEL_INPUT_FRAMES = 300            # Fixed model input length (matches training
 MIN_INFERENCE_SECONDS = 1.0         # Wait until buffer spans >=1s before first inference
 BUFFER_HARD_CAP_FRAMES = 600        # Defensive cap (10s @ 60fps); time-prune is primary
 
+# --- Crowd-load FPS floor (Post-Bremen roadmap 2.d) ---
+# MediaPipe holistic runs once per detected person per frame at ~30-50 ms each
+# on CPU, so per-frame cost scales linearly with crowd size and FPS collapses
+# in dense audiences (30 people * 40 ms = 1.2 s/frame = 0.8 FPS). Fix: cap
+# MediaPipe calls per frame to a budget computed from a target FPS floor and a
+# running EWMA of per-person extraction cost. Persons not picked this frame
+# keep their cached score (still drawn, still aggregated) and are refreshed on
+# a later frame via round-robin. The time-windowed buffer (roadmap 2.c) makes
+# this safe: sparse-in-time features get resampled to MODEL_INPUT_FRAMES
+# evenly, so the model is unaware of the throttle.
+TARGET_FPS_FLOOR = 12.0             # Minimum FPS we try to hold regardless of crowd size
+MP_BUDGET_FRACTION = 0.70           # Fraction of frame budget reserved for MediaPipe
+MEDIAPIPE_BUDGET_MS = (1000.0 / TARGET_FPS_FLOOR) * MP_BUDGET_FRACTION
+MP_TIME_EWMA_ALPHA = 0.1            # Per-frame smoothing for measured extraction cost
+MP_TIME_DEFAULT_MS = 40.0           # Initial estimate before any measurement
+MIN_PERSONS_PER_FRAME = 1           # Always extract at least one person per frame
+
 # --- Stale-track eviction (Post-Bremen fix for ID inflation / RAM growth) ---
 # YOLO botsort/bytetrack assigns a fresh monotonically-increasing id every time
 # a person is re-detected after being lost. In dense crowds the live id set
@@ -847,6 +864,13 @@ class MultiPersonEngagementSystem:
         # end of each process_frame / process_view. Read by the overlay so the
         # "Context: X.Xs" readout reflects real time, not frame-count / FPS.
         self.current_context_seconds = 0.0
+
+        # Crowd-throttle state (roadmap 2.d): EWMA of per-person MediaPipe cost
+        # and a round-robin cursor so every person eventually gets refreshed.
+        self._mp_avg_ms = MP_TIME_DEFAULT_MS
+        self._rr_offset = 0
+        self.last_selected_count = 0
+        self.last_total_count = 0
         
         # Per-view YOLO trackers for 360° mode (avoids cross-view ID confusion)
         self._view_yolos = {}
@@ -898,13 +922,28 @@ class MultiPersonEngagementSystem:
                 detections.append((track_id, (x1, y1, x2, y2)))
         return detections
     
-    def extract_and_infer_person(self, frame_rgb, track_id, bbox, view_idx):
+    def extract_and_infer_person(self, frame_rgb, track_id, bbox, view_idx, selected=True):
         """Phase 2: MediaPipe features + engagement inference for one person (CPU-heavy).
         
         Safe to call from multiple threads — each view has its own holistic instance.
+        When selected=False, skips MediaPipe + model and returns cached score with a
+        fresh bbox; this is the throttled-frame path (roadmap 2.d).
         """
+        if not selected:
+            self._ensure_buffer(track_id)
+            return {
+                'bbox': bbox,
+                'padded_bbox': bbox,
+                'id': track_id,
+                'score': self.person_scores[track_id],
+                'buffer_fill': min(self._buffer_time_span(track_id) / TARGET_DURATION_SECONDS, 1.0),
+                'keypoints': None,
+            }
+
         holistic = self._get_view_holistic(view_idx)
+        mp_t0 = time.perf_counter()
         features, padded_bbox = self._extract_features_with_holistic(frame_rgb, bbox, holistic)
+        self._record_mp_time((time.perf_counter() - mp_t0) * 1000.0)
         features_flat = features.flatten()
         self._append_features(track_id, features_flat)
 
@@ -938,9 +977,18 @@ class MultiPersonEngagementSystem:
         detections = self.detect_view(frame_bgr, view_idx)
         active_ids = set(tid for tid, _ in detections)
         self._evict_stale_tracks(active_ids)
+
+        # Per-view person budget (roadmap 2.d). Each view runs sequentially in
+        # its own thread so a per-view budget keeps per-view frame cost bounded.
+        ordered_ids = [tid for tid, _ in detections]
+        selected_ids = self._select_persons_for_extraction(ordered_ids)
+
         current_frame_data = []
         for track_id, bbox in detections:
-            person = self.extract_and_infer_person(frame_rgb, track_id, bbox, view_idx)
+            person = self.extract_and_infer_person(
+                frame_rgb, track_id, bbox, view_idx,
+                selected=(track_id in selected_ids),
+            )
             current_frame_data.append(person)
         
         if current_frame_data:
@@ -1134,6 +1182,37 @@ class MultiPersonEngagementSystem:
         spans = [self._buffer_time_span(tid) for tid in self.person_buffers]
         self.current_context_seconds = min(max(spans), TARGET_DURATION_SECONDS) if spans else 0.0
 
+    # --- Crowd-load throttling (roadmap 2.d) --------------------------------
+
+    def _select_persons_for_extraction(self, ordered_track_ids):
+        """Pick which persons get a fresh MediaPipe pass this frame.
+        Budget = MEDIAPIPE_BUDGET_MS / EWMA(per-person extract cost), clamped
+        to [MIN_PERSONS_PER_FRAME, N]. Round-robin so every person gets a turn.
+        Returns a set of track_ids selected for full extraction this frame."""
+        n = len(ordered_track_ids)
+        self.last_total_count = n
+        if n == 0:
+            self.last_selected_count = 0
+            return set()
+        budget = max(MIN_PERSONS_PER_FRAME,
+                     int(MEDIAPIPE_BUDGET_MS / max(self._mp_avg_ms, 1.0)))
+        if budget >= n:
+            self.last_selected_count = n
+            return set(ordered_track_ids)
+        start = self._rr_offset % n
+        end = start + budget
+        if end <= n:
+            selected = ordered_track_ids[start:end]
+        else:
+            selected = ordered_track_ids[start:] + ordered_track_ids[:end - n]
+        self._rr_offset = (self._rr_offset + budget) % n
+        self.last_selected_count = len(selected)
+        return set(selected)
+
+    def _record_mp_time(self, elapsed_ms):
+        self._mp_avg_ms = ((1.0 - MP_TIME_EWMA_ALPHA) * self._mp_avg_ms
+                           + MP_TIME_EWMA_ALPHA * elapsed_ms)
+
     def process_frame(self, frame):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self._frame_counter += 1
@@ -1153,30 +1232,45 @@ class MultiPersonEngagementSystem:
             active_ids = set(int(t) for t in track_ids)
             self._evict_stale_tracks(active_ids)
 
+            # Throttle MediaPipe to hold TARGET_FPS_FLOOR: pick a budget-sized
+            # subset of persons this frame; unselected persons reuse cached score.
+            ordered_ids = [int(t) for t in track_ids]
+            selected_ids = self._select_persons_for_extraction(ordered_ids)
+
             for box, track_id in zip(boxes, track_ids):
                 x1, y1, x2, y2 = map(int, box)
+                tid_int = int(track_id)
 
-                # 2. Extract features and append with timestamp (auto-prunes >10s old)
-                features, padded_bbox = self.extract_features(frame_rgb, (x1, y1, x2, y2))
-                features_flat = features.flatten()
-                self._append_features(track_id, features_flat)
+                if tid_int in selected_ids:
+                    # 2. Extract features and append with timestamp (auto-prunes >10s old)
+                    mp_t0 = time.perf_counter()
+                    features, padded_bbox = self.extract_features(frame_rgb, (x1, y1, x2, y2))
+                    self._record_mp_time((time.perf_counter() - mp_t0) * 1000.0)
+                    features_flat = features.flatten()
+                    self._append_features(track_id, features_flat)
 
-                # 3. Inference (gated on wall-clock span, not frame count; resample
-                #    to MODEL_INPUT_FRAMES so the model always sees its trained shape)
-                if self._buffer_ready(track_id):
-                    buf_array = self._resample_buffer(track_id)
-                    if buf_array is not None:
-                        input_tensor = torch.tensor(
-                            buf_array,
-                            dtype=self.tensor_dtype,
-                            device=self.device
-                        ).unsqueeze(0)
-                        with torch.no_grad():
-                            logits = self.model(input_tensor)
-                            probs = torch.softmax(logits, dim=1)
-                            # Class 1 is 'Engaged'
-                            score = probs[0][1].item()
-                            self.person_scores[track_id] = score
+                    # 3. Inference (gated on wall-clock span, not frame count; resample
+                    #    to MODEL_INPUT_FRAMES so the model always sees its trained shape)
+                    if self._buffer_ready(track_id):
+                        buf_array = self._resample_buffer(track_id)
+                        if buf_array is not None:
+                            input_tensor = torch.tensor(
+                                buf_array,
+                                dtype=self.tensor_dtype,
+                                device=self.device
+                            ).unsqueeze(0)
+                            with torch.no_grad():
+                                logits = self.model(input_tensor)
+                                probs = torch.softmax(logits, dim=1)
+                                # Class 1 is 'Engaged'
+                                score = probs[0][1].item()
+                                self.person_scores[track_id] = score
+                else:
+                    # Throttled this frame: skip MediaPipe + model, keep cached score.
+                    # YOLO bbox is fresh so the overlay still tracks the person live.
+                    self._ensure_buffer(track_id)
+                    features = None
+                    padded_bbox = (x1, y1, x2, y2)
 
                 current_frame_data.append({
                     'bbox': (x1, y1, x2, y2),
@@ -2293,7 +2387,10 @@ def main():
         platform_str = f"{platform_info['os']} | {actual_device.upper()}"
         people_count = len(people_data)
         context_seconds = system.current_context_seconds
-        fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s"
+        throttle_str = ""
+        if system.last_total_count > 0 and system.last_selected_count < system.last_total_count:
+            throttle_str = f" | MP: {system.last_selected_count}/{system.last_total_count}"
+        fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s{throttle_str}"
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
