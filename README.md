@@ -157,6 +157,34 @@ python scripts/inference/console_subscriber.py
 
 **Output**: Engagement score (0.0–1.0) published to Redis at 1 Hz
 
+### 📦 Checkpoint Format (PyTorch 2.6+)
+
+`models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth` is stored
+as a **slim `state_dict`** (just the 55 model tensors, ~14 MB) — not the full
+training-time bundle. This is deliberate:
+
+- PyTorch 2.6 changed `torch.load`'s default to `weights_only=True`, which uses a
+  restricted unpickler that rejects optimiser state, argparse `Namespace`
+  objects, numpy scalars, etc. A full training checkpoint trips this with
+  `WeightsUnpickler error: Unsupported operand …`.
+- A bare `state_dict` (a `dict[str, Tensor]`) loads cleanly under the strict
+  default, with no `weights_only=False` opt-out and no security trade-off.
+
+**When re-training**, run the re-export utility before committing the new
+checkpoint so end-users on torch 2.6+ are not blocked:
+
+```bash
+python scripts/utils/reexport_checkpoint.py \
+  path/to/training_checkpoint.pth \
+  -o models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth
+```
+
+The script verifies the output round-trips under `weights_only=True` before
+overwriting. **Do not** revert the loader to `weights_only=False` to "fix" a
+load error — re-export the checkpoint instead.
+
+The pinned stack is `torch==2.6.0+cu124` (see `Handover_JuneSession/constraints.txt`).
+
 ---
 
 ## ✨ Features
@@ -165,13 +193,51 @@ python scripts/inference/console_subscriber.py
 - **Phase 1**: Checks cached (last-used) camera index with a full 3-frame real-content test — instant startup when the same camera is plugged in
 - **Phase 2**: Quick-scans remaining indices (0–9) with a 3-frame test to detect any additional cameras
 - When only one real camera is found, selects it automatically
-- **When multiple real cameras exist**, opens a tiled live-preview window showing all feeds simultaneously — press `1`/`2`/`3`... to choose, `Enter` to accept the default (last-used first, then 360°), `Q` to quit
+- **When multiple real cameras exist**, opens a tiled live-preview window showing all feeds simultaneously — press `1`/`2`/`3`... to choose (1-indexed by list position, not OS device index), `Enter` to accept the default (last-used first, then 360°), `Q` to quit
+- **`--select-camera` / `-s`** forces the picker to appear on every run, even when only one camera is detected, and bypasses the last-used cache so a freshly plugged-in USB webcam is always discovered. Useful for non-technical end users handing the laptop between people. The bundled `Handover_JuneSession/3_START_ENGAGEMENT.bat` passes this flag by default.
 - Default camera highlighted in green in the picker; camera used most recently labelled "last used"
 - Filters out virtual cameras (OBS, NDI, SMPTE colour bars) using brightness, uniformity, and frame-diff checks — static or blank feeds are rejected
 - Caches the selected camera index for instant startup next time
 - Prioritises 360° cameras as default when no last-used preference is set
 - Cross-platform: DirectShow backend on Windows, default backend on macOS/Linux
 - Clean console output — MediaPipe/TFLite C++ warnings suppressed via OS-level stderr redirect
+
+### 🖥️ Resizable GUI Window
+- Main display window is created as `WINDOW_NORMAL` and resized to fit `frame width + physio sidebar`, capped at 1600 px so it never opens larger than a typical laptop screen.
+- Without this OpenCV defaults to `WINDOW_AUTOSIZE`, which on smaller displays pushes the title bar, RHS physio sidebar, and bottom FPS overlay off-screen and breaks the `q`-to-quit shortcut.
+- `opencv-contrib-python` is pinned to `4.10.0.84` in `requirements.txt` to avoid HighGUI regressions seen on some Windows machines with 4.11.x.
+
+### 📝 Logging
+Every pipeline entry-point writes a rotating log file so post-mortem debugging is possible after a session, without impacting frame rates.
+
+- **Where:**
+  ```
+  data/logs/engagement/engagement_<timestamp>_pid<n>.log   # multiperson camera app
+  data/logs/emotibit/emotibit_<timestamp>_pid<n>.log       # EmotiBit UDP + ML pipeline
+  data/logs/subscriber/subscriber_<timestamp>_pid<n>.log   # Redis subscriber CLI
+  ```
+  10 MB per file × 5 rotations = ~50 MB ceiling per script. New file per run.
+
+- **What is logged:**
+  - **Startup context** — platform, Python version, PID, full CLI args, camera/Redis/device choices, model paths.
+  - **Errors and warnings** — Redis disconnects, camera open failures, missing models, disk-full events, parse failures on Redis messages, MediaPipe / YOLO init issues.
+  - **Uncaught exceptions** — full stack trace via `sys.excepthook`, so a crash on Sowmya's laptop can be diagnosed from the log alone.
+  - **Lifecycle events** — session start/end, model load, FPS calibration result, save-dir path, EmotiBit device discovery, face enrolment events.
+  - All messages carry a millisecond timestamp and the originating thread name.
+
+- **What is NOT logged** (by design):
+  - Per-frame engagement scores and keypoints — those still go to the existing JSONL/NPZ files under `data/sessions/`. Logging them would be high-frequency noise; the session data IS the per-frame record.
+  - Console `print(...)` output is unchanged; the console log handler only echoes WARNING+ so the user-facing on-screen feedback stays the same.
+
+- **How it stays fast (async):** producer threads (camera loop, EmotiBit UDP receiver, Redis listener) only push records onto an in-memory `queue.Queue` via a `QueueHandler` (microsecond cost, no disk I/O). A single background `QueueListener` thread drains the queue and handles all formatting + file writes. The 30 FPS render loop is not blocked even at high log volume.
+
+- **For developers:** any module can opt in with one line and messages flow into the same log file:
+  ```python
+  import logging
+  log = logging.getLogger(__name__)
+  log.info("loaded model in %.2fs", elapsed)
+  ```
+  The shared setup lives in [src/applog.py](src/applog.py).
 
 ### 🌐 360° Camera Support
 - Auto-detects equirectangular video format (2:1 aspect ratio)

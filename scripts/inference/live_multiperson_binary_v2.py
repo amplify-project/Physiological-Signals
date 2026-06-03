@@ -48,10 +48,17 @@ import logging
 logging.getLogger('absl').setLevel(logging.ERROR)
 
 # Redirect OS-level stderr (fd 2) to devnull to suppress C++ warnings,
-# then restore it after MediaPipe model initialization
+# then restore it after MediaPipe model initialization.
+# IMPORTANT: we set up the fds here but do NOT redirect yet — that happens
+# lazily inside _silence_native_stderr(), called just before MediaPipe init.
+# Doing it at module top hides genuine startup errors (YOLO/checkpoint loads)
+# from the console and makes failures look like silent exits.
 _stderr_fd = os.dup(2)
 _devnull = os.open(os.devnull, os.O_WRONLY)
-os.dup2(_devnull, 2)
+
+def _silence_native_stderr():
+    """Redirect OS fd 2 to devnull (call right before MediaPipe init)."""
+    os.dup2(_devnull, 2)
 
 import cv2
 if not hasattr(cv2, 'VideoCapture'):
@@ -78,6 +85,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 from face_identifier import FaceIdentifier, IDENTIFIED_COLOR
+
+# Shared async logger (writes to data/logs/engagement/<ts>.log).
+# Imported via a sys.path insert so the script still works when launched
+# directly (not as a package).
+import sys as _sys
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root / 'src') not in _sys.path:
+    _sys.path.insert(0, str(_repo_root / 'src'))
+from applog import setup_logging, install_excepthook  # noqa: E402
+import logging as _logging
+log = _logging.getLogger('engagement')
 
 # Optional: 360° support
 try:
@@ -217,12 +235,30 @@ DEFAULT_REDIS_HOST = 'localhost'
 DEFAULT_REDIS_PORT = 6379
 REDIS_CHANNEL = 'engagement_score'  # Channel to publish to
 
-# Cross-platform paths using pathlib
-SCRIPT_DIR = Path(__file__).parent.resolve()  # scripts/inference/
-PROJECT_ROOT = SCRIPT_DIR.parent.parent  # Go up 2 levels: scripts/ -> project root
-MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
-YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
-YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
+# Cross-platform paths using pathlib.
+# Two supported layouts:
+#   1. Self-contained handover bundle (end-user, no git):
+#        <bundle>/live_multiperson_binary_v2.py
+#        <bundle>/model/best_model.pth
+#        <bundle>/yolo11n.pt
+#        <bundle>/yolo26n.pt
+#   2. Project tree (developer, scripts/inference/):
+#        <repo>/scripts/inference/live_multiperson_binary_v2.py
+#        <repo>/models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth
+#        <repo>/yolo11n.pt
+SCRIPT_DIR = Path(__file__).parent.resolve()
+_LOCAL_MODEL = SCRIPT_DIR / 'model' / 'best_model.pth'
+if _LOCAL_MODEL.exists():
+    # Self-contained bundle
+    MODEL_PATH = _LOCAL_MODEL
+    YOLO_MODEL_PATH = SCRIPT_DIR / 'yolo11n.pt'
+    YOLO_FALLBACK_PATH = SCRIPT_DIR / 'yolo26n.pt'
+else:
+    # Project tree
+    PROJECT_ROOT = SCRIPT_DIR.parent.parent
+    MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
+    YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
+    YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
 
 # Default session data directory: relative to CWD (not __file__)
 # This ensures compatibility when packaged as an executable (PyInstaller etc.)
@@ -703,9 +739,28 @@ class MultiPersonEngagementSystem:
         self.publish_interval = 1.0  # seconds
 
         # 2. Load YOLO (person detection)
+        def _check_lfs(p):
+            """Detect unmaterialised Git LFS pointer files (<1 KB and starts with 'version')."""
+            try:
+                if p.stat().st_size < 1024:
+                    with open(p, 'rb') as fh:
+                        head = fh.read(64)
+                    if head.startswith(b'version https://git-lfs'):
+                        print(f"❌ {p.name} is an unfetched Git LFS pointer ({p.stat().st_size} bytes).")
+                        print(f"   Run 'git lfs install' once, then 'git lfs pull' in the repo root.")
+                        sys.exit(1)
+            except FileNotFoundError:
+                pass
+        _check_lfs(YOLO_MODEL_PATH)
+        _check_lfs(YOLO_FALLBACK_PATH)
+        _check_lfs(MODEL_PATH)
         if YOLO_MODEL_PATH.exists():
             print(f"Loading {YOLO_MODEL_PATH.name}...")
-            self.yolo = YOLO(str(YOLO_MODEL_PATH))
+            try:
+                self.yolo = YOLO(str(YOLO_MODEL_PATH))
+            except Exception as e:
+                print(f"❌ YOLO failed to load {YOLO_MODEL_PATH}: {e}")
+                sys.exit(1)
         elif YOLO_FALLBACK_PATH.exists():
             print(f"⚠️  {YOLO_MODEL_PATH.name} not found, using {YOLO_FALLBACK_PATH.name}")
             self.yolo = YOLO(str(YOLO_FALLBACK_PATH))
@@ -715,6 +770,7 @@ class MultiPersonEngagementSystem:
         
         # 3. Initialize MediaPipe Holistic
         print("Initializing MediaPipe...")
+        _silence_native_stderr()  # MediaPipe C++ init spams fd 2; restored after first frame
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
             static_image_mode=False,
@@ -1109,21 +1165,47 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
         # HR — same line as label, right-aligned area
         with emotibit_lock:
-            snap_eda = list(emotibit_data.get(serial, {}).get('eda', []))
-            snap_hr  = list(emotibit_data.get(serial, {}).get('hr',  []))
-            snap_metrics = dict(emotibit_data.get(serial, {}).get('metrics', {}))
+            d = emotibit_data.get(serial, {})
+            snap_eda    = list(d.get('eda', []))
+            snap_hr     = list(d.get('hr',  []))
+            snap_eda_sd = list(d.get('eda_sd', []))
+            snap_hr_sd  = list(d.get('hr_sd',  []))
+            snap_metrics = dict(d.get('metrics', {}))
         if snap_hr:
             hr_text = f"{snap_hr[-1]:.0f}bpm"
             hr_col  = (100, 210, 100)
-        elif 'hr_sd' in snap_metrics:
-            hr_text = f"HR SD {snap_metrics['hr_sd']:.2f}"
+        elif snap_hr_sd:
+            hr_text = f"HR SD {snap_hr_sd[-1]:.2f}"
             hr_col  = (100, 210, 100)
         else:
             hr_text = "--"
             hr_col  = (80, 80, 80)
         cv2.putText(sidebar, hr_text, (sidebar_w - 86, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
-        # EDA spline plot — fills remaining vertical space
+        # Temp ROC SD — small secondary readout right under HR
+        temp_roc = snap_metrics.get('temperature_roc_sd')
+        if temp_roc is not None:
+            cv2.putText(sidebar, f"Ṫ SD {temp_roc:.3f}",
+                        (sidebar_w - 86, y0 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (170, 170, 220), 1, cv2.LINE_AA)
+        # EDA spline plot — fills remaining vertical space.
+        # Prefer raw EDA stream when available; otherwise plot the EDA SD stream
+        # (which is what the SD-pipeline publishes since May 28 2026).
+        if snap_eda:
+            plot_arr   = snap_eda
+            plot_label = "EDA"
+            plot_unit  = "µS"
+            line_col   = (80, 200, 255)
+        elif snap_eda_sd:
+            plot_arr   = snap_eda_sd
+            plot_label = "EDA SD"
+            plot_unit  = ""
+            line_col   = (80, 200, 255)
+        else:
+            plot_arr = []
+            plot_label = "EDA"
+            plot_unit = ""
+            line_col = (80, 200, 255)
         plot_x  = 4
         plot_y  = y0 + 22
         plot_pw = sidebar_w - 8
@@ -1131,8 +1213,8 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         if plot_ph > 12:
             cv2.rectangle(sidebar, (plot_x, plot_y),
                           (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
-            if len(snap_eda) > 2:
-                arr = np.array(snap_eda, dtype=np.float32)
+            if len(plot_arr) > 2:
+                arr = np.array(plot_arr, dtype=np.float32)
                 mn, mx = float(arr.min()), float(arr.max())
                 rng = (mx - mn) if mx != mn else 1.0
                 xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
@@ -1141,37 +1223,21 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                       - ((arr - mn) / rng * (plot_ph - 4))).round().astype(np.int32)
                 ys = np.clip(ys, plot_y, plot_y + plot_ph - 2)
                 pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
-                cv2.polylines(sidebar, [pts], False, (80, 200, 255), 1, cv2.LINE_AA)
-                # y-axis: label + max (top-left), min (bottom-left), current (top-right)
+                cv2.polylines(sidebar, [pts], False, line_col, 1, cv2.LINE_AA)
                 lbl_col = (75, 120, 150)
-                cv2.putText(sidebar, f"EDA {mx:.2f}µS",
+                cv2.putText(sidebar, f"{plot_label} {mx:.2f}{plot_unit}",
                             (plot_x + 2, plot_y + 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
                 cv2.putText(sidebar, f"{mn:.2f}",
                             (plot_x + 2, plot_y + plot_ph - 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                eda_now = f"{arr[-1]:.3f}"
-                cv2.putText(sidebar, eda_now,
+                cv2.putText(sidebar, f"{arr[-1]:.3f}",
                             (sidebar_w - 46, plot_y + 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, (80, 200, 255), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, line_col, 1, cv2.LINE_AA)
             else:
-                metric_items = [
-                    ("EDA SD", snap_metrics.get('eda_sd')),
-                    ("HR SD", snap_metrics.get('hr_sd')),
-                    ("Temp ROC SD", snap_metrics.get('temperature_roc_sd')),
-                    ("SCR SD", snap_metrics.get('scr_frequency_sd')),
-                    ("IBI SD", snap_metrics.get('ibi_sd')),
-                ]
-                metric_items = [(name, value) for name, value in metric_items if value is not None]
-                if metric_items:
-                    for row_idx, (name, value) in enumerate(metric_items[:5]):
-                        cv2.putText(sidebar, f"{name}: {value:.3f}",
-                                    (plot_x + 4, plot_y + 12 + row_idx * 12),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, (90, 180, 210), 1, cv2.LINE_AA)
-                else:
-                    cv2.putText(sidebar, "Physio: no signal",
-                                (plot_x + 4, plot_y + plot_ph // 2 + 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
+                cv2.putText(sidebar, "Physio: no signal",
+                            (plot_x + 4, plot_y + plot_ph // 2 + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
         if i < n - 1:
             cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
     return sidebar
@@ -1186,6 +1252,10 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-Person Engagement Detection with Redis Streaming')
     parser.add_argument('--camera', type=int, default=None,
                         help='Force specific camera index (skips auto-detection)')
+    parser.add_argument('--select-camera', '-s', action='store_true', default=False,
+                        help='Always show the camera-selection preview (ignores last-used cache). '
+                             'Useful when an external webcam is plugged in and the user wants '
+                             'to pick it instead of the built-in laptop camera.')
     parser.add_argument('--video', type=str, default=None,
                         help='Path to video file (overrides --camera)')
     parser.add_argument('--redis-host', type=str, default=DEFAULT_REDIS_HOST,
@@ -1213,14 +1283,27 @@ def main():
     # Detect platform and device
     platform_info = get_platform_info()
     actual_device = get_best_device() if args.device == 'auto' else args.device
-    
+
+    # Wire up the shared async logger first so everything below is captured.
+    setup_logging('engagement', extra_context={
+        'camera': str(args.camera) if args.camera is not None else (
+            'video:' + args.video if args.video else 'auto'),
+        'redis': f"{args.redis_host}:{args.redis_port}",
+        'device': args.device,
+        'save': str(args.save or args.save_engagement or args.save_keypoints),
+    })
+    install_excepthook(log)
+    log.info('Engagement inference starting (args=%s)', vars(args))
+
     print(f"🖥️  Platform: {platform_info['os']} ({platform_info['machine']})")
     if args.video:
         print(f"🎥 Video File: {args.video}")
     elif args.camera is not None:
         print(f"🎥 Camera: index {args.camera} (manual)")
+    elif args.select_camera:
+        print(f"🎥 Camera: interactive selection (--select-camera)")
     else:
-        print(f"🎥 Camera: auto-detect")
+        print(f"🎥 Camera: auto-detect  (tip: re-run with --select-camera to pick a different one)")
     print(f"📡 Redis Server: {args.redis_host}:{args.redis_port}")
     print(f"💻 Device: {actual_device} {'(auto-detected)' if args.device == 'auto' else ''}")
     
@@ -1295,6 +1378,8 @@ def main():
                             emotibit_data[serial] = {
                                 'eda': deque(maxlen=125),
                                 'hr':  deque(maxlen=125),
+                                'eda_sd': deque(maxlen=180),
+                                'hr_sd':  deque(maxlen=180),
                                 'metrics': {},
                             }
                         if 'EDA_filtered' in data:
@@ -1314,7 +1399,12 @@ def main():
                             }
                             for source_key, target_key in metric_aliases.items():
                                 if source_key in data:
-                                    emotibit_data[serial]['metrics'][target_key] = float(data[source_key])
+                                    v = float(data[source_key])
+                                    emotibit_data[serial]['metrics'][target_key] = v
+                                    if target_key == 'eda_sd':
+                                        emotibit_data[serial]['eda_sd'].append(v)
+                                    elif target_key == 'hr_sd':
+                                        emotibit_data[serial]['hr_sd'].append(v)
                 except Exception:
                     pass
         except Exception as e:
@@ -1391,7 +1481,7 @@ def main():
         # Non-Windows: default backend
         return cv2.VideoCapture(index)
 
-    def select_camera_interactively(detected_cameras, default_camera):
+    def select_camera_interactively(detected_cameras, default_camera, force=False):
         """
         Show a live tiled preview of all detected cameras and let the user
         choose one via a keypress.
@@ -1402,8 +1492,10 @@ def main():
             Q / Escape     — quit application
 
         Returns the chosen camera dict from detected_cameras.
+        When force=False (default) the selector is skipped for a single camera;
+        set force=True (via --select-camera) to always show it.
         """
-        if len(detected_cameras) == 1:
+        if len(detected_cameras) == 1 and not force:
             return detected_cameras[0]
 
         TILE_W, TILE_H = 320, 240
@@ -1526,8 +1618,11 @@ def main():
         skipped_virtual = 0
 
         # --- Phase 1: Try cached camera (fast path, 3 test frames) ---
+        # When --select-camera is set, skip the cache entirely so the user
+        # always gets a full scan + selector (e.g. they just plugged in a
+        # USB webcam and want to pick it).
         cached_idx = None
-        if CAMERA_CACHE_FILE.exists():
+        if not args.select_camera and CAMERA_CACHE_FILE.exists():
             try:
                 cached_idx = int(CAMERA_CACHE_FILE.read_text().strip())
             except (ValueError, OSError):
@@ -1640,13 +1735,15 @@ def main():
         if skipped_virtual > 0:
             print(f"   ({skipped_virtual} virtual cameras filtered out)")
 
-        if len(detected_cameras) > 1:
-            selected = select_camera_interactively(detected_cameras, default_camera)
+        if len(detected_cameras) > 1 or args.select_camera:
+            selected = select_camera_interactively(
+                detected_cameras, default_camera, force=args.select_camera,
+            )
         else:
             selected = default_camera
             icon = "\U0001f310" if selected['is_360'] else "\U0001f4f7"
             kind = "360\u00b0" if selected['is_360'] else "2D"
-            print(f"\n{icon} {kind} camera auto-selected: index {selected['index']} ({selected['resolution']})") 
+            print(f"\n{icon} {kind} camera auto-selected: index {selected['index']} ({selected['resolution']})")
         
         # Cache selected camera for next startup
         try:
@@ -1789,7 +1886,13 @@ def main():
     
     # Use prefetcher for 360° mode (large frame decode benefits from overlap)
     prefetcher = FramePrefetcher(cap) if is_360 else None
-    
+
+    # Name of the main display window. The window itself is created lazily on
+    # the first imshow below (with WINDOW_NORMAL) so that any earlier OpenCV
+    # windows (e.g. the --select-camera preview) finish cleanly first and we
+    # don't leave a grey placeholder window on screen.
+    _WIN_NAME = 'Concert Engagement System'
+
     while True:
         frame_start_time = time.time()
         
@@ -2115,11 +2218,26 @@ def main():
             face_id.enrolled_names if face_id and not is_360 else [],
             emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
         )
-        cv2.imshow('Concert Engagement System', np.hstack([display_frame, _sidebar]))
+        # Lazily create the main window as resizable on the very first frame.
+        # Doing this here (after any --select-camera preview has been torn
+        # down) avoids a stray empty grey window on screen during startup.
+        # Without WINDOW_NORMAL OpenCV defaults to WINDOW_AUTOSIZE, which on
+        # smaller laptop screens pushes the title bar, physio sidebar (RHS)
+        # and FPS overlay (bottom) off-screen and breaks the 'q' shortcut.
         if not _mouse_cb_set[0]:
-            cv2.setMouseCallback('Concert Engagement System', on_mouse)
+            cv2.namedWindow(_WIN_NAME, cv2.WINDOW_NORMAL)
+
+        cv2.imshow(_WIN_NAME, np.hstack([display_frame, _sidebar]))
+        if not _mouse_cb_set[0]:
+            cv2.setMouseCallback(_WIN_NAME, on_mouse)
             video_w_box[0] = w
             _mouse_cb_set[0] = True
+            # Fit the window to the composited frame width on first frame,
+            # but cap at 1600px so it never opens larger than typical laptop screens.
+            _full_w = w + SIDEBAR_W
+            _init_w = min(_full_w, 1600)
+            _init_h = int(h * (_init_w / _full_w))
+            cv2.resizeWindow(_WIN_NAME, _init_w, _init_h)
 
         key = cv2.waitKey(1) & 0xFF
         
@@ -2181,7 +2299,7 @@ def main():
                         emotibit_data, emotibit_lock, focus_target,
                         sidebar_radio_rects, SIDEBAR_W,
                     )
-                    cv2.imshow('Concert Engagement System', np.hstack([overlay, _sb_reg]))
+                    cv2.imshow(_WIN_NAME, np.hstack([overlay, _sb_reg]))
                     k = cv2.waitKey(50) & 0xFF
                     if k == 27:                        # Esc — cancel
                         input_cancelled = True

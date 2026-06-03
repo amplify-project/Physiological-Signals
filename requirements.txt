@@ -27,7 +27,11 @@
 # -----------------------------------------------------------------------------
 # Computer Vision & Pose Estimation
 # -----------------------------------------------------------------------------
-opencv-contrib-python>=4.8.0  # mediapipe needs contrib; do NOT install opencv-python alongside
+# Pinned: 4.10.0.84 is tested across Windows/macOS/Linux for the OpenCV HighGUI
+# behaviour the live app relies on (WINDOW_NORMAL resize, waitKey focus, mouse
+# callbacks). Newer 4.11.x builds have shipped HighGUI regressions on some
+# Windows machines (window opens fullscreen / non-resizable, 'q' key ignored).
+opencv-contrib-python==4.10.0.84  # mediapipe needs contrib; do NOT install opencv-python alongside
 mediapipe>=0.10.0,<0.10.15    # 0.10.15+ removed mp.solutions.holistic API
 ultralytics>=8.3.0          # YOLO26 for person detection (end-to-end, NMS-free)
 lap>=0.5.12                 # Required by ultralytics tracker (not auto-installed in venvs)

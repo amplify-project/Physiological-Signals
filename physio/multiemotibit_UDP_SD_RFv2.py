@@ -23,6 +23,15 @@ import pandas as pd
 import joblib
 import redis
 
+# Shared async logger (writes to data/logs/emotibit/<ts>.log).
+import sys as _sys
+_repo_root = Path(__file__).resolve().parents[1]
+if str(_repo_root / 'src') not in _sys.path:
+    _sys.path.insert(0, str(_repo_root / 'src'))
+from applog import setup_logging, install_excepthook  # noqa: E402
+import logging as _logging
+log = _logging.getLogger('emotibit')
+
 # ----------------------------- SETTINGS -----------------------------
 COLUMNS = ["EDA", "HeartRate"]  # For feature extraction (used for predictions)
 WINDOW_SECONDS = 5
@@ -680,6 +689,13 @@ def _ensure_firewall_rules():
 
 # ----------------------------- MAIN -----------------------------
 def main():
+    setup_logging('emotibit', extra_context={
+        'redis': f'{REDIS_HOST}:{REDIS_PORT}',
+        'window_seconds': str(WINDOW_SECONDS),
+        'emit_rate_hz': str(EMIT_RATE_HZ),
+    })
+    install_excepthook(log)
+    log.info('EmotiBit pipeline starting')
     _ensure_firewall_rules()
 
     print("Loading models...")

@@ -47,29 +47,48 @@ if exist .venv (
     rmdir /s /q .venv
 )
 
-echo [1/5] Creating virtual environment...
+echo [1/6] Creating virtual environment...
 %PYEXE% -m venv .venv
+if errorlevel 1 (
+    echo.
+    echo ERROR: Could not create the virtual environment.
+    echo Make sure Python 3.10, 3.11, or 3.12 is installed correctly.
+    pause
+    exit /b 1
+)
 call .venv\Scripts\activate.bat
-pip install --upgrade pip --quiet
 
 echo.
-echo [2/5] Installing PyTorch 2.6.0 (CUDA 12.4)...
+echo [2/6] Upgrading pip, setuptools and wheel inside the venv...
+echo       (this prevents the red "new release of pip available" warning
+echo        from appearing during the package installs below - it is cosmetic
+echo        but looks alarming. Upgrading first makes the rest of setup quiet.)
+python -m pip install --upgrade pip setuptools wheel --disable-pip-version-check
+if errorlevel 1 (
+    echo.
+    echo ERROR: Could not upgrade pip. Check your internet connection.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [3/6] Installing PyTorch 2.6.0 (CUDA 12.4)...
 echo       (must be installed first from the PyTorch index)
-pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install --disable-pip-version-check torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
 
 echo.
-echo [3/5] Installing remaining dependencies...
+echo [4/6] Installing remaining dependencies...
 echo       (constraints.txt locks torch so pip cannot downgrade it)
-pip install -r requirements.txt -c constraints.txt --extra-index-url https://download.pytorch.org/whl/cu124
+python -m pip install --disable-pip-version-check -r requirements.txt -c constraints.txt --extra-index-url https://download.pytorch.org/whl/cu124
 
 echo.
-echo [4/5] Installing facenet-pytorch (face ID model)...
+echo [5/6] Installing facenet-pytorch (face ID model)...
 echo       (installed separately: its metadata has an outdated torch constraint)
 echo       (the code is runtime-compatible with torch 2.6.0)
-pip install facenet-pytorch==2.6.0 --no-deps
+python -m pip install --disable-pip-version-check facenet-pytorch==2.6.0 --no-deps
 
 echo.
-echo [5/5] Ensuring face ID weights are available locally...
+echo [6/6] Ensuring face ID weights are available locally...
 if not exist model mkdir model
 if exist model\20180402-114759-vggface2.pt (
     echo       Face ID weights already present.
@@ -92,7 +111,7 @@ echo.
 echo ============================================================
 echo  Verifying key package versions...
 echo ============================================================
-pip list | findstr /i "torch torchvision torchaudio facenet ultralytics mediapipe pillow numpy opencv"
+python -m pip list --disable-pip-version-check | findstr /i "torch torchvision torchaudio facenet ultralytics mediapipe pillow numpy opencv"
 
 echo.
 echo ============================================================
