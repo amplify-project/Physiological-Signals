@@ -42,12 +42,11 @@ _LOG_PATH: Path | None = None
 
 
 def _default_log_dir(script_name: str) -> Path:
-    # Repo root = parent of src/. Falls back to CWD if the layout is unexpected.
+    # Handover bundle is self-contained: always anchor logs to this file's
+    # parent folder (Handover_JuneSession/data/logs/<script>) so log location
+    # doesn't depend on the user's CWD when launching the .bat files.
     here = Path(__file__).resolve()
-    for candidate in (here.parents[1], here.parents[2]):
-        if (candidate / "src").is_dir():
-            return candidate / "data" / "logs" / script_name
-    return Path.cwd() / "data" / "logs" / script_name
+    return here.parent / "data" / "logs" / script_name
 
 
 def setup_logging(
