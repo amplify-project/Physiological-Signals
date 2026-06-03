@@ -228,8 +228,14 @@ DEFAULT_REDIS_PORT = 6379
 REDIS_CHANNEL = 'engagement_score'  # Channel to publish to
 
 # Cross-platform paths using pathlib
-SCRIPT_DIR = Path(__file__).parent.resolve()  # scripts/inference/
-PROJECT_ROOT = SCRIPT_DIR.parent.parent  # Go up 2 levels: scripts/ -> project root
+SCRIPT_DIR = Path(__file__).parent.resolve()
+# In the handover folder this script lives at <repo>/Handover_JuneSession/, so
+# the repo root is one level up. In scripts/inference/ it's two levels up.
+# Detect by looking for the models directory.
+if (SCRIPT_DIR.parent / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth').exists():
+    PROJECT_ROOT = SCRIPT_DIR.parent
+else:
+    PROJECT_ROOT = SCRIPT_DIR.parent.parent
 MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
 YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
 YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
@@ -740,7 +746,8 @@ class MultiPersonEngagementSystem:
         self.model = TemporalTransformer(num_classes=2).to(self.device)
         
         try:
-            checkpoint = torch.load(model_path, map_location=self.device)
+            # weights_only=False required for our checkpoint format on PyTorch 2.6+
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             # Handle DDP state dict (remove 'module.' prefix if present)
             state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
             new_state_dict = {}

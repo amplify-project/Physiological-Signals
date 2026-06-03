@@ -741,7 +741,8 @@ class MultiPersonEngagementSystem:
         self.model = TemporalTransformer(num_classes=2).to(self.device)
         
         try:
-            checkpoint = torch.load(model_path, map_location=self.device)
+            # weights_only=False required for our checkpoint format on PyTorch 2.6+
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             # Handle DDP state dict (remove 'module.' prefix if present)
             state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
             new_state_dict = {}
