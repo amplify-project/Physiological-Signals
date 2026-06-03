@@ -1134,47 +1134,58 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
     cv2.putText(sidebar, "EmotiBit", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
     sidebar_radio_rects.clear()
-    if not enrolled_names:
-        with emotibit_lock:
-            n_devices = len(emotibit_data)
-        if n_devices == 0:
-            cv2.putText(sidebar, "No EmotiBits", (8, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-            cv2.putText(sidebar, "connected", (8, 73),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-            cv2.putText(sidebar, "(start EmotiBit publisher)", (8, 95),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
-        else:
-            cv2.putText(sidebar, f"{n_devices} EmotiBit(s) connected", (8, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1, cv2.LINE_AA)
-            cv2.putText(sidebar, "No participants", (8, 78),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-            cv2.putText(sidebar, "enrolled yet", (8, 96),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-            cv2.putText(sidebar, "[R]=register serial", (8, 118),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+
+    # Snapshot connected device serials once under the lock
+    with emotibit_lock:
+        connected_serials = list(emotibit_data.keys())
+
+    # Build unified row list: enrolled devices first (with radio button),
+    # then any other connected-but-unassigned devices (plotted, no radio).
+    enrolled_set = set(enrolled_names)
+    unassigned = [s for s in connected_serials if s not in enrolled_set]
+    rows = ([(s, True) for s in enrolled_names]
+            + [(s, False) for s in unassigned])
+
+    if not rows:
+        cv2.putText(sidebar, "No EmotiBits", (8, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+        cv2.putText(sidebar, "connected", (8, 73),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+        cv2.putText(sidebar, "(start EmotiBit publisher)", (8, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
         return sidebar
-    n = len(enrolled_names)
+
+    n = len(rows)
     # Scale row height to fit up to 6 devices: generous when few, compact when many
     available_h = h - 28
     row_h = max(60, min(140, available_h // max(n, 1)))
-    for i, serial in enumerate(enrolled_names):
+    for i, (serial, is_enrolled) in enumerate(rows):
         y0 = 28 + i * row_h
         y1 = min(y0 + row_h - 2, h - 2)
-        sidebar_radio_rects.append((y0, y1, serial))
-        selected = (focus_target == serial)
+        # Only enrolled rows are clickable focus targets
+        if is_enrolled:
+            sidebar_radio_rects.append((y0, y1, serial))
+        selected = is_enrolled and (focus_target == serial)
         if selected:
             cv2.rectangle(sidebar, (2, y0), (sidebar_w - 2, y1), (45, 28, 45), -1)
-        # Radio button
+        # Radio button (enrolled only — unassigned rows show a dim dash)
         rb_cx, rb_cy = 11, y0 + 12
-        if selected:
-            cv2.circle(sidebar, (rb_cx, rb_cy), 6, (255, 0, 255), -1)
+        if is_enrolled:
+            if selected:
+                cv2.circle(sidebar, (rb_cx, rb_cy), 6, (255, 0, 255), -1)
+            else:
+                cv2.circle(sidebar, (rb_cx, rb_cy), 6, (140, 140, 140), 1)
         else:
-            cv2.circle(sidebar, (rb_cx, rb_cy), 6, (140, 140, 140), 1)
-        # Serial label — truncate long IDs to fit
+            cv2.line(sidebar, (rb_cx - 5, rb_cy), (rb_cx + 5, rb_cy),
+                     (80, 80, 80), 1, cv2.LINE_AA)
+        # Serial label — truncate long IDs to fit. Unassigned dimmed.
         label = serial if len(serial) <= 14 else serial[-14:]
+        label_col = (220, 220, 220) if is_enrolled else (150, 150, 150)
         cv2.putText(sidebar, f"#{label}", (22, y0 + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, label_col, 1, cv2.LINE_AA)
+        if not is_enrolled:
+            cv2.putText(sidebar, "unassigned", (22, y0 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1, cv2.LINE_AA)
         # HR — same line as label, right-aligned area
         with emotibit_lock:
             d = emotibit_data.get(serial, {})
