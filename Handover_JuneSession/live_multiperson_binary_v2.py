@@ -1134,12 +1134,24 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
     sidebar_radio_rects.clear()
     if not enrolled_names:
-        cv2.putText(sidebar, "No enrolled", (8, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-        cv2.putText(sidebar, "participants", (8, 73),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
-        cv2.putText(sidebar, "[R]=register serial", (8, 95),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+        with emotibit_lock:
+            n_devices = len(emotibit_data)
+        if n_devices == 0:
+            cv2.putText(sidebar, "No EmotiBits", (8, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+            cv2.putText(sidebar, "connected", (8, 73),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+            cv2.putText(sidebar, "(start EmotiBit publisher)", (8, 95),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+        else:
+            cv2.putText(sidebar, f"{n_devices} EmotiBit(s) connected", (8, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1, cv2.LINE_AA)
+            cv2.putText(sidebar, "No participants", (8, 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+            cv2.putText(sidebar, "enrolled yet", (8, 96),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+            cv2.putText(sidebar, "[R]=register serial", (8, 118),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
         return sidebar
     n = len(enrolled_names)
     # Scale row height to fit up to 6 devices: generous when few, compact when many
