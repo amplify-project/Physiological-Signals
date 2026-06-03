@@ -278,6 +278,18 @@ MAX_SEQUENCE_LENGTH = 300           # Maximum frames (model positional encoding 
 DEFAULT_SEQUENCE_LENGTH = 64        # Fallback if FPS measurement fails
 MIN_INFERENCE_FRAMES = 30           # Minimum frames before first estimate (~1s @ 30fps)
 
+# --- Time-windowed buffer (Post-Bremen fix for context drift, roadmap 2.c) ---
+# Training used 300-frame clips spanning 10 s at 30 fps. At inference our FPS
+# varies with crowd size (3-30 fps), so a fixed-FRAME deque silently warps the
+# real-time window the model sees (e.g. 300 frames @ 3 fps = 100 s of context,
+# wildly off-distribution). Fix: store (timestamp, features) pairs covering the
+# last TARGET_DURATION_SECONDS of wall-clock time, then RESAMPLE to exactly
+# MODEL_INPUT_FRAMES before each model call. The model always sees its trained
+# input shape over its trained time window, regardless of live FPS.
+MODEL_INPUT_FRAMES = 300            # Fixed model input length (matches training)
+MIN_INFERENCE_SECONDS = 1.0         # Wait until buffer spans >=1s before first inference
+BUFFER_HARD_CAP_FRAMES = 600        # Defensive cap (10s @ 60fps); time-prune is primary
+
 # --- Stale-track eviction (Post-Bremen fix for ID inflation / RAM growth) ---
 # YOLO botsort/bytetrack assigns a fresh monotonically-increasing id every time
 # a person is re-detected after being lost. In dense crowds the live id set
@@ -816,8 +828,10 @@ class MultiPersonEngagementSystem:
             sys.exit(1)
         
         # State Management
-        # Dictionary to store feature buffers for each track_id
-        # { track_id: deque(maxlen=self.sequence_length) }
+        # Per-track feature buffer: deque of (monotonic_timestamp, features_flat)
+        # tuples covering ~TARGET_DURATION_SECONDS of wall-clock time. Pruned
+        # by timestamp on every append; resampled to MODEL_INPUT_FRAMES for
+        # model calls. See _append_features() / _resample_buffer().
         self.person_buffers = {}
 
         # Store latest scores for visualization and averaging
@@ -828,6 +842,11 @@ class MultiPersonEngagementSystem:
         # Updated each time a track is seen; consulted by _evict_stale_tracks().
         self.person_last_seen = {}
         self._frame_counter = 0
+
+        # Longest wall-clock buffer span across active tracks, refreshed at the
+        # end of each process_frame / process_view. Read by the overlay so the
+        # "Context: X.Xs" readout reflects real time, not frame-count / FPS.
+        self.current_context_seconds = 0.0
         
         # Per-view YOLO trackers for 360° mode (avoids cross-view ID confusion)
         self._view_yolos = {}
@@ -875,9 +894,7 @@ class MultiPersonEngagementSystem:
             for box, raw_id in zip(boxes, track_ids):
                 track_id = f"v{view_idx}_{raw_id}"
                 x1, y1, x2, y2 = map(int, box)
-                if track_id not in self.person_buffers:
-                    self.person_buffers[track_id] = deque(maxlen=self.sequence_length)
-                    self.person_scores[track_id] = 0.0
+                self._ensure_buffer(track_id)
                 detections.append((track_id, (x1, y1, x2, y2)))
         return detections
     
@@ -889,32 +906,26 @@ class MultiPersonEngagementSystem:
         holistic = self._get_view_holistic(view_idx)
         features, padded_bbox = self._extract_features_with_holistic(frame_rgb, bbox, holistic)
         features_flat = features.flatten()
-        self.person_buffers[track_id].append(features_flat)
-        
-        buf_len = len(self.person_buffers[track_id])
-        if buf_len >= MIN_INFERENCE_FRAMES:
-            buf_array = np.array(self.person_buffers[track_id])
-            if buf_len < self.sequence_length:
-                pad_rows = self.sequence_length - buf_len
-                padding = np.zeros((pad_rows, buf_array.shape[1]), dtype=buf_array.dtype)
-                buf_array = np.concatenate([padding, buf_array], axis=0)
-            
-            input_tensor = torch.tensor(
-                buf_array, dtype=self.tensor_dtype, device=self.device
-            ).unsqueeze(0)
-            
-            with torch.no_grad():
-                logits = self.model(input_tensor)
-                probs = torch.softmax(logits, dim=1)
-                score = probs[0][1].item()
-                self.person_scores[track_id] = score
-        
+        self._append_features(track_id, features_flat)
+
+        if self._buffer_ready(track_id):
+            buf_array = self._resample_buffer(track_id)
+            if buf_array is not None:
+                input_tensor = torch.tensor(
+                    buf_array, dtype=self.tensor_dtype, device=self.device
+                ).unsqueeze(0)
+                with torch.no_grad():
+                    logits = self.model(input_tensor)
+                    probs = torch.softmax(logits, dim=1)
+                    score = probs[0][1].item()
+                    self.person_scores[track_id] = score
+
         return {
             'bbox': bbox,
             'padded_bbox': padded_bbox,
             'id': track_id,
             'score': self.person_scores[track_id],
-            'buffer_fill': len(self.person_buffers[track_id]) / self.sequence_length,
+            'buffer_fill': min(self._buffer_time_span(track_id) / TARGET_DURATION_SECONDS, 1.0),
             'keypoints': features,
         }
     
@@ -934,13 +945,14 @@ class MultiPersonEngagementSystem:
         
         if current_frame_data:
             weighted_sum = sum(d['score'] * d['buffer_fill'] for d in current_frame_data
-                              if len(self.person_buffers[d['id']]) >= MIN_INFERENCE_FRAMES)
+                              if self._buffer_ready(d['id']))
             weight_total = sum(d['buffer_fill'] for d in current_frame_data
-                              if len(self.person_buffers[d['id']]) >= MIN_INFERENCE_FRAMES)
+                              if self._buffer_ready(d['id']))
             crowd_average = weighted_sum / weight_total if weight_total > 0 else 0.0
         else:
             crowd_average = 0.0
-        
+
+        self._update_context_seconds()
         return current_frame_data, crowd_average
     
     def _extract_features_with_holistic(self, frame_rgb, bbox, holistic):
@@ -1069,6 +1081,59 @@ class MultiPersonEngagementSystem:
                 self.person_scores.pop(tid, None)
                 self.person_last_seen.pop(tid, None)
 
+    # --- Time-windowed feature buffer (roadmap 2.c) -------------------------
+    # Buffer entries are (monotonic_timestamp, features_flat) tuples. Stored in
+    # a deque so old entries pop in O(1) from the left during time-pruning; the
+    # deque maxlen is a defensive cap only (the time-window prune is primary).
+
+    def _ensure_buffer(self, track_id):
+        if track_id not in self.person_buffers:
+            self.person_buffers[track_id] = deque(maxlen=BUFFER_HARD_CAP_FRAMES)
+            self.person_scores[track_id] = 0.0
+
+    def _append_features(self, track_id, features_flat):
+        """Append a feature vector with the current monotonic timestamp,
+        then prune entries older than TARGET_DURATION_SECONDS."""
+        self._ensure_buffer(track_id)
+        buf = self.person_buffers[track_id]
+        now = time.monotonic()
+        buf.append((now, features_flat))
+        cutoff = now - TARGET_DURATION_SECONDS
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
+
+    def _buffer_time_span(self, track_id):
+        buf = self.person_buffers.get(track_id)
+        if not buf or len(buf) < 2:
+            return 0.0
+        return buf[-1][0] - buf[0][0]
+
+    def _buffer_ready(self, track_id):
+        return self._buffer_time_span(track_id) >= MIN_INFERENCE_SECONDS
+
+    def _resample_buffer(self, track_id):
+        """Resample buffered (ts, features) pairs to exactly MODEL_INPUT_FRAMES
+        evenly-spaced points across the buffer's current time span. Linear
+        interpolation per feature dimension (vectorised). Returns (300, 1629)
+        ndarray, or None if the buffer is too short."""
+        buf = self.person_buffers.get(track_id)
+        if not buf or len(buf) < 2:
+            return None
+        ts = np.fromiter((t for t, _ in buf), dtype=np.float64, count=len(buf))
+        span = ts[-1] - ts[0]
+        if span < 1e-3:
+            return None
+        feats = np.stack([f for _, f in buf]).astype(np.float32, copy=False)
+        target_ts = np.linspace(ts[0], ts[-1], MODEL_INPUT_FRAMES)
+        right = np.searchsorted(ts, target_ts, side='left').clip(1, len(ts) - 1)
+        left = right - 1
+        w = ((target_ts - ts[left]) / (ts[right] - ts[left] + 1e-9)).reshape(-1, 1).astype(np.float32)
+        return feats[left] * (1.0 - w) + feats[right] * w
+
+    def _update_context_seconds(self):
+        spans = [self._buffer_time_span(tid) for tid in self.person_buffers]
+        self.current_context_seconds = min(max(spans), TARGET_DURATION_SECONDS) if spans else 0.0
+
     def process_frame(self, frame):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self._frame_counter += 1
@@ -1090,58 +1155,46 @@ class MultiPersonEngagementSystem:
 
             for box, track_id in zip(boxes, track_ids):
                 x1, y1, x2, y2 = map(int, box)
-                
-                # Initialize buffer if new person
-                if track_id not in self.person_buffers:
-                    self.person_buffers[track_id] = deque(maxlen=self.sequence_length)
-                    self.person_scores[track_id] = 0.0 # Default start
-                
-                # 2. Extract Features
+
+                # 2. Extract features and append with timestamp (auto-prunes >10s old)
                 features, padded_bbox = self.extract_features(frame_rgb, (x1, y1, x2, y2))
                 features_flat = features.flatten()
-                self.person_buffers[track_id].append(features_flat)
-                
-                # 3. Inference (progressive: run once we have MIN_INFERENCE_FRAMES)
-                buf_len = len(self.person_buffers[track_id])
-                if buf_len >= MIN_INFERENCE_FRAMES:
-                    buf_array = np.array(self.person_buffers[track_id])  # (buf_len, 1629)
-                    
-                    # Pad to full sequence_length if buffer is not yet full
-                    if buf_len < self.sequence_length:
-                        pad_rows = self.sequence_length - buf_len
-                        padding = np.zeros((pad_rows, buf_array.shape[1]), dtype=buf_array.dtype)
-                        buf_array = np.concatenate([padding, buf_array], axis=0)
-                    
-                    input_tensor = torch.tensor(
-                        buf_array, 
-                        dtype=self.tensor_dtype,
-                        device=self.device
-                    ).unsqueeze(0)
-                    
-                    with torch.no_grad():
-                        logits = self.model(input_tensor)
-                        probs = torch.softmax(logits, dim=1)
-                        # Class 1 is 'Engaged'
-                        score = probs[0][1].item()
-                        self.person_scores[track_id] = score
-                
+                self._append_features(track_id, features_flat)
+
+                # 3. Inference (gated on wall-clock span, not frame count; resample
+                #    to MODEL_INPUT_FRAMES so the model always sees its trained shape)
+                if self._buffer_ready(track_id):
+                    buf_array = self._resample_buffer(track_id)
+                    if buf_array is not None:
+                        input_tensor = torch.tensor(
+                            buf_array,
+                            dtype=self.tensor_dtype,
+                            device=self.device
+                        ).unsqueeze(0)
+                        with torch.no_grad():
+                            logits = self.model(input_tensor)
+                            probs = torch.softmax(logits, dim=1)
+                            # Class 1 is 'Engaged'
+                            score = probs[0][1].item()
+                            self.person_scores[track_id] = score
+
                 current_frame_data.append({
                     'bbox': (x1, y1, x2, y2),
                     'padded_bbox': padded_bbox,
                     'id': track_id,
                     'score': self.person_scores[track_id],
-                    'buffer_fill': len(self.person_buffers[track_id]) / self.sequence_length,
+                    'buffer_fill': min(self._buffer_time_span(track_id) / TARGET_DURATION_SECONDS, 1.0),
                     'keypoints': features,
                 })
         
         # 4. Calculate Crowd Average (confidence-weighted)
         if self.person_scores:
-            # Include all people with at least MIN_INFERENCE_FRAMES, weighted by confidence
+            # Include all people whose buffer spans MIN_INFERENCE_SECONDS, weighted by buffer fill
             weighted_sum = 0.0
             weight_total = 0.0
             for d in current_frame_data:
                 bf = d.get('buffer_fill', 0.0)
-                if len(self.person_buffers[d['id']]) >= MIN_INFERENCE_FRAMES:
+                if self._buffer_ready(d['id']):
                     weighted_sum += d['score'] * bf
                     weight_total += bf
             
@@ -1151,6 +1204,8 @@ class MultiPersonEngagementSystem:
                 crowd_average = 0.0
         else:
             crowd_average = 0.0
+
+        self._update_context_seconds()
             
         # 5. Publish to Redis (throttled to 1 Hz)
         current_time = time.time()
@@ -2199,25 +2254,14 @@ def main():
             avg_frame_time = sum(fps_frame_times) / len(fps_frame_times)
             live_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
         
-        # Continuously adapt sequence length based on live FPS
+        # Time-windowed buffer (roadmap 2.c) makes per-FPS sequence-length
+        # adaptation obsolete: the buffer always spans TARGET_DURATION_SECONDS
+        # of wall-clock time and is resampled to MODEL_INPUT_FRAMES at every
+        # model call, so the model input shape and effective time window are
+        # both invariant to live FPS. The old block adapted self.sequence_length
+        # against live FPS and was clamped to [60,300] frames, which could not
+        # represent 10s at FPS outside [6, 30].
         current_time = time.time()
-        if current_time - last_adaptation_time >= adaptation_interval and len(fps_frame_times) >= 15:
-            optimal_seq_length = int(live_fps * TARGET_DURATION_SECONDS)
-            optimal_seq_length = max(MIN_SEQUENCE_LENGTH, min(MAX_SEQUENCE_LENGTH, optimal_seq_length))
-            
-            # Only adapt if drift is significant (more than 10% off target)
-            current_duration = system.sequence_length / live_fps if live_fps > 0 else TARGET_DURATION_SECONDS
-            drift = abs(current_duration - TARGET_DURATION_SECONDS) / TARGET_DURATION_SECONDS
-            
-            if drift > 0.10:  # More than 10% off target duration
-                if system.update_sequence_length(optimal_seq_length):
-                    new_duration = system.sequence_length / live_fps if live_fps > 0 else 0
-                    print(f"\U0001f504 Adapted buffer: {system.sequence_length} frames @ {live_fps:.1f} FPS = {new_duration:.1f}s")
-            
-            last_adaptation_time = current_time
-        
-        # Calculate equivalent inference duration
-        inference_duration = system.sequence_length / live_fps if live_fps > 0 else 0
         
         # --- VISUALIZATION (common for both modes) ---
         h, w = display_frame.shape[:2]
@@ -2248,7 +2292,7 @@ def main():
         # FPS and Info (Bottom Left)
         platform_str = f"{platform_info['os']} | {actual_device.upper()}"
         people_count = len(people_data)
-        context_seconds = system.sequence_length / live_fps if live_fps > 0 else 0
+        context_seconds = system.current_context_seconds
         fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s"
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
