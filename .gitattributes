@@ -1,2 +1,8 @@
 *.pth filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
+
+# Handover bundle must be self-contained for non-technical users who
+# download the repo as a ZIP (ZIP downloads do NOT resolve LFS pointers).
+# Keep these weights as regular git blobs.
+Handover_JuneSession/**/*.pth -filter -diff -merge -text
+Handover_JuneSession/**/*.pt  -filter -diff -merge -text

@@ -234,18 +234,30 @@ DEFAULT_REDIS_HOST = 'localhost'
 DEFAULT_REDIS_PORT = 6379
 REDIS_CHANNEL = 'engagement_score'  # Channel to publish to
 
-# Cross-platform paths using pathlib
+# Cross-platform paths using pathlib.
+# Two supported layouts:
+#   1. Self-contained handover bundle (end-user, no git):
+#        <bundle>/live_multiperson_binary_v2.py
+#        <bundle>/model/best_model.pth
+#        <bundle>/yolo11n.pt
+#        <bundle>/yolo26n.pt
+#   2. Project tree (developer, scripts/inference/):
+#        <repo>/scripts/inference/live_multiperson_binary_v2.py
+#        <repo>/models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth
+#        <repo>/yolo11n.pt
 SCRIPT_DIR = Path(__file__).parent.resolve()
-# In the handover folder this script lives at <repo>/Handover_JuneSession/, so
-# the repo root is one level up. In scripts/inference/ it's two levels up.
-# Detect by looking for the models directory.
-if (SCRIPT_DIR.parent / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth').exists():
-    PROJECT_ROOT = SCRIPT_DIR.parent
+_LOCAL_MODEL = SCRIPT_DIR / 'model' / 'best_model.pth'
+if _LOCAL_MODEL.exists():
+    # Self-contained bundle
+    MODEL_PATH = _LOCAL_MODEL
+    YOLO_MODEL_PATH = SCRIPT_DIR / 'yolo11n.pt'
+    YOLO_FALLBACK_PATH = SCRIPT_DIR / 'yolo26n.pt'
 else:
+    # Project tree
     PROJECT_ROOT = SCRIPT_DIR.parent.parent
-MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
-YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
-YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
+    MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
+    YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
+    YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
 
 # Default session data directory: relative to CWD (not __file__)
 # This ensures compatibility when packaged as an executable (PyInstaller etc.)
