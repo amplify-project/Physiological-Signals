@@ -6,10 +6,9 @@
 # Install with:
 #   pip install -r requirements.txt
 #
-# NOTE: matplotlib uses the TkAgg backend on Windows/Linux.
-#       On Windows you may need to install Tcl/Tk:
-#         https://www.python.org/downloads/
-#       On Linux: sudo apt-get install python3-tk
+# NOTE: This publisher is now headless. The live EDA + HR plot was removed
+#       in favour of the engagement GUI (live_multiperson_binary_v2.py), which
+#       subscribes to Redis and renders all physio signals in its sidebar.
 # =============================================================================
 
 # Numerical
@@ -26,9 +25,6 @@ redis==7.0.1
 
 # LSL (LabStreamingLayer - optional, only if using the legacy publisher)
 pylsl==1.17.6
-
-# Live plot (EDA + HR real-time graph)
-matplotlib==3.10.7
 
 # Date utilities
 python-dateutil==2.9.0.post0

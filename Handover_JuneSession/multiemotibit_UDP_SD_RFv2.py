@@ -574,59 +574,13 @@ def discover_devices(adv_sock, timeout_s, own_ips=None):
             devices[ip] = hh_seen[ip]
     return devices
 
-# ----------------------------- LIVE PLOT -----------------------------
-import matplotlib
-# Use platform-appropriate backend
-if sys.platform == 'darwin':  # macOS
-    matplotlib.use('MacOSX')
-elif sys.platform == 'win32':  # Windows
-    matplotlib.use('TkAgg')
-else:  # Linux and other platforms
-    matplotlib.use('TkAgg')
-    
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-
-def create_plot(devices):
-    n = len(devices)
-    fig, axes = plt.subplots(2, n, figsize=(5*n,7))
-    if n==1: axes = np.array([[axes[0]],[axes[1]]])
-
-    eda_lines, hr_lines = [], []
-
-    for i, dev in enumerate(devices):
-        l_eda, = axes[0][i].plot([], [], lw=2)
-        l_hr,  = axes[1][i].plot([], [], lw=2)
-        eda_lines.append(l_eda)
-        hr_lines.append(l_hr)
-        axes[0][i].set_title(f"EDA - {dev.source_id}")
-        axes[1][i].set_title(f"HR - {dev.source_id}")
-        axes[0][i].set_ylim(0, 5)
-        axes[1][i].set_ylim(40, 140)
-
-    def update(_):
-        for i, dev in enumerate(devices):
-            with dev.lock:
-                eda = dev.filtered_eda
-                hr = dev.filtered_hr
-            if len(eda)>5:
-                eda_lines[i].set_data(np.arange(len(eda)), eda)
-                axes[0][i].set_xlim(0, len(eda))
-            if len(hr)>5:
-                hr_lines[i].set_data(np.arange(len(hr)), hr)
-                axes[1][i].set_xlim(0, len(hr))
-        return eda_lines + hr_lines
-
-    def _on_key(event):
-        if event.key == 'q':
-            print("\n'q' pressed - shutting down gracefully...")
-            plt.close(fig)
-
-    fig.canvas.mpl_connect('key_press_event', _on_key)
-    fig.text(0.5, 0.01, "Press 'q' to quit", ha='center', fontsize=9, color='gray')
-
-    ani = animation.FuncAnimation(fig, update, interval=500)
-    return fig, ani
+# ----------------------------- LIVE PLOT (removed) -----------------------------
+# The local matplotlib live plot was removed: the engagement GUI
+# (live_multiperson_binary_v2.py) now subscribes to Redis and renders all
+# physio signals in its sidebar, so plotting here was duplicate work and a
+# blocking Tk main loop on the publisher process. The publisher now runs
+# headless and blocks on a wait loop while the UDP / prediction daemon
+# threads continue to push data to Redis.
 
 # ========================= FIREWALL CHECK =======================
 
@@ -930,11 +884,13 @@ def main():
 
     threading.Thread(target=prediction_loop, daemon=True).start()
 
-    fig, ani = create_plot(agg_list)
+    fig, ani = (None, None)  # plotting removed; engagement GUI renders signals
 
     try:
-        print("<¬ Starting live plot...")
-        plt.show()
+        print("<¬ Publisher running headless. Open the engagement GUI to view live plots.")
+        print("   Press Ctrl+C in this window to stop publishing.")
+        while not stop_flag.is_set():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     except Exception as e:

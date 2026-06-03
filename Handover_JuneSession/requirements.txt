@@ -34,8 +34,11 @@ python-dateutil==2.9.0.post0
 # --- Redis ---
 redis==7.0.1
 
-# --- Visualisation (EmotiBit live plot) ---
-matplotlib==3.10.7
+# --- Visualisation ---
+# matplotlib intentionally removed: the live EmotiBit plot was previously
+# drawn here, but the engagement GUI now renders all physio signals from
+# Redis. Keeping pillow because it is pulled in transitively by torchvision
+# / facenet-pytorch and pinning it avoids resolver churn.
 pillow==10.2.0
 
 # --- Utilities ---
