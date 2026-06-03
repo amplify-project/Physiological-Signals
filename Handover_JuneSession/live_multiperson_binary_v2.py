@@ -1240,21 +1240,20 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                           (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
             if len(plot_arr) > 2:
                 arr = np.array(plot_arr, dtype=np.float32)
-                # Robust rolling-window autoscale: clip to 5th-95th percentile so
-                # a single startup spike does not flatten the rest of the trace,
-                # and enforce a small minimum range so a near-constant signal
-                # still renders as a centred horizontal line instead of
-                # collapsing to a single pixel row.
+                # True rolling-window zoom: stretch the spline to the full
+                # height of the plot using the 5th-95th percentile so a single
+                # startup spike does not flatten the rest of the trace. Tiny
+                # variations therefore occupy the full y-axis.
                 lo, hi = np.percentile(arr, [5.0, 95.0])
-                mn, mx = float(arr.min()), float(arr.max())
-                lo = float(min(lo, mn))
-                hi = float(max(hi, mx))
+                lo, hi = float(lo), float(hi)
+                if hi - lo < 1e-9:   # all samples (almost) identical
+                    mn, mx = float(arr.min()), float(arr.max())
+                    if mx - mn < 1e-9:
+                        mid = float(arr[-1])
+                        lo, hi = mid - 0.5, mid + 0.5  # arbitrary unit window
+                    else:
+                        lo, hi = mn, mx
                 rng = hi - lo
-                MIN_RANGE = max(1e-3, abs(hi + lo) * 5e-4)  # ~0.05% of magnitude
-                if rng < MIN_RANGE:
-                    mid = 0.5 * (hi + lo)
-                    lo, hi = mid - MIN_RANGE / 2, mid + MIN_RANGE / 2
-                    rng = hi - lo
                 arr_clipped = np.clip(arr, lo, hi)
                 xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
                                  len(arr_clipped)).round().astype(np.int32)
