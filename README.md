@@ -351,6 +351,42 @@ Start-Process -FilePath "redis\redis-server.exe" -ArgumentList "redis\redis.wind
 
 This section captures issues observed during live demoing, with emphasis on efficiency, robust behavior under load, and practical concert conditions.
 
+### Progress log — June 2026 (branch `Post_Bremen_Bug_Fixes`)
+
+Completed work against this roadmap, in commit order:
+
+- **Item 1 — EmotiBit visibility before face registration** ✅
+  - Sidebar now plots every connected EmotiBit immediately on discovery, independent of facial enrollment state. Three-state messaging (`unassigned` / `assigned` / `stale`) drives the label; plots stay live in all states. Y-axis autoscale rewritten to zoom-to-fit so tiny variations fill the panel.
+  - Commits: `50247b1`, `832d553`, `5de7e84`, `1da0024`.
+
+- **Item 3 — Pipeline redundancy** ✅ (plotting half)
+  - Sowmya's separate matplotlib live-plot loop in `multiemotibit_UDP_SD_RFv2.py` was redundant with the GUI sidebar plots — removed. Publisher now runs headless. `matplotlib` pin dropped from both `requirements.txt` copies.
+  - Commit: `daa44da`.
+  - Note: the **2D-first efficiency gate** for 360° is a sequencing rule, not a code change. 360° tuning is deferred until the 2D path holds ≥ `TARGET_FPS_FLOOR` (12) on demo crowds.
+
+- **Item 2.b — ID inflation / tracker stability** ✅
+  - YOLO botsort assigns a fresh monotonically-increasing id every time a person is re-detected after a lost frame. In dense audiences the id space climbed into the 1000s while only ~20 people were present. Each stale id retained a feature buffer (~417 KB), leaking RAM and bloating the per-frame crowd-engagement aggregator.
+  - Implemented the timeout-based eviction the original author had left commented out: new `_evict_stale_tracks()` runs at the top of `process_frame` (2D) and `process_view` (360°). Constants: `STALE_TRACK_TIMEOUT_FRAMES = 60` (~2 s @ 30 FPS — comfortably above brief occlusions so botsort's own 30-frame `track_buffer` recovery still works), `MAX_TRACKED_IDS = 64` (hard cap, oldest-unseen evicted first, active ids never touched).
+  - Behaviour: id labels still increment monotonically (botsort owns that counter), but `len(person_buffers)` stays bounded and per-frame Python cost no longer grows with stale-id history. Display remapping is an open option for cosmetic id reuse.
+  - Commit: `6be189b`.
+
+- **Item 2.c — Context duration drift** ✅
+  - The action transformer was trained on 10-second, 300-frame DAiSEE/Kinetics-700 clips at 30 FPS. The per-track feature buffer was a fixed-FRAME `deque` (default 64, clamped [60, 300]), so as live FPS varied the wall-clock window silently drifted: at 3 FPS a 60-frame buffer spans 20 s of real time — wildly off-distribution. The old FPS-adaptive `update_sequence_length` loop could not represent 10 s outside [6, 30] FPS, and the overlay `Context: X.Xs` derived from `sequence_length / live_fps` exhibited the drift seen in the June demo screenshots.
+  - Replaced with a time-windowed buffer: entries are `(monotonic_ts, features_flat)` tuples, pruned to `TARGET_DURATION_SECONDS = 10.0` on every append. `_resample_buffer()` interpolates the buffer onto exactly `MODEL_INPUT_FRAMES = 300` evenly-spaced timesteps via vectorised piecewise-linear `np.searchsorted + lerp` immediately before each model call. Inference gate switched from `MIN_INFERENCE_FRAMES` to `MIN_INFERENCE_SECONDS = 1.0`. Overlay reads `system.current_context_seconds` (longest active buffer span, capped at 10 s) so it sits steady at 10.0 s regardless of FPS. Obsolete adaptation loop removed from main loop; `update_sequence_length` retained but unused by the live path.
+  - Commit: `9f0fbee`.
+
+- **Item 2.d — Underutilized hardware at low FPS / crowd-load FPS floor** ✅
+  - MediaPipe holistic costs ~30–50 ms per person on CPU and runs once per detected person per frame, so 30 people × 40 ms = 1.2 s/frame = 0.8 FPS — the collapse seen in Sowmya's screen grabs.
+  - Added an adaptive per-frame MediaPipe budget driven by `TARGET_FPS_FLOOR = 12.0` and an EWMA of measured per-person extract cost. `_select_persons_for_extraction()` round-robins through detected ids with that budget; selected persons get the full MediaPipe + model pass, unselected persons reuse their cached score with the fresh YOLO bbox (still drawn live, still aggregated). The roadmap 2.c time-windowed buffer absorbs the sparse-in-time extraction transparently — the model is unaware of the throttle.
+  - Constants: `TARGET_FPS_FLOOR = 12.0`, `MP_BUDGET_FRACTION = 0.70`, `MP_TIME_EWMA_ALPHA = 0.1`, `MIN_PERSONS_PER_FRAME = 1`. Mirrored into the 360° path as a per-view budget. Overlay grows a `MP: selected/total` suffix only when throttling is active.
+  - Commit: `6fd1216`.
+
+**Outstanding under Item 2.d:** if the round-robin throttle alone doesn't hit 12 FPS on the largest expected audiences, the next lever is a thread pool of per-worker MediaPipe holistic instances (true parallel extraction). Not implemented yet because MediaPipe holistic objects are not thread-safe — needs a `threading.local` of holistic instances and a `ThreadPoolExecutor` around the per-person loop.
+
+**All work above is in sync across `scripts/inference/live_multiperson_binary_v2.py` (project copy) and `Handover_JuneSession/live_multiperson_binary_v2.py` (Sowmya's bundle copy).**
+
+---
+
 ### 1. EmotiBit visibility before face registration
 - [ ] EmotiBit plots should be visible even before being registered to a facial ID.
 - [ ] Decouple physio visibility from face-enrollment state so operators can validate sensor health immediately.
