@@ -1238,20 +1238,34 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                           (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
             if len(plot_arr) > 2:
                 arr = np.array(plot_arr, dtype=np.float32)
+                # Robust rolling-window autoscale: clip to 5th-95th percentile so
+                # a single startup spike does not flatten the rest of the trace,
+                # and enforce a small minimum range so a near-constant signal
+                # still renders as a centred horizontal line instead of
+                # collapsing to a single pixel row.
+                lo, hi = np.percentile(arr, [5.0, 95.0])
                 mn, mx = float(arr.min()), float(arr.max())
-                rng = (mx - mn) if mx != mn else 1.0
+                lo = float(min(lo, mn))
+                hi = float(max(hi, mx))
+                rng = hi - lo
+                MIN_RANGE = max(1e-3, abs(hi + lo) * 5e-4)  # ~0.05% of magnitude
+                if rng < MIN_RANGE:
+                    mid = 0.5 * (hi + lo)
+                    lo, hi = mid - MIN_RANGE / 2, mid + MIN_RANGE / 2
+                    rng = hi - lo
+                arr_clipped = np.clip(arr, lo, hi)
                 xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
-                                 len(arr)).round().astype(np.int32)
+                                 len(arr_clipped)).round().astype(np.int32)
                 ys = (plot_y + plot_ph - 2
-                      - ((arr - mn) / rng * (plot_ph - 4))).round().astype(np.int32)
+                      - ((arr_clipped - lo) / rng * (plot_ph - 4))).round().astype(np.int32)
                 ys = np.clip(ys, plot_y, plot_y + plot_ph - 2)
                 pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
                 cv2.polylines(sidebar, [pts], False, line_col, 1, cv2.LINE_AA)
                 lbl_col = (75, 120, 150)
-                cv2.putText(sidebar, f"{plot_label} {mx:.2f}{plot_unit}",
+                cv2.putText(sidebar, f"{plot_label} {hi:.2f}{plot_unit}",
                             (plot_x + 2, plot_y + 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                cv2.putText(sidebar, f"{mn:.2f}",
+                cv2.putText(sidebar, f"{lo:.2f}",
                             (plot_x + 2, plot_y + plot_ph - 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
                 cv2.putText(sidebar, f"{arr[-1]:.3f}",
