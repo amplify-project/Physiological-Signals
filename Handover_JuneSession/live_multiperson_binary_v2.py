@@ -1378,9 +1378,6 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1, cv2.LINE_AA)
         # HR — same line as label, right-aligned area
         with emotibit_lock:
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
-        # HR — same line as label, right-aligned area
-        with emotibit_lock:
             d = emotibit_data.get(serial, {})
             snap_eda    = list(d.get('eda', []))
             snap_hr     = list(d.get('hr',  []))
