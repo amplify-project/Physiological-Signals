@@ -48,10 +48,17 @@ import logging
 logging.getLogger('absl').setLevel(logging.ERROR)
 
 # Redirect OS-level stderr (fd 2) to devnull to suppress C++ warnings,
-# then restore it after MediaPipe model initialization
+# then restore it after MediaPipe model initialization.
+# IMPORTANT: we set up the fds here but do NOT redirect yet — that happens
+# lazily inside _silence_native_stderr(), called just before MediaPipe init.
+# Doing it at module top hides genuine startup errors (YOLO/checkpoint loads)
+# from the console and makes failures look like silent exits.
 _stderr_fd = os.dup(2)
 _devnull = os.open(os.devnull, os.O_WRONLY)
-os.dup2(_devnull, 2)
+
+def _silence_native_stderr():
+    """Redirect OS fd 2 to devnull (call right before MediaPipe init)."""
+    os.dup2(_devnull, 2)
 
 import cv2
 if not hasattr(cv2, 'VideoCapture'):
@@ -719,9 +726,28 @@ class MultiPersonEngagementSystem:
         self.publish_interval = 1.0  # seconds
 
         # 2. Load YOLO (person detection)
+        def _check_lfs(p):
+            """Detect unmaterialised Git LFS pointer files (<1 KB and starts with 'version')."""
+            try:
+                if p.stat().st_size < 1024:
+                    with open(p, 'rb') as fh:
+                        head = fh.read(64)
+                    if head.startswith(b'version https://git-lfs'):
+                        print(f"❌ {p.name} is an unfetched Git LFS pointer ({p.stat().st_size} bytes).")
+                        print(f"   Run 'git lfs install' once, then 'git lfs pull' in the repo root.")
+                        sys.exit(1)
+            except FileNotFoundError:
+                pass
+        _check_lfs(YOLO_MODEL_PATH)
+        _check_lfs(YOLO_FALLBACK_PATH)
+        _check_lfs(MODEL_PATH)
         if YOLO_MODEL_PATH.exists():
             print(f"Loading {YOLO_MODEL_PATH.name}...")
-            self.yolo = YOLO(str(YOLO_MODEL_PATH))
+            try:
+                self.yolo = YOLO(str(YOLO_MODEL_PATH))
+            except Exception as e:
+                print(f"❌ YOLO failed to load {YOLO_MODEL_PATH}: {e}")
+                sys.exit(1)
         elif YOLO_FALLBACK_PATH.exists():
             print(f"⚠️  {YOLO_MODEL_PATH.name} not found, using {YOLO_FALLBACK_PATH.name}")
             self.yolo = YOLO(str(YOLO_FALLBACK_PATH))
@@ -731,6 +757,7 @@ class MultiPersonEngagementSystem:
         
         # 3. Initialize MediaPipe Holistic
         print("Initializing MediaPipe...")
+        _silence_native_stderr()  # MediaPipe C++ init spams fd 2; restored after first frame
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
             static_image_mode=False,
