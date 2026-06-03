@@ -277,6 +277,20 @@ MAX_SEQUENCE_LENGTH = 300           # Maximum frames (model positional encoding 
 DEFAULT_SEQUENCE_LENGTH = 64        # Fallback if FPS measurement fails
 MIN_INFERENCE_FRAMES = 30           # Minimum frames before first estimate (~1s @ 30fps)
 
+# --- Stale-track eviction (Post-Bremen fix for ID inflation / RAM growth) ---
+# YOLO botsort/bytetrack assigns a fresh monotonically-increasing id every time
+# a person is re-detected after being lost. In dense crowds the live id set
+# climbs into the 1000s while only ~20 people are present, leaking ~400 KB per
+# stale id (each 64-frame x 1629-float feature buffer).
+#
+# STALE_TRACK_TIMEOUT_FRAMES: how many frames a track may be absent before its
+#   buffer is dropped. Set comfortably above typical short occlusions so brief
+#   YOLO drops still recover the same id, but short enough to bound RAM.
+# MAX_TRACKED_IDS: hard cap; when exceeded, evict the oldest-seen ids until
+#   under the cap. Protects against pathological ID inflation in crowds.
+STALE_TRACK_TIMEOUT_FRAMES = 60      # ~2 s @ 30 fps
+MAX_TRACKED_IDS = 64                  # generous upper bound for live audiences
+
 # 360° Video Configuration
 NUM_360_VIEWS = 4                   # Number of perspective views to extract from 360° video
 VIEW_FOV = (90, 90)                 # Field of view (horizontal, vertical) in degrees
@@ -808,6 +822,11 @@ class MultiPersonEngagementSystem:
         # Store latest scores for visualization and averaging
         # { track_id: score }
         self.person_scores = {}
+
+        # Frame index of last sighting per track_id (for stale-track eviction).
+        # Updated each time a track is seen; consulted by _evict_stale_tracks().
+        self.person_last_seen = {}
+        self._frame_counter = 0
         
         # Per-view YOLO trackers for 360° mode (avoids cross-view ID confusion)
         self._view_yolos = {}
@@ -902,8 +921,11 @@ class MultiPersonEngagementSystem:
         """Process a single 360° view (sequential fallback)."""
         if frame_rgb is None:
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        
+        self._frame_counter += 1
+
         detections = self.detect_view(frame_bgr, view_idx)
+        active_ids = set(tid for tid, _ in detections)
+        self._evict_stale_tracks(active_ids)
         current_frame_data = []
         for track_id, bbox in detections:
             person = self.extract_and_infer_person(frame_rgb, track_id, bbox, view_idx)
@@ -1022,8 +1044,30 @@ class MultiPersonEngagementSystem:
         
         return keypoints, padded_bbox
 
+    def _evict_stale_tracks(self, active_ids):
+        """Drop buffers for ids absent longer than STALE_TRACK_TIMEOUT_FRAMES,\n        and enforce MAX_TRACKED_IDS by evicting the longest-unseen first.\n        Bounds RAM and per-frame cost in crowded scenes where YOLO's\n        re-detection inflates the id space (see Post-Bremen roadmap 2.b)."""
+        for tid in active_ids:
+            self.person_last_seen[tid] = self._frame_counter
+        cutoff = self._frame_counter - STALE_TRACK_TIMEOUT_FRAMES
+        stale = [tid for tid, last in self.person_last_seen.items()
+                 if last < cutoff and tid not in active_ids]
+        for tid in stale:
+            self.person_buffers.pop(tid, None)
+            self.person_scores.pop(tid, None)
+            self.person_last_seen.pop(tid, None)
+        if len(self.person_buffers) > MAX_TRACKED_IDS:
+            ordered = sorted(self.person_last_seen.items(), key=lambda kv: kv[1])
+            n_drop = len(self.person_buffers) - MAX_TRACKED_IDS
+            for tid, _ in ordered[:n_drop]:
+                if tid in active_ids:
+                    continue
+                self.person_buffers.pop(tid, None)
+                self.person_scores.pop(tid, None)
+                self.person_last_seen.pop(tid, None)
+
     def process_frame(self, frame):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._frame_counter += 1
         
         # 1. YOLO Tracking — pass BGR frame (YOLO expects BGR, converts internally)
         # persist=True is crucial for ID tracking across frames
@@ -1035,12 +1079,10 @@ class MultiPersonEngagementSystem:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.int().cpu().numpy()
             
-            # Clean up old buffers for IDs that are no longer tracked
-            active_ids = set(track_ids)
-            # Optional: Implement a timeout instead of immediate removal to handle occlusion
-            # For now, we'll keep it simple: if YOLO loses track, we reset.
-            # self.person_buffers = {k: v for k, v in self.person_buffers.items() if k in active_ids}
-            # self.person_scores = {k: v for k, v in self.person_scores.items() if k in active_ids}
+            # Evict stale-track buffers BEFORE re-populating, to bound RAM and
+            # per-frame scan cost. See _evict_stale_tracks() docstring.
+            active_ids = set(int(t) for t in track_ids)
+            self._evict_stale_tracks(active_ids)
 
             for box, track_id in zip(boxes, track_ids):
                 x1, y1, x2, y2 = map(int, box)
