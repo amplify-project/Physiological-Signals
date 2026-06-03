@@ -443,6 +443,18 @@ Completed work against this roadmap, in commit order:
 - [ ] Standard practice: parallelize independent CPU-heavy tasks (pose per target/view) with bounded worker pools.
 - [ ] State-of-the-art: add timeline tracing for queue wait vs compute time and schedule work by deadlines.
 
+#### 2.e. GPU-native keypoint extractor (move off MediaPipe)
+- [ ] Root cause behind the GPU idling in 2.d: MediaPipe Holistic's Python binding is CPU-only TFLite. The GPU graph exists in MediaPipe C++ but is not exposed through Python, so on RTX-class hardware the card sits near 0% while one CPU core saturates. Per-person cost (~30–50 ms) is the hard ceiling that the 2.d round-robin throttle only papers over.
+- [ ] Measure first: confirm post-patch FPS on representative crowd sizes (10, 20, 30 people, 2D and 360°) with 2.b + 2.c + 2.d in place. Only commit to a swap if the throttle alone cannot hold the 12 FPS floor.
+- [ ] If a swap is warranted, the action transformer was trained on the MediaPipe 543-keypoint schema (33 pose + 468 face mesh + 21 + 21 hands, each (x, y, z) → 1629 floats). Any replacement must either provide an adapter onto that schema or trigger a retrain.
+
+**Proposed solutions**
+- [ ] Standard practice: **DWPose / RTMPose via ONNXRuntime-CUDA or TensorRT.** 133 whole-body keypoints (body + hands + face contour), batched across all detected persons in a single GPU call — directly addresses the 30-person collapse. Loses dense face mesh; needs a keypoint adapter to the 543-point schema, or a retrain on the reduced schema. Some scaffolding already exists under `src/dwpose_engagement/`.
+- [ ] Standard practice: **MMPose (PyTorch).** Same model family as DWPose, easier to finetune, heavier dependencies. Useful if we decide to retrain rather than adapt.
+- [ ] Standard practice: **MediaPipe Tasks GPU C++ with a pybind shim.** Preserves the exact 543-keypoint topology so no action-transformer retrain, but binding work is non-trivial and the graph is still single-process.
+- [ ] State-of-the-art: **Sapiens (Meta, 2024).** Best-in-class accuracy, larger VRAM footprint, batched. Overkill for live demo today, viable target if hardware scales.
+- [ ] Evaluation plan: small benchmark script — batched DWPose vs current MediaPipe on a recorded demo clip — comparing FPS at N = {1, 10, 20, 30} persons and per-keypoint agreement on the points that exist in both schemas. Decide adapter-vs-retrain from the agreement numbers and a held-out DAiSEE pass.
+
 ### 3. Pipeline redundancy and 2D-first optimization gate
 - [ ] There is pipeline redundancy with double plotting and related duplicate work.
 - [ ] Streamline plotting/data paths before adding complexity.
