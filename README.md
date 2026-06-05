@@ -383,23 +383,37 @@ Completed work against this roadmap, in commit order:
 
 **Outstanding under Item 2.d:** if the round-robin throttle alone doesn't hit 12 FPS on the largest expected audiences, the next lever is a thread pool of per-worker MediaPipe holistic instances (true parallel extraction). Not implemented yet because MediaPipe holistic objects are not thread-safe — needs a `threading.local` of holistic instances and a `ThreadPoolExecutor` around the per-person loop.
 
-**All work above is in sync across `scripts/inference/live_multiperson_binary_v2.py` (project copy) and `Handover_JuneSession/live_multiperson_binary_v2.py` (Sowmya's bundle copy).**
+### Progress log — June 2026 (branch `Post_Canteen_Bug_Fixes`)
+
+Quality-of-life fixes from the 4 June canteen run review (data saving + GUI clarity):
+
+- **Console-output throttle (engagement side)** — Redis-publish line now mirrors the EmotiBit publisher's pattern: prints every second for the first 3 publishes, then once per 60 s. Keeps terminal I/O off the hot path during long sessions without losing the ability to confirm the pipeline is alive at startup.
+
+- **MP throttle visibility** — when MediaPipe is round-robin throttled the HUD now shows e.g. `MP: 1/3 rr2`; the `rr` offset increments every frame so the operator can see the rotation cycling. Each bbox of a person who got fresh MediaPipe **this frame** also gets a small cyan dot top-right, so the round-robin is visually traceable across the crowd.
+
+- **Sidebar HRSD + STROC layout** — the temperature ROC SD readout (`Ṫ SD …`) was being drawn on top of the EDA spline plot and was therefore invisible. Both readouts now sit side-by-side on the same row header line **above** the plot rectangle, with shorter labels (`HRSD`, `STROC`) so they fit at `sidebar_w=280`. EDA / EDA SD spline behaviour unchanged.
+
+- **Display-ID remap on the overlay** — the on-screen bbox label was using the raw YOLO `bytetrack` id which inflates rapidly in crowds (2 058 distinct ids over a 47 min canteen run with ~6 people on screen). Boxes now read `P1`, `P2`, … from a recyclable pool of small integer slots; raw `track_id` is still what's written to `engagement_data.jsonl` and the keypoint NPZ chunks for offline analysis. Slots are returned to the pool when their underlying track is dropped by `_evict_stale_tracks()` (>60 frames absent or `MAX_TRACKED_IDS=64` cap), so the next new person picks up the smallest free `P*` slot. **Caveat:** if churn is severe enough that >64 distinct tracks are seen within any ~2 s window, eviction will recycle slots while their tracks are still live, which would visibly jump the numbers in front of the operator. The fix in that regime is to bump `MAX_TRACKED_IDS` (the eviction cap) or `STALE_TRACK_TIMEOUT_FRAMES` (the absence threshold) — both constants near line 320 of `live_multiperson_binary_v2.py`.
+
+- **Data-saving validation (canteen run, 47 min, ~6 people on screen, MediaPipe throttled)** — NPZ chunks compress to ~4 MB total across 27 files; the engagement JSONL is 29 MB. NPZ schema is correct (`frames`, `track_ids`, `keypoints (N,543,3) float16`, `bboxes`, `frame_size`). The "MB not GB" surprise is dominated by 2.d throttling (only ~1 of every ~6 detected people gets MP → NPZ) plus ~39 % of buffered keypoint rows being all-zero (Holistic returned no landmarks for that crop). No corruption.
+
+**Sync status (June 2026):** both `Handover_JuneSession/live_multiperson_binary_v2.py` and `scripts/inference/live_multiperson_binary_v2.py` carry the Post-Bremen and Post-Canteen progress-log items. The only intentional divergence is the `applog` import bootstrap (Handover copy resolves it from its own folder; project-tree copy resolves it from `src/`).
 
 ---
 
-### 1. EmotiBit visibility before face registration
-- [ ] EmotiBit plots should be visible even before being registered to a facial ID.
-- [ ] Decouple physio visibility from face-enrollment state so operators can validate sensor health immediately.
+### 1. EmotiBit visibility before face registration ✅
+- [x] EmotiBit plots should be visible even before being registered to a facial ID.
+- [x] Decouple physio visibility from face-enrollment state so operators can validate sensor health immediately.
 
 **Proposed solutions**
-- [ ] Standard practice: render all discovered EmotiBit streams as unassigned rows immediately, independent of face ID state.
-- [ ] Standard practice: add assignment states (`unassigned`, `assigned`, `stale`) and keep plotting active in all states.
+- [x] Standard practice: render all discovered EmotiBit streams as unassigned rows immediately, independent of face ID state.
+- [x] Standard practice: add assignment states (`unassigned`, `assigned`, `stale`) and keep plotting active in all states.
 - [ ] State-of-the-art: add confidence-based auto-association between tracked people and devices using temporal cues, with manual override.
 
-### 2. Multi-person FPS collapse and runtime efficiency
-- [ ] During demoing, many people were simultaneously detected. Some FPS reduction per additional person is expected, but frame rate dropped to around 3 FPS.
-- [ ] Maintain a minimum FPS target of 12 at all times.
-- [ ] Evaluate adaptive frame processing to maintain 12 FPS (for example, controlled frame dropping, selective per-frame work, or phased inference).
+### 2. Multi-person FPS collapse and runtime efficiency (partially ✅)
+- [x] During demoing, many people were simultaneously detected. Some FPS reduction per additional person is expected, but frame rate dropped to around 3 FPS.
+- [ ] Maintain a minimum FPS target of 12 at all times. *(2D path holds 9–12 FPS post 2.b/2.c/2.d on canteen-class crowds; not yet validated at 30+ people. See Item 2.e for the GPU-keypoint follow-up if the throttle alone is insufficient.)*
+- [x] Evaluate adaptive frame processing to maintain 12 FPS (for example, controlled frame dropping, selective per-frame work, or phased inference).
 
 **Proposed solutions**
 - [ ] Standard practice: implement a hard real-time budget loop with degradation tiers to enforce minimum 12 FPS.
@@ -408,39 +422,39 @@ Completed work against this roadmap, in commit order:
 - [ ] State-of-the-art: asynchronous multi-rate pipeline (capture, detect, pose, classify, render, publish) with bounded queues and frame dropping under backpressure.
 - [ ] State-of-the-art: export detector/inference path to optimized runtime (ONNX/TensorRT where available) for lower latency.
 
-#### 2.b. ID inflation and tracker stability
-- [ ] Additional IDs were repeatedly assigned to the same people after detect/lost/redetect cycles.
-- [ ] IDs reached the 1000s for about 20 people.
-- [ ] Review tracker identity persistence and reuse strategy to reduce duplicate IDs.
-- [ ] Evaluate memory impact of large ID churn and buffer retention.
+#### 2.b. ID inflation and tracker stability ✅
+- [x] Additional IDs were repeatedly assigned to the same people after detect/lost/redetect cycles.
+- [x] IDs reached the 1000s for about 20 people.
+- [x] Review tracker identity persistence and reuse strategy to reduce duplicate IDs.
+- [x] Evaluate memory impact of large ID churn and buffer retention.
 - [ ] Depending on achieved frame-rate solutions, consider a mode that prioritizes visual tracking of the 6 people wearing EmotiBits.
 
 **Proposed solutions**
 - [ ] Standard practice: switch to or tune robust MOT settings (track age, minimum hits, reactivation window) to reduce identity churn.
-- [ ] Standard practice: separate detector-internal IDs from stable application-level person IDs.
-- [ ] Standard practice: enforce lifecycle cleanup and caps for inactive tracks and stale buffers.
+- [x] Standard practice: separate detector-internal IDs from stable application-level person IDs. *(Display-ID remap `P1`/`P2`/… on overlay; raw `track_id` retained in saved data.)*
+- [x] Standard practice: enforce lifecycle cleanup and caps for inactive tracks and stale buffers. *(`_evict_stale_tracks()`, `STALE_TRACK_TIMEOUT_FRAMES=60`, `MAX_TRACKED_IDS=64`.)*
 - [ ] State-of-the-art: add appearance re-identification embeddings for long occlusion recovery and identity stitching.
 
-#### 2.c. Context duration drift
-- [ ] In demo images, FPS was around 3 but context grew to around 20 seconds.
-- [ ] Context window should stay at 10 seconds.
-- [ ] Investigate and fix context-duration drift so temporal context remains pinned to target duration.
+#### 2.c. Context duration drift ✅
+- [x] In demo images, FPS was around 3 but context grew to around 20 seconds.
+- [x] Context window should stay at 10 seconds.
+- [x] Investigate and fix context-duration drift so temporal context remains pinned to target duration.
 
 **Proposed solutions**
-- [ ] Standard practice: convert context control to time-based buffering instead of fixed frame-floor behavior.
-- [ ] Standard practice: keep a 10-second target window and resample buffered features to the model input length when FPS is low.
-- [ ] Standard practice: set minimum sequence constraints from inference viability (first estimate threshold), not from static frame counts.
+- [x] Standard practice: convert context control to time-based buffering instead of fixed frame-floor behavior.
+- [x] Standard practice: keep a 10-second target window and resample buffered features to the model input length when FPS is low.
+- [x] Standard practice: set minimum sequence constraints from inference viability (first estimate threshold), not from static frame counts. *(Now `MIN_INFERENCE_SECONDS=1.0`.)*
 - [ ] State-of-the-art: include time-delta encoding for irregular frame spacing in the temporal model.
 
-#### 2.d. Underutilized hardware at low FPS
-- [ ] Demo images show around 3 FPS while CPU and GPU were not fully burdened.
-- [ ] Profile pipeline stages to identify serialization bottlenecks and non-hardware-limited stalls.
-- [ ] Evaluate parallel and asynchronous execution paths where safe and measurable.
+#### 2.d. Underutilized hardware at low FPS ✅
+- [x] Demo images show around 3 FPS while CPU and GPU were not fully burdened.
+- [x] Profile pipeline stages to identify serialization bottlenecks and non-hardware-limited stalls. *(MediaPipe Holistic on CPU TFLite identified as the dominant per-person cost.)*
+- [x] Evaluate parallel and asynchronous execution paths where safe and measurable.
 
 **Proposed solutions**
-- [ ] Standard practice: add stage-level wall-time instrumentation (capture, detect, pose, classify, render, publish, logging).
+- [x] Standard practice: add stage-level wall-time instrumentation (capture, detect, pose, classify, render, publish, logging). *(EWMA per-person extract cost feeds the budget loop.)*
 - [ ] Standard practice: remove blocking synchronization points and pre-allocate tensors/buffers to reduce per-frame overhead.
-- [ ] Standard practice: parallelize independent CPU-heavy tasks (pose per target/view) with bounded worker pools.
+- [ ] Standard practice: parallelize independent CPU-heavy tasks (pose per target/view) with bounded worker pools. *(Round-robin throttle in place; true thread pool deferred — MediaPipe holistic is not thread-safe.)*
 - [ ] State-of-the-art: add timeline tracing for queue wait vs compute time and schedule work by deadlines.
 
 #### 2.e. GPU-native keypoint extractor (move off MediaPipe)
@@ -455,10 +469,10 @@ Completed work against this roadmap, in commit order:
 - [ ] State-of-the-art: **Sapiens (Meta, 2024).** Best-in-class accuracy, larger VRAM footprint, batched. Overkill for live demo today, viable target if hardware scales.
 - [ ] Evaluation plan: small benchmark script — batched DWPose vs current MediaPipe on a recorded demo clip — comparing FPS at N = {1, 10, 20, 30} persons and per-keypoint agreement on the points that exist in both schemas. Decide adapter-vs-retrain from the agreement numbers and a held-out DAiSEE pass.
 
-### 3. Pipeline redundancy and 2D-first optimization gate
-- [ ] There is pipeline redundancy with double plotting and related duplicate work.
-- [ ] Streamline plotting/data paths before adding complexity.
-- [ ] Establish an efficiency gate for 2D perspective mode before proceeding to 360 feeds.
+### 3. Pipeline redundancy and 2D-first optimization gate (partially ✅)
+- [x] There is pipeline redundancy with double plotting and related duplicate work. *(Sowmya's matplotlib live-plot loop removed; publisher runs headless.)*
+- [x] Streamline plotting/data paths before adding complexity.
+- [ ] Establish an efficiency gate for 2D perspective mode before proceeding to 360 feeds. *(Gate is the 12 FPS floor under Item 2; not yet formalised as a regression check.)*
 - [ ] 360 processing currently scales roughly 4x and can drop FPS to less than 1, which is unacceptable for live use.
 
 **Proposed solutions**
@@ -499,10 +513,10 @@ Completed work against this roadmap, in commit order:
 - [ ] Standard practice: enforce an enrollment quality gate (minimum face-pixel size, frontal pose, sharpness) and prompt the user to re-enrol if not met, so the runtime envelope is predictable.
 - [ ] State-of-the-art: fuse face and body re-identification embeddings for longer-range identity persistence.
 
-### 6. Data saving overhead not yet demo-validated
-- [ ] The demo did not include data saving overhead.
-- [ ] Run end-to-end performance validation with save options enabled.
-- [ ] Quantify FPS and latency impact for `--save`, `--save-engagement`, and `--save-keypoints` in realistic multi-person sessions.
+### 6. Data saving overhead not yet demo-validated (partially ✅)
+- [x] The demo did not include data saving overhead. *(47-min canteen run with `--save-engagement` + `--save-keypoints` did not destabilise FPS; NPZ schema validated.)*
+- [x] Run end-to-end performance validation with save options enabled.
+- [ ] Quantify FPS and latency impact for `--save`, `--save-engagement`, and `--save-keypoints` in realistic multi-person sessions. *(Comparative no-save vs save benchmark still pending.)*
 
 **Proposed solutions**
 - [ ] Standard practice: benchmark no-save vs each save mode under the same scripted workload and report FPS/latency deltas.
@@ -518,4 +532,4 @@ Completed work against this roadmap, in commit order:
 
 ## 🗺️ Roadmap
 
-See [docs/NextSteps.md](docs/NextSteps.md) for planned features and technical details.
+See the **Post Jazzahead Demo Roadmap** above for the live tracker of efficiency, ID stability, and model-fairness work.

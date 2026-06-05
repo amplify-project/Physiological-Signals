@@ -44,6 +44,10 @@ data/processed/features_*/
 data/sessions/*.jsonl
 data/sessions/*_summary.json
 data/sessions/20*_*/
+Handover_JuneSession/data/sessions/*.jsonl
+Handover_JuneSession/data/sessions/*_summary.json
+Handover_JuneSession/data/sessions/20*_*/
+Handover_JuneSession/data/logs/
 *.npy
 *.avi
 *.mp4

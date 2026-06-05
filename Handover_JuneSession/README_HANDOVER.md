@@ -1,6 +1,6 @@
 # Concert Engagement AR System — Full Handover
 
-> **V1 — April 2026**
+> **V2 — June 2026**
 > Contains the complete real-time engagement pipeline: computer vision inference, physiological signal processing (EmotiBit), Redis pub/sub streaming, and the Unity C# subscriber for AR glasses.
 
 This is a **self-contained package**. No other repositories needed.
@@ -90,17 +90,41 @@ Open **three separate terminal/command prompt windows** and run one script in ea
 
 The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera view with a sidebar:
 
-- **Radio buttons** on the sidebar select which detected person to treat as the "focus target" whose engagement score is highlighted and published
-- **Engagement score** is displayed as a coloured overlay on each person's bounding box (green = engaged, red = disengaged)
-- Press **`q`** or **Escape** to quit gracefully
+- **Bounding boxes** are labelled `P1`, `P2`, … — small recyclable display IDs that stay stable for the operator. The raw tracker ID is still recorded in the saved data for offline analysis.
+- **Engagement score** is shown as a coloured overlay on each person's bounding box (green = engaged, red = disengaged).
+- A small **cyan dot** in the top-right of a bounding box means that person received fresh MediaPipe extraction this frame (the rest reuse their last score). When the system is throttling under crowd load the HUD shows e.g. `MP: 1/3 rr2`.
+- **Sidebar** shows one row per enrolled person with their EmotiBit serial, plus three readouts:
+  - **EDA spline plot** — live electrodermal activity over the rolling window.
+  - **HRSD** — 5-second standard deviation of heart rate.
+  - **STROC** — 5-second standard deviation of skin-temperature rate-of-change.
+- **Radio buttons** on the sidebar select which detected person to treat as the "focus target".
+- Press **`R`** to open a picklist of detected-but-unassigned EmotiBit serials; arrow keys / number keys to select, **Enter** to confirm, **Esc** to cancel.
+- Press **`q`** or **Esc** to quit gracefully.
+
+### CLI flags for `live_multiperson_binary_v2.py`
+
+The `3_START_ENGAGEMENT.bat` file invokes the script with sensible defaults; pass extra flags by editing the .bat or running the script directly inside the venv:
+
+| Flag | Purpose |
+|------|---------|
+| `--camera N` | Pick camera index (0, 1, 2, …) |
+| `--select-camera` / `-s` | Interactive camera picker at startup |
+| `--video PATH` | Run on a recorded video file instead of a live camera |
+| `--save` | Save **everything**: engagement JSONL + keypoint NPZ chunks + raw video |
+| `--save-engagement` | Save only `engagement_data.jsonl` (~370 MB / 30 min) |
+| `--save-keypoints` | Save only the compressed MediaPipe keypoint NPZ chunks |
+| `--save-dir PATH` | Override the default `data/sessions/<timestamp>/` location |
+| `--no-face-id` | Skip the face-ID enrol step (faster startup, no per-person identity) |
+| `--redis-host HOST` / `--redis-port N` | Point at a non-default Redis broker |
+| `--device cuda` / `cpu` / `mps` | Force a specific compute device (default `auto`) |
 
 ### EmotiBit device discovery (Window 2)
 
 When `2_START_EMOTIBIT.bat` starts (runs `multiemotibit_UDP_SD_RFv2.py`):
-1. Power on your EmotiBit device(s)
-2. Wait for them to appear in the console (up to 20 seconds)
-3. Press **Enter** to accept, or wait 5 s after the last device — it auto-accepts
-4. A live plot window opens showing real-time filtered **EDA** and **Heart Rate** per device
+1. Power on your EmotiBit device(s).
+2. Wait for them to appear in the console (up to 20 seconds).
+3. **Press ENTER** once all expected devices are listed to begin streaming.
+4. The publisher then runs **headless** — there is no separate matplotlib window. All physio plots are rendered inside the engagement GUI sidebar.
 
 ---
 
@@ -112,19 +136,17 @@ All AR data flows over Redis pub/sub on `localhost:6379`.
 
 | Channel | Payload | Description |
 |---------|---------|-------------|
-| `engagement:scores` | `{person_id, score, timestamp}` | Per-person binary engagement score |
-| `engagement:focus` | `{person_id, score, timestamp}` | Score for the selected focus target only |
+| `engagement_score` | `{frame, persons:[{id, score, bbox, identified, …}], crowd_avg, fps, ts}` | Single per-frame snapshot for all detected persons. The Unity / `test_subscriber.py` consumers extract their target by id. |
 
 ### Physiological (EmotiBit)
 
-Replace `{device}` with the EmotiBit's MAC-derived ID (e.g. `MD-V5-0000448`).
+Replace `{device}` with the EmotiBit's MAC-derived serial (e.g. `MD-V5-0000448`).
 
 | Channel | Payload | Description |
 |---------|---------|-------------|
-| `device:{device}:hr_filtered` | `{device, HR_filtered, timestamp}` | Low-pass filtered Heart Rate (BPM) |
-| `device:{device}:eda_filtered` | `{device, EDA_filtered, timestamp}` | Low-pass filtered EDA (µS) |
-| `device:{device}:valence_cont` | `{device, valence, timestamp}` | Continuous Valence score [0–2] |
-| `device:{device}:arousal_cont` | `{device, arousal, timestamp}` | Continuous Arousal score [0–2] |
+| `device:{device}:physio_metrics` | `{device, timestamp, eda_sd, edl_sd, hr_sd, ibi_sd, temperature_roc_sd, scr_frequency_sd}` | All 5 s standard-deviation metrics published once per second. The GUI sidebar consumes this. |
+| `device:{device}:valence_cont` | `{device, valence, timestamp}` | Continuous Valence score [0–2] from the Random Forest. |
+| `device:{device}:arousal_cont` | `{device, arousal, timestamp}` | Continuous Arousal score [0–2] from the Random Forest. |
 
 All payloads are JSON strings.
 
@@ -157,9 +179,9 @@ Both should print JSON messages every second when the systems are running.
 
 ## 🛑 Stopping
 
-- Press **`q`** in the engagement window, or **Ctrl+C** in any terminal
-- Close the EmotiBit plot window (press `q` inside it) — this flushes and saves all CSV recordings
-- Close the Redis terminal last
+- Press **`q`** or **Esc** in the engagement window, or **Ctrl+C** in any terminal.
+- In Window 2 (EmotiBit publisher), press **Ctrl+C** to flush and save all CSV recordings.
+- Close the Redis terminal last.
 
 ---
 
@@ -200,7 +222,6 @@ If data saving has to stop because the disk or memory is full, the live engageme
 | No EmotiBit devices found | Check device is powered on and on the **same Wi-Fi** network; run the .bat as Administrator (it will auto-add firewall rules) |
 | Engagement window black / no camera | Check camera index — pass `--camera 1` (or 2) as an argument to `3_START_ENGAGEMENT.bat` |
 | `FaceIdentifier init failed` | Re-run `SETUP.bat` so it installs the Face ID weights, or place `model/20180402-114759-vggface2.pt` in the project manually |
-| Live plot window doesn't open | Python was installed without Tcl/Tk — reinstall Python and tick "tcl/tk and IDLE" |
 | `Model not found` | Make sure `model/best_model.pth`, `yolo26n.pt`, `rf_valence_full_v2.pkl`, `rf_arousal_full_v2.pkl` are all present in the folder |
 | `WeightsUnpickler error: Unsupported operand …` when loading `best_model.pth` | The repo's `best_model.pth` was overwritten with a full training checkpoint instead of a slim `state_dict`. Run `git lfs pull` to refresh, or re-export it with `python scripts/utils/reexport_checkpoint.py <bundle.pth> -o models/.../best_model.pth`. **Do not** patch the code to pass `weights_only=False` — see the Model Checkpoint section in the project root `README.md`. |
 | `best_model.pth` resolves to a path outside the repo (e.g. `C:\Users\<name>\AMPLIFY\models\...`) | You're on a pre-`5590200` commit. `git pull` on `GUI_Bug_Fix` to get the path-detection fix. |
@@ -234,9 +255,3 @@ Camera feed         ──────▶  live_multiperson_binary_v2.py
 ## 🐍 Python Version
 
 **Tested with Python 3.10, 3.11, 3.12** on Windows 11.
-
----
-
-## ⚠️ Known Issues
-
-See **`KNOWN_ISSUES.md`** for a full list of bugs found and fixed during handover testing (April 2026).
