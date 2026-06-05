@@ -1430,7 +1430,9 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             cv2.line(sidebar, (rb_cx - 5, rb_cy), (rb_cx + 5, rb_cy),
                      (80, 80, 80), 1, cv2.LINE_AA)
         # Serial label — truncate long IDs to fit. Unassigned dimmed.
-        label = serial if len(serial) <= 14 else serial[-14:]
+        # 10-char tail leaves room for the STROC / HRSD readouts on the same
+        # row at sidebar_w=280 without collisions.
+        label = serial if len(serial) <= 10 else serial[-10:]
         label_col = (220, 220, 220) if is_enrolled else (150, 150, 150)
         cv2.putText(sidebar, f"#{label}", (22, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, label_col, 1, cv2.LINE_AA)
@@ -1462,10 +1464,11 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
         # STROC = Skin Temperature Rate Of Change SD. Sits left of HRSD on
         # the same row header so both readouts stay above the EDA plot.
+        # 2 decimals is enough for the operator view (CSV keeps full precision).
         temp_roc = snap_metrics.get('temperature_roc_sd')
         if temp_roc is not None:
-            cv2.putText(sidebar, f"STROC {temp_roc:.3f}",
-                        (sidebar_w - 165, y0 + 16),
+            cv2.putText(sidebar, f"STROC {temp_roc:.2f}",
+                        (sidebar_w - 145, y0 + 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 170, 220), 1, cv2.LINE_AA)
         # EDA spline plot — fills remaining vertical space.
         # Three render modes, in priority order:
