@@ -1430,9 +1430,9 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             cv2.line(sidebar, (rb_cx - 5, rb_cy), (rb_cx + 5, rb_cy),
                      (80, 80, 80), 1, cv2.LINE_AA)
         # Serial label — truncate long IDs to fit. Unassigned dimmed.
-        # 10-char tail leaves room for the STROC / HRSD readouts on the same
-        # row at sidebar_w=280 without collisions.
-        label = serial if len(serial) <= 10 else serial[-10:]
+        # Last 5 chars is enough to disambiguate wearers in operator view; the
+        # full ID is in the CSV. Keeps the row header clear for STROC / HRSD.
+        label = serial if len(serial) <= 5 else serial[-5:]
         label_col = (220, 220, 220) if is_enrolled else (150, 150, 150)
         cv2.putText(sidebar, f"#{label}", (22, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, label_col, 1, cv2.LINE_AA)
