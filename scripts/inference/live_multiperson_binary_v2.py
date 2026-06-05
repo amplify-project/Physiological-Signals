@@ -780,6 +780,14 @@ class MultiPersonEngagementSystem:
         # Publish throttle (1 Hz)
         self.last_publish_time = 0
         self.publish_interval = 1.0  # seconds
+        # Console-print throttle for the per-publish line: print every second
+        # for the first 3 publishes (so the user can confirm the pipeline is
+        # alive), then once per 60 s. Mirrors multiemotibit_UDP_SD_RFv2's
+        # throttling pattern to keep terminal I/O off the hot path.
+        self._console_pub_count = 0
+        self._console_pub_last = 0.0
+        self._console_pub_interval = 60.0
+        self._console_pub_warmup = 3
 
         # 2. Load YOLO (person detection)
         def _check_lfs(p):
@@ -850,7 +858,7 @@ class MultiPersonEngagementSystem:
         # by timestamp on every append; resampled to MODEL_INPUT_FRAMES for
         # model calls. See _append_features() / _resample_buffer().
         self.person_buffers = {}
-
+        
         # Store latest scores for visualization and averaging
         # { track_id: score }
         self.person_scores = {}
@@ -859,6 +867,16 @@ class MultiPersonEngagementSystem:
         # Updated each time a track is seen; consulted by _evict_stale_tracks().
         self.person_last_seen = {}
         self._frame_counter = 0
+
+        # Display-label remap (issue 5): YOLO's bytetrack inflates the id space
+        # in crowded scenes (2k+ ids over a 47 min run). The raw ids are still
+        # logged to JSONL/NPZ for analysis, but the on-screen overlay uses a
+        # compact recyclable pool of P1/P2/... labels so the operator sees a
+        # stable, audience-sized set of names. Slots are returned to the pool
+        # when their underlying track is evicted by _evict_stale_tracks().
+        self._display_id_map = {}    # track_id -> "P12"
+        self._display_id_pool = []   # free integer slots, smallest-first
+        self._display_id_next = 1    # next never-used integer
 
         # Longest wall-clock buffer span across active tracks, refreshed at the
         # end of each process_frame / process_view. Read by the overlay so the
@@ -1107,10 +1125,8 @@ class MultiPersonEngagementSystem:
 
     def _evict_stale_tracks(self, active_ids):
         """Drop buffers for ids absent longer than STALE_TRACK_TIMEOUT_FRAMES,\n        and enforce MAX_TRACKED_IDS by evicting the longest-unseen first.\n        Bounds RAM and per-frame cost in crowded scenes where YOLO's\n        re-detection inflates the id space (see Post-Bremen roadmap 2.b)."""
-        # Refresh last-seen for currently visible tracks
         for tid in active_ids:
             self.person_last_seen[tid] = self._frame_counter
-        # Timeout-based eviction
         cutoff = self._frame_counter - STALE_TRACK_TIMEOUT_FRAMES
         stale = [tid for tid, last in self.person_last_seen.items()
                  if last < cutoff and tid not in active_ids]
@@ -1118,7 +1134,7 @@ class MultiPersonEngagementSystem:
             self.person_buffers.pop(tid, None)
             self.person_scores.pop(tid, None)
             self.person_last_seen.pop(tid, None)
-        # Hard cap: drop the oldest-seen tracks if still over the limit
+            self._release_display_id(tid)
         if len(self.person_buffers) > MAX_TRACKED_IDS:
             ordered = sorted(self.person_last_seen.items(), key=lambda kv: kv[1])
             n_drop = len(self.person_buffers) - MAX_TRACKED_IDS
@@ -1128,6 +1144,43 @@ class MultiPersonEngagementSystem:
                 self.person_buffers.pop(tid, None)
                 self.person_scores.pop(tid, None)
                 self.person_last_seen.pop(tid, None)
+                self._release_display_id(tid)
+
+    # --- Display-label remap -------------------------------------------------
+    def display_label(self, track_id):
+        """Return a short, recyclable on-screen label (e.g. 'P3') for a YOLO
+        track id. Allocates the smallest free slot, or a fresh one if the
+        pool is empty. Slots are returned to the pool when the track is
+        evicted by _evict_stale_tracks(). Raw track_id is still kept in the
+        JSONL/NPZ logs for offline analysis."""
+        tid = int(track_id)
+        lbl = self._display_id_map.get(tid)
+        if lbl is not None:
+            return lbl
+        if self._display_id_pool:
+            slot = self._display_id_pool.pop(0)
+        else:
+            slot = self._display_id_next
+            self._display_id_next += 1
+        lbl = f"P{slot}"
+        self._display_id_map[tid] = lbl
+        return lbl
+
+    def _release_display_id(self, track_id):
+        tid = int(track_id)
+        lbl = self._display_id_map.pop(tid, None)
+        if lbl is None:
+            return
+        try:
+            slot = int(lbl[1:])
+        except ValueError:
+            return
+        # Insert in sorted order so display_label() always picks the smallest
+        # free slot first — keeps the visible numbers small and stable.
+        idx = 0
+        while idx < len(self._display_id_pool) and self._display_id_pool[idx] < slot:
+            idx += 1
+        self._display_id_pool.insert(idx, slot)
 
     # --- Time-windowed feature buffer (roadmap 2.c) -------------------------
     # Buffer entries are (monotonic_timestamp, features_flat) tuples. Stored in
@@ -1308,7 +1361,11 @@ class MultiPersonEngagementSystem:
                 payload = f"{crowd_average:.4f}"
                 self.redis_client.publish(REDIS_CHANNEL, payload)
                 self.last_publish_time = current_time
-                print(f"📡 Redis pub → {REDIS_CHANNEL}: {payload}")
+                self._console_pub_count += 1
+                if (self._console_pub_count <= self._console_pub_warmup
+                        or (current_time - self._console_pub_last) >= self._console_pub_interval):
+                    print(f"📡 Redis pub → {REDIS_CHANNEL}: {payload}")
+                    self._console_pub_last = current_time
             except Exception as e:
                 print(f"Redis Error: {e}")
 
@@ -1388,23 +1445,27 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             snap_eda_sd = list(d.get('eda_sd', []))
             snap_hr_sd  = list(d.get('hr_sd',  []))
             snap_metrics = dict(d.get('metrics', {}))
+        # HRSD + STROC on the same line, side by side, OUT of the EDA plot
+        # area below. Short labels (HRSD / STROC) to fit the ~140 px header
+        # real estate at sidebar_w=280.
         if snap_hr:
-            hr_text = f"{snap_hr[-1]:.0f}bpm"
+            hr_text = f"HR {snap_hr[-1]:.0f}bpm"
             hr_col  = (100, 210, 100)
         elif snap_hr_sd:
-            hr_text = f"HR SD {snap_hr_sd[-1]:.2f}"
+            hr_text = f"HRSD {snap_hr_sd[-1]:.2f}"
             hr_col  = (100, 210, 100)
         else:
-            hr_text = "--"
+            hr_text = "HR --"
             hr_col  = (80, 80, 80)
-        cv2.putText(sidebar, hr_text, (sidebar_w - 86, y0 + 16),
+        cv2.putText(sidebar, hr_text, (sidebar_w - 78, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
-        # Temp ROC SD — small secondary readout right under HR
+        # STROC = Skin Temperature Rate Of Change SD. Sits left of HRSD on
+        # the same row header so both readouts stay above the EDA plot.
         temp_roc = snap_metrics.get('temperature_roc_sd')
         if temp_roc is not None:
-            cv2.putText(sidebar, f"Ṫ SD {temp_roc:.3f}",
-                        (sidebar_w - 86, y0 + 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (170, 170, 220), 1, cv2.LINE_AA)
+            cv2.putText(sidebar, f"STROC {temp_roc:.3f}",
+                        (sidebar_w - 165, y0 + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 170, 220), 1, cv2.LINE_AA)
         # EDA spline plot — fills remaining vertical space.
         # Prefer raw EDA stream when available; otherwise plot the EDA SD stream
         # (which is what the SD-pipeline publishes since May 28 2026).
@@ -2239,9 +2300,9 @@ def main():
                             bar_h = 4
                             bar_w = int((x2 - x1) * bf)
                             cv2.rectangle(view_bgr, (x1, bar_y), (x1 + bar_w, bar_y + bar_h), (255, 255, 0), -1)
-                            plabel = f"ID:{pid} {score:.0%} conf:{bf:.0%}"
+                            plabel = f"{system.display_label(pid)} {score:.0%} conf:{bf:.0%}"
                         else:
-                            plabel = f"ID:{pid} {score:.0%}"
+                            plabel = f"{system.display_label(pid)} {score:.0%}"
                         cv2.putText(view_bgr, plabel, (x1, y1 - 10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                 
@@ -2306,6 +2367,10 @@ def main():
                 pid = person['id']
                 bf = person.get('buffer_fill', 1.0)
                 identified = person.get('identified_as')
+                # Fresh-MP marker: this person got a MediaPipe pass this frame
+                # (vs reusing cached score). Helps visualise the round-robin
+                # so the throttle ratio in the HUD is not just a static number.
+                fresh_mp = person.get('keypoints') is not None
                 
                 # Determine if this person should be highlighted
                 # Magenta box only when a specific EmotiBit is selected for this person
@@ -2325,8 +2390,10 @@ def main():
                     # Standard engagement gradient box
                     color = (0, int(255 * score), int(255 * (1-score)))
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    # Always show EmotiBit serial if enrolled; fall back to auto ID
-                    id_str = identified if identified else f"ID:{pid}"
+                    # Always show EmotiBit serial if enrolled; otherwise a short,
+                    # recyclable display label (P1/P2/...) instead of the raw
+                    # YOLO track id which inflates rapidly in dense crowds.
+                    id_str = identified if identified else system.display_label(pid)
                     if bf < 0.9:
                         label = f"{id_str} {score:.0%} conf:{bf:.0%}"
                         cv2.putText(display_frame, label, (x1, y1 - 10),
@@ -2340,6 +2407,11 @@ def main():
                     else:
                         cv2.putText(display_frame, f"{id_str} {score:.0%}", (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Fresh-MP marker: small filled dot top-right of bbox when this
+                # person was MediaPipe-refreshed this frame. Visualises the
+                # round-robin rotation so MP: x/N is not just a static digit.
+                if fresh_mp:
+                    cv2.circle(display_frame, (x2 - 5, y1 + 5), 3, (0, 255, 255), -1)
         
         # Calculate live FPS
         frame_duration = time.time() - frame_start_time
@@ -2389,7 +2461,8 @@ def main():
         context_seconds = system.current_context_seconds
         throttle_str = ""
         if system.last_total_count > 0 and system.last_selected_count < system.last_total_count:
-            throttle_str = f" | MP: {system.last_selected_count}/{system.last_total_count}"
+            throttle_str = (f" | MP: {system.last_selected_count}/{system.last_total_count}"
+                            f" rr{system._rr_offset}")
         fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s{throttle_str}"
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
