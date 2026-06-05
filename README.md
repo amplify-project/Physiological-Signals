@@ -336,6 +336,26 @@ Start-Process -FilePath "redis\redis-server.exe" -ArgumentList "redis\redis.wind
 - Publishes affect outputs to Redis on `device:{serial}:valence_cont` and `device:{serial}:arousal_cont`
 - Logs all raw signals, SD metrics, predictions, and processing time to CSV in `emotibit_recordings/`
 
+#### Planned change — per-wearer session z-score (under validation on `Post_Canteen_Bug_Fixes`)
+
+The current `physio_metrics` bundle publishes raw `numpy.std()` of the 5 s buffer as magnitude-only SDs. The 4 June canteen recordings exposed two limitations: (1) impossible EmotiBit beat-detector values (IBI 80 ms / 6,160 ms, HR > 220 BPM) propagate untouched into the SDs, producing a ~270 ms `ibi_sd` floor; (2) magnitudes don't tell the operator whether a person is rising above or settling below their own normal — the question the stage-side view actually needs to answer.
+
+The planned replacement matches the methodology already published in the IMX '26 adult paper (rolling-median + z-score) and the IMEX infant paper (whole-session z-score, motivated by the absence of a resting baseline when sensors are rotated across wearers):
+
+- **Per-device running mean/SD via Welford's algorithm** — one-pass, numerically stable; converges to the true session mean within ~60–90 s and barely moves thereafter, so sustained elevations stay visibly elevated (unlike a short EMA, which habituates).
+- **Calibration gate** — first ~60 s after a wearer assignment marked as "calibrating" in the GUI; z-scores published thereafter as $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC, SCR frequency.
+- **Wearer-swap detection (auto)** — multi-condition trigger: sustained simultaneous silence on all channels (EDA + PPG + temperature + accelerometer) for ≥ 30 s, followed by a return of all channels to plausible ranges, plus a step change in skin temperature baseline. Biased toward missing resets rather than firing false ones (false reset wastes 60 s; missed reset contaminates across wearers).
+- **Manual reset hook** — per-device "new wearer" button in the GUI sidebar that resets that device's Welford state and re-arms the calibration gate. Belt-and-braces for the auto-detector.
+- **Loose-strap handling** — partial channel dropout (EDA falls but PPG/accelerometer continue) does **not** trigger a reset; instead the affected channel is flagged "low-quality" in the publish bundle so the GUI can render it greyed-out rather than as a falsely calm baseline.
+
+**Required upstream filtering (precondition for any baseline approach):**
+- Plausibility gates: HR ∈ [40, 200] BPM, IBI ∈ [300, 1500] ms, temperature ∈ [30, 38] °C (skin temp on a child).
+- Short median pre-filter on per-beat IBI to suppress the EmotiBit sample-and-hold artefacts.
+- Hampel filter on EDA for spike rejection.
+- Rejected samples are excluded from the Welford update so artefacts never enter the running stats.
+
+Backwards-compatibility: the existing `eda_sd` / `hr_sd` / `ibi_sd` / `temperature_roc_sd` / `scr_frequency_sd` magnitude fields remain in the `physio_metrics` payload (the operator still wants to read "this person is at HR 110 right now"); the signed `*_z` fields are added alongside them. The Valence/Arousal RF path is unchanged. Implementation will land on `Post_Canteen_Bug_Fixes` for Sowmya + Eoghan to validate against the canteen recordings before merging to `main`.
+
 **GUI sidebar (280px panel hstacked on the right):**
 - One row per enrolled participant — radio button, EmotiBit serial label, and live Physio values
 - Accepts `hr_sd` and `eda_sd` from `device:{serial}:physio_metrics`; falls back to legacy HR/EDA plots when those channels are available

@@ -150,6 +150,23 @@ Replace `{device}` with the EmotiBit's MAC-derived serial (e.g. `MD-V5-0000448`)
 
 All payloads are JSON strings.
 
+### Planned change — per-wearer session z-score (under validation on `Post_Canteen_Bug_Fixes`)
+
+The 4 June canteen recordings revealed two issues with the current `physio_metrics` bundle: (1) impossible EmotiBit beat-detector values (IBI 80 ms / 6,160 ms, HR > 220 BPM) flow untouched into the SDs, producing a ~270 ms `ibi_sd` floor; (2) magnitude-only SDs don't tell the operator whether a wearer is rising above or settling below their own normal. The planned replacement mirrors the methodology in the IMX '26 adult paper (rolling-median + z-score) and the IMEX infant paper (whole-session z-score, motivated by the absence of a resting baseline when sensors rotate across wearers):
+
+- **Per-device running mean/SD (Welford)** — converges to the true session mean within ~60–90 s and barely moves thereafter, so sustained elevations stay visibly elevated (a short EMA would habituate them away).
+- **Calibration gate** — first ~60 s marked "calibrating" in the GUI; thereafter publish signed $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC, SCR frequency alongside the existing magnitude fields.
+- **Wearer-swap detection (auto)** — fires only on sustained simultaneous silence on all channels (EDA + PPG + temperature + accelerometer) for ≥ 30 s followed by return-to-plausible plus a step change in skin temperature baseline. Biased to miss rather than false-trigger.
+- **Manual "new wearer" button** in each GUI sidebar tile — resets that device's Welford state and re-arms the calibration gate. Operator override for the auto-detector.
+- **Loose-strap handling** — partial channel dropout flags the affected channel as `low-quality` in the publish bundle; does not trigger a reset.
+
+**Required upstream filtering** (precondition; rejected samples are excluded from Welford updates):
+- HR ∈ [40, 200] BPM, IBI ∈ [300, 1500] ms, temperature ∈ [30, 38] °C plausibility gates.
+- Median pre-filter on per-beat IBI to suppress EmotiBit sample-and-hold artefacts.
+- Hampel filter on EDA for spike rejection.
+
+Existing `eda_sd` / `hr_sd` / `ibi_sd` / `temperature_roc_sd` / `scr_frequency_sd` fields stay in the payload (so Unity and the GUI sidebar continue to work unchanged); `*_z` fields and a `quality` flag are added alongside. The Valence/Arousal RF path is unchanged. To be validated by Sowmya + Eoghan on `Post_Canteen_Bug_Fixes` before merging to `main`.
+
 ---
 
 ## 🔌 Unity Integration

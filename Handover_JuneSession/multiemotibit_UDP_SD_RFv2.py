@@ -51,6 +51,29 @@ REDIS_DB = 0
 CHANNEL_PHYSIO = "device:{src}:physio_metrics"
 CHANNEL_VAL = "device:{src}:valence_cont"
 CHANNEL_ARO = "device:{src}:arousal_cont"
+CHANNEL_RESET = "device:{src}:reset_baseline"  # GUI publishes here to reset a wearer's baseline
+
+# ---- Per-wearer session-z baseline / artefact-rejection settings ----
+# Plausibility gates: samples outside these ranges never enter RF / SD / Welford buffers.
+PLAUSIBLE_HR_BPM   = (40.0, 200.0)
+PLAUSIBLE_IBI_MS   = (300.0, 1500.0)
+PLAUSIBLE_TEMP_C   = (30.0, 38.0)
+PLAUSIBLE_EDA_US   = (0.01, 100.0)
+PLAUSIBLE_SCR_FREQ = (0.0, 20.0)
+IBI_MEDIAN_KERNEL  = 3        # median pre-filter on per-beat IBI
+CALIBRATION_SECONDS = 60      # warm-up window before z-scores are published
+Z_SOFT_THRESHOLD = 1.5        # amber GUI indicator (~13% fire rate)
+Z_HARD_THRESHOLD = 2.0        # red GUI indicator + logged event (~5%, matches published methodology)
+# Wearer-swap auto-detection (pinned-floor heuristic).
+# EmotiBits keep streaming when removed from skin -- they emit pinned junk
+# (EDA near zero, PPG near zero, HR/IBI sample-and-hold). UDP silence never
+# happens, so we detect off-wrist by sustained collapse of the contact-driven
+# raw signals instead.
+SWAP_PINNED_SECONDS     = 15.0   # off-wrist must persist >= this to count as a swap
+EDA_OFFWRIST_THRESHOLD  = 0.10   # µS — below this the wrist is empty
+PPG_OFFWRIST_THRESHOLD  = 1500.0 # PPGGreen counts — below this the LED has no skin to reflect off
+SWAP_TEMP_STEP_C        = 1.0    # post-return skin-temp shift confirms different wearer (optional)
+SWAP_DATA_FRESH_SECONDS = 5.0    # "channel is live" threshold
 
 # ---- EmotiBit UDP protocol settings ----
 EMOTIBIT_CONTROL_PORT = 3131
@@ -98,6 +121,58 @@ def filter_hr(arr):
     arr = medfilt(arr, kernel_size=5)
     return lowpass_filter(arr, cutoff=0.5, fs=EMIT_RATE_HZ)
 
+# ----------------------------- BASELINE STATE -----------------------------
+class WelfordState:
+    """Numerically-stable running mean/variance (Welford's online algorithm).
+    One instance per (device, channel). Anchors the per-wearer session z-score.
+    """
+    __slots__ = ('n', 'mean', 'm2')
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x):
+        if x is None:
+            return
+        try:
+            xv = float(x)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(xv):
+            return
+        self.n += 1
+        delta = xv - self.mean
+        self.mean += delta / self.n
+        delta2 = xv - self.mean
+        self.m2 += delta * delta2
+
+    @property
+    def sd(self):
+        if self.n < 2:
+            return 0.0
+        return float(np.sqrt(self.m2 / (self.n - 1)))
+
+    def reset(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+
+def _plausible(value, lo_hi):
+    """True if value is finite and within (lo, hi)."""
+    if value is None:
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(v):
+        return False
+    lo, hi = lo_hi
+    return lo <= v <= hi
+
 # ----------------------------- FEATURE EXTRACTION -----------------------------
 def extract_features_window(df):
     feats = {}
@@ -144,6 +219,13 @@ class DataLogger:
         computed_metrics = [
             "valence", "arousal",
             "edl_sd", "eda_sd", "temperature_roc_sd", "scr_frequency_sd", "hr_sd", "ibi_sd",
+            # Per-wearer session-z baseline columns (post-canteen physio update).
+            "calibrating", "calibration_remaining_s", "baseline_n",
+            "hr_z", "eda_z", "ibi_z", "temperature_roc_z", "scr_frequency_z",
+            "hr_event_hard", "eda_event_hard", "ibi_event_hard",
+            "quality_hr", "quality_eda", "quality_ibi",
+            "quality_temperature_roc", "quality_scr_frequency",
+            "swap_detected",
             "processing_time_ms"
             # Note: end_to_end_latency_ms removed - unreliable without proper clock sync
         ]
@@ -204,7 +286,9 @@ class DeviceAggregator:
         self.values = {col: [] for col in COLUMNS}
         self.all_signals = all_signal_types or {}  # Store all signal types
         self.all_signal_values = {sig: [] for sig in self.all_signals.keys()}  # Buffer for all signals
-        self.lock = threading.Lock()
+        # Reentrant: process_window holds the lock while calling _compute_baseline_extras,
+        # which may call _reset_baseline_unlocked. Reset listener thread also acquires.
+        self.lock = threading.RLock()
         self.clf_val = clf_val
         self.clf_aro = clf_aro
         self.redis = redis_client
@@ -222,39 +306,264 @@ class DeviceAggregator:
         self.last_print_time = 0
         self.print_interval = 30.0  # Print every 30 seconds after initial 3 seconds
 
-    def update(self, col, value):
-        """Update values for both prediction columns and all signals"""
+        # ---- Per-wearer session-z baseline state ----
+        # Welford running mean/SD per channel, anchored to wearer-session start.
+        self.welford = {
+            'hr': WelfordState(),
+            'eda': WelfordState(),
+            'ibi': WelfordState(),
+            'temperature_roc': WelfordState(),
+            'scr_frequency': WelfordState(),
+        }
+        self.baseline_session_start = time.time()
+        self.baseline_temp_c = None  # captured at end of calibration window
+        self.swap_offwrist_start = None  # wall-clock when pinned-floor (off-wrist) began
+        # Median pre-filter buffer for raw per-beat IBI (sample-and-hold artefacts)
+        self._ibi_raw_recent = []
+        # Last wall-clock arrival per channel group (for stale-data + swap detection)
+        self.last_data_time = {'eda': 0.0, 'ppg': 0.0, 'temperature': 0.0, 'accelerometer': 0.0}
+        # Quality flag per published channel
+        self.channel_quality = {
+            'hr': 'ok', 'eda': 'ok', 'ibi': 'ok',
+            'temperature_roc': 'ok', 'scr_frequency': 'ok',
+        }
+
+    def reset_baseline(self, reason="manual"):
+        """Reset Welford state and calibration window. Call on wearer swap."""
         with self.lock:
-            # Update prediction columns (EDA, HeartRate)
-            if col in COLUMNS:
-                self.values[col].append(float(value))
-                max_samples = int(WINDOW_SECONDS * EMIT_RATE_HZ)
-                for c in COLUMNS:
-                    self.values[c] = self.values[c][-max_samples:]
-            
-            # Update all signals
-            if col in self.all_signal_values:
-                self.all_signal_values[col].append(float(value))
-                max_samples = int(WINDOW_SECONDS * EMIT_RATE_HZ)
-                self.all_signal_values[col] = self.all_signal_values[col][-max_samples:]
-            
-            # Track 5 specific signals for Redis SD metrics
+            self._reset_baseline_unlocked(reason)
+
+    def _reset_baseline_unlocked(self, reason):
+        for w in self.welford.values():
+            w.reset()
+        self.baseline_session_start = time.time()
+        self.baseline_temp_c = None
+        self.swap_offwrist_start = None
+        self._ibi_raw_recent = []
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.source_id} baseline reset ({reason})")
+        log.info('baseline_reset', extra={'device': self.source_id, 'reason': reason})
+
+    def update(self, col, value):
+        """Update buffers for one signal sample.
+
+        Raw samples are always logged to the CSV buffer (unfiltered record).
+        Plausibility-gated copies populate the RF / SD / Welford buffers so
+        impossible EmotiBit values (e.g. IBI 80 ms / 6,160 ms, HR > 220 BPM)
+        never reach the statistics. IBI is additionally de-duplicated against
+        the sample-and-hold UDP stream and median-pre-filtered over the most
+        recent plausible beats.
+        """
+        with self.lock:
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                return
+            if not np.isfinite(v):
+                return
+
             max_samples = int(WINDOW_SECONDS * EMIT_RATE_HZ)
-            if col == "EDL":  # Tonic EDA
-                self.edl_values.append(float(value))
+            now_wall = time.time()
+
+            # Always log raw to CSV buffer
+            if col in self.all_signal_values:
+                self.all_signal_values[col].append(v)
+                self.all_signal_values[col] = self.all_signal_values[col][-max_samples:]
+
+            # Track arrival per channel group (powers stale-data flags + swap detection)
+            if col in ("EDA", "EDL", "EDR") or col.startswith("SCR"):
+                self.last_data_time['eda'] = now_wall
+            elif col in ("HeartRate", "InterBeatInterval") or col.startswith("PPG"):
+                self.last_data_time['ppg'] = now_wall
+            elif col.startswith("Temperature") or col == "Thermopile":
+                self.last_data_time['temperature'] = now_wall
+            elif col.startswith("Accelerometer") or col.startswith("Gyroscope") or col.startswith("Magnetometer"):
+                self.last_data_time['accelerometer'] = now_wall
+
+            # Plausibility gates before RF / SD / Welford buffers
+            if col == "HeartRate":
+                if not _plausible(v, PLAUSIBLE_HR_BPM):
+                    self.channel_quality['hr'] = 'low'
+                    return
+                self.channel_quality['hr'] = 'ok'
+                self.values['HeartRate'].append(v)
+                self.values['HeartRate'] = self.values['HeartRate'][-max_samples:]
+                self.hr_values.append(v)
+                self.hr_values = self.hr_values[-max_samples:]
+            elif col == "EDA":
+                if not _plausible(v, PLAUSIBLE_EDA_US):
+                    self.channel_quality['eda'] = 'low'
+                    return
+                self.channel_quality['eda'] = 'ok'
+                self.values['EDA'].append(v)
+                self.values['EDA'] = self.values['EDA'][-max_samples:]
+            elif col == "EDL":
+                if not _plausible(v, PLAUSIBLE_EDA_US):
+                    self.channel_quality['eda'] = 'low'
+                    return
+                self.edl_values.append(v)
                 self.edl_values = self.edl_values[-max_samples:]
-            elif col in ["Temperature0", "Temperature1"]:
-                self.temp_values.append(float(value))
+            elif col == "InterBeatInterval":
+                if not _plausible(v, PLAUSIBLE_IBI_MS):
+                    self.channel_quality['ibi'] = 'low'
+                    return
+                # De-duplicate sample-and-hold values: only push when value changes
+                if self._ibi_raw_recent and abs(self._ibi_raw_recent[-1] - v) < 1e-6:
+                    return
+                self._ibi_raw_recent.append(v)
+                self._ibi_raw_recent = self._ibi_raw_recent[-IBI_MEDIAN_KERNEL:]
+                v_filt = float(np.median(self._ibi_raw_recent)) if len(self._ibi_raw_recent) >= IBI_MEDIAN_KERNEL else v
+                self.channel_quality['ibi'] = 'ok'
+                self.ibi_values.append(v_filt)
+                self.ibi_values = self.ibi_values[-max_samples:]
+            elif col in ("Temperature0", "Temperature1"):
+                if not _plausible(v, PLAUSIBLE_TEMP_C):
+                    self.channel_quality['temperature_roc'] = 'low'
+                    return
+                self.channel_quality['temperature_roc'] = 'ok'
+                self.temp_values.append(v)
                 self.temp_values = self.temp_values[-max_samples:]
             elif col == "SCRFrequency":
-                self.scr_freq_values.append(float(value))
+                if not _plausible(v, PLAUSIBLE_SCR_FREQ):
+                    self.channel_quality['scr_frequency'] = 'low'
+                    return
+                self.channel_quality['scr_frequency'] = 'ok'
+                self.scr_freq_values.append(v)
                 self.scr_freq_values = self.scr_freq_values[-max_samples:]
-            elif col == "HeartRate":
-                self.hr_values.append(float(value))
-                self.hr_values = self.hr_values[-max_samples:]
-            elif col == "InterBeatInterval":
-                self.ibi_values.append(float(value))
-                self.ibi_values = self.ibi_values[-max_samples:]
+
+    def _compute_baseline_extras(self):
+        """Update Welford running stats with current 1Hz representatives,
+        compute per-channel signed z-scores, soft/hard event flags, quality
+        flags, and auto wearer-swap detection.
+
+        Returns a dict ready to merge into the physio_metrics payload, plus a
+        'swap_detected' flag the caller acts on (outside the lock).
+        """
+        now_wall = time.time()
+        age_s = now_wall - self.baseline_session_start
+        calibrating = age_s < CALIBRATION_SECONDS
+        sps = EMIT_RATE_HZ  # samples per second
+
+        # 1Hz representative values per channel (last 1s of plausibility-gated buffer).
+        # Mean of 25 samples gives independent-ish 1Hz draws into Welford rather than
+        # the heavily-correlated 5s sliding-window mean.
+        def _mean_tail(buf, n=sps):
+            if not buf:
+                return None
+            tail = buf[-n:] if len(buf) >= n else buf
+            try:
+                m = float(np.mean(tail))
+                return m if np.isfinite(m) else None
+            except Exception:
+                return None
+
+        hr_repr = _mean_tail(self.hr_values)
+        eda_repr = _mean_tail(self.edl_values)
+        scr_repr = _mean_tail(self.scr_freq_values)
+        # IBI: latest de-duplicated + median-filtered beat (one update per new beat).
+        ibi_repr = float(self.ibi_values[-1]) if self.ibi_values else None
+        # Temperature ROC: derivative on tail of temp buffer.
+        temp_roc_repr = None
+        if len(self.temp_values) >= 2:
+            tail = self.temp_values[-sps:] if len(self.temp_values) >= sps else self.temp_values
+            diffs = np.diff(tail)
+            if len(diffs) > 0:
+                m = float(np.mean(diffs) * EMIT_RATE_HZ)
+                if np.isfinite(m):
+                    temp_roc_repr = m
+
+        # Update Welford with the per-channel representative
+        if hr_repr is not None: self.welford['hr'].update(hr_repr)
+        if eda_repr is not None: self.welford['eda'].update(eda_repr)
+        if ibi_repr is not None: self.welford['ibi'].update(ibi_repr)
+        if temp_roc_repr is not None: self.welford['temperature_roc'].update(temp_roc_repr)
+        if scr_repr is not None: self.welford['scr_frequency'].update(scr_repr)
+
+        # Capture baseline skin temperature at end of calibration window
+        # (used as the reference for swap detection's temperature step).
+        if not calibrating and self.baseline_temp_c is None and self.temp_values:
+            self.baseline_temp_c = _mean_tail(self.temp_values, sps)
+
+        # Per-channel signed z-scores (None during calibration or insufficient data)
+        def _z(val, w):
+            if val is None or calibrating or w.n < 5 or w.sd <= 0:
+                return None
+            return (val - w.mean) / w.sd
+
+        z_scores = {
+            'hr_z': _z(hr_repr, self.welford['hr']),
+            'eda_z': _z(eda_repr, self.welford['eda']),
+            'ibi_z': _z(ibi_repr, self.welford['ibi']),
+            'temperature_roc_z': _z(temp_roc_repr, self.welford['temperature_roc']),
+            'scr_frequency_z': _z(scr_repr, self.welford['scr_frequency']),
+        }
+        events = {}
+        for k, z in z_scores.items():
+            base = k[:-2]  # strip trailing '_z'
+            events[f'{base}_event_soft'] = (z is not None and abs(z) > Z_SOFT_THRESHOLD)
+            events[f'{base}_event_hard'] = (z is not None and abs(z) > Z_HARD_THRESHOLD)
+
+        # Quality flags: stale data on a channel group => low quality on its derived metrics
+        def _fresh(group):
+            return (now_wall - self.last_data_time.get(group, 0.0)) < SWAP_DATA_FRESH_SECONDS
+        quality = {
+            'hr':              self.channel_quality['hr']              if _fresh('ppg')         else 'low',
+            'ibi':             self.channel_quality['ibi']             if _fresh('ppg')         else 'low',
+            'eda':             self.channel_quality['eda']             if _fresh('eda')         else 'low',
+            'temperature_roc': self.channel_quality['temperature_roc'] if _fresh('temperature') else 'low',
+            'scr_frequency':   self.channel_quality['scr_frequency']   if _fresh('eda')         else 'low',
+        }
+
+        # Wearer-swap auto-detection (pinned-floor heuristic).
+        # EmotiBits keep streaming when removed from skin -- they don't go silent,
+        # they emit pinned junk: EDA at the implausibility floor and PPGGreen at
+        # near-zero (no skin to reflect the LED). The 5 June canteen test proved
+        # the UDP-silence heuristic could never fire because the device was still
+        # publishing packets the whole time it was off the wrist.
+        # Off-wrist = sustained collapse of EDA AND PPGGreen below their floors.
+        # When the wrist is re-attached and both rise back above their floors,
+        # if the collapse lasted >= SWAP_PINNED_SECONDS we trigger a reset. The
+        # temperature step is now an *optional* confirmer (skipped when the temp
+        # stream is unavailable, as it was on Sowmya's MD-V5-0000334 with T0).
+        eda_recent = self.all_signal_values.get('EDA', [])
+        ppg_recent = self.all_signal_values.get('PPGGreen', [])
+        # Mean over last second of raw samples (~25 samples each)
+        eda_mean_recent = float(np.mean(eda_recent[-sps:])) if len(eda_recent) >= 3 else None
+        ppg_mean_recent = float(np.mean(ppg_recent[-sps:])) if len(ppg_recent) >= 3 else None
+        currently_offwrist = (
+            eda_mean_recent is not None and ppg_mean_recent is not None and
+            eda_mean_recent < EDA_OFFWRIST_THRESHOLD and
+            ppg_mean_recent < PPG_OFFWRIST_THRESHOLD
+        )
+        swap_detected = False
+        if currently_offwrist:
+            if self.swap_offwrist_start is None:
+                self.swap_offwrist_start = now_wall
+        elif self.swap_offwrist_start is not None:
+            offwrist_duration = now_wall - self.swap_offwrist_start
+            if offwrist_duration >= SWAP_PINNED_SECONDS:
+                # Optional temperature-step confirmer: if a baseline temp was captured
+                # AND the temp stream is currently live, require >= SWAP_TEMP_STEP_C
+                # shift. Otherwise (temp stream unavailable) the sustained off-wrist
+                # duration alone is sufficient.
+                temp_step_ok = True
+                if self.baseline_temp_c is not None and self.temp_values:
+                    current_temp = _mean_tail(self.temp_values, sps)
+                    if current_temp is not None:
+                        temp_step_ok = abs(current_temp - self.baseline_temp_c) >= SWAP_TEMP_STEP_C
+                if temp_step_ok:
+                    swap_detected = True
+            self.swap_offwrist_start = None
+
+        return {
+            'calibrating': calibrating,
+            'calibration_remaining_s': round(max(0.0, CALIBRATION_SECONDS - age_s), 1),
+            'session_age_s': round(age_s, 1),
+            'baseline_n': int(self.welford['hr'].n),
+            'z_scores': z_scores,
+            'events': events,
+            'quality': quality,
+            'swap_detected': swap_detected,
+        }
 
     def process_window(self):
         processing_start = time.time()  # Start latency measurement
@@ -325,7 +634,35 @@ class DeviceAggregator:
             signal_dict["scr_frequency_sd"] = scr_freq_sd
             signal_dict["hr_sd"] = hr_sd
             signal_dict["ibi_sd"] = ibi_sd
-            
+
+            # --- Per-wearer session-z baseline extras (computed once, used by both CSV + Redis) ---
+            with self.lock:
+                extras = self._compute_baseline_extras()
+                if extras['swap_detected']:
+                    self._reset_baseline_unlocked(reason='auto_swap_detected')
+                    # Recompute against the fresh state so this cycle reports calibrating.
+                    extras = self._compute_baseline_extras()
+                    extras['swap_detected'] = True  # preserve event for CSV / downstream
+
+            # Persist baseline state into the CSV row so detector behaviour can be
+            # audited from the file (the 5 June canteen test was inconclusive
+            # because these columns weren't being written).
+            signal_dict["calibrating"] = bool(extras['calibrating'])
+            signal_dict["calibration_remaining_s"] = extras['calibration_remaining_s']
+            signal_dict["baseline_n"] = extras['baseline_n']
+            for k, v in extras['z_scores'].items():
+                signal_dict[k] = float(v) if v is not None else ""
+            signal_dict["hr_event_hard"] = bool(extras['events'].get('hr_event_hard', False))
+            signal_dict["eda_event_hard"] = bool(extras['events'].get('eda_event_hard', False))
+            signal_dict["ibi_event_hard"] = bool(extras['events'].get('ibi_event_hard', False))
+            q = extras['quality']
+            signal_dict["quality_hr"] = q.get('hr', '')
+            signal_dict["quality_eda"] = q.get('eda', '')
+            signal_dict["quality_ibi"] = q.get('ibi', '')
+            signal_dict["quality_temperature_roc"] = q.get('temperature_roc', '')
+            signal_dict["quality_scr_frequency"] = q.get('scr_frequency', '')
+            signal_dict["swap_detected"] = bool(extras['swap_detected'])
+
             # Add performance metric (for CSV storage)
             signal_dict["processing_time_ms"] = processing_time_ms
             
@@ -358,7 +695,19 @@ class DeviceAggregator:
             # 5. Standard deviation of Inter-Beat Interval
             if ibi_sd is not None:
                 physio_metrics["ibi_sd"] = ibi_sd
-            
+
+            # --- Per-wearer session-z baseline extras (additive schema) ---
+            physio_metrics['calibrating'] = bool(extras['calibrating'])
+            physio_metrics['calibration_remaining_s'] = extras['calibration_remaining_s']
+            physio_metrics['session_age_s'] = extras['session_age_s']
+            physio_metrics['baseline_n'] = extras['baseline_n']
+            for k, v in extras['z_scores'].items():
+                if v is not None:
+                    physio_metrics[k] = round(float(v), 3)
+            for k, v in extras['events'].items():
+                physio_metrics[k] = bool(v)
+            physio_metrics['quality'] = extras['quality']
+
             # Note: Performance metrics (processing_time_ms, sample counts) are only saved to CSV, not published to Redis
             
             # Publish consolidated metrics
@@ -380,7 +729,13 @@ class DeviceAggregator:
                     ("hr_sd", hr_sd), ("ibi_sd", ibi_sd)
                 ] if v is not None]
                 metrics_str = ", ".join(sd_metrics) + f", proc={processing_time_ms:.1f}ms"
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.source_id} {metrics_str}, Val={val_cont:.2f}, Aro={aro_cont:.2f}")
+                if extras['calibrating']:
+                    base_str = f"calibrating({extras['calibration_remaining_s']:.0f}s left,n={extras['baseline_n']})"
+                else:
+                    zs = extras['z_scores']
+                    z_parts = [f"{k[:-2]}={zs[k]:+.2f}" for k in ('hr_z', 'eda_z', 'ibi_z') if zs[k] is not None]
+                    base_str = " ".join(z_parts) if z_parts else f"baseline_n={extras['baseline_n']}"
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.source_id} {metrics_str}, {base_str}, Val={val_cont:.2f}, Aro={aro_cont:.2f}")
                 self.last_print_time = current_time
 
         except Exception as e:
@@ -829,6 +1184,42 @@ def main():
             time.sleep(HEARTBEAT_INTERVAL_S)
 
     threading.Thread(target=heartbeat_thread, daemon=True).start()
+
+    # ---- BASELINE-RESET LISTENER ----
+    # GUI / operator publishes an empty JSON to `device:{serial}:reset_baseline`
+    # whenever a sensor is reassigned to a new wearer. We pattern-subscribe and
+    # dispatch to the matching aggregator. Auto-swap detection in
+    # _compute_baseline_extras is the safety net; this is the manual override.
+    aggs_by_source = {agg.source_id: agg for agg in agg_list}
+
+    def reset_listener_thread():
+        try:
+            pubsub = r.pubsub()
+            pubsub.psubscribe('device:*:reset_baseline')
+            for message in pubsub.listen():
+                if stop_flag.is_set():
+                    return
+                if message.get('type') != 'pmessage':
+                    continue
+                try:
+                    channel = message.get('channel')
+                    if isinstance(channel, (bytes, bytearray)):
+                        channel = channel.decode('utf-8', errors='ignore')
+                    # channel = "device:{src}:reset_baseline"
+                    parts = (channel or '').split(':')
+                    if len(parts) >= 3:
+                        src = parts[1]
+                        agg = aggs_by_source.get(src)
+                        if agg is not None:
+                            agg.reset_baseline(reason='manual_redis')
+                        else:
+                            print(f"[WARN] reset_baseline received for unknown device: {src}")
+                except Exception as e:
+                    print(f"[WARN] reset listener dispatch: {e}")
+        except Exception as e:
+            print(f"[WARN] reset listener exited: {e}")
+
+    threading.Thread(target=reset_listener_thread, daemon=True).start()
 
     # ---- UDP RECEIVE THREAD ----
     def udp_thread():
