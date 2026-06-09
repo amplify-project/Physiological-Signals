@@ -1438,179 +1438,184 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         if not is_enrolled:
             cv2.putText(sidebar, "unassigned", (22, y0 + 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1, cv2.LINE_AA)
-        # HR — same line as label, right-aligned area
+        # ------ Snapshot subscriber state under lock ------
         with emotibit_lock:
             d = emotibit_data.get(serial, {})
-            snap_eda    = list(d.get('eda', []))
-            snap_hr     = list(d.get('hr',  []))
-            snap_eda_sd = list(d.get('eda_sd', []))
-            snap_hr_sd  = list(d.get('hr_sd',  []))
-            snap_eda_z  = list(d.get('eda_z',  []))
+            snap_eda_z   = list(d.get('eda_z',  []))
+            snap_hr_z    = list(d.get('hr_z',   []))
+            snap_stroc_z = list(d.get('temperature_roc_z', []))
             snap_metrics = dict(d.get('metrics', {}))
-        # HRSD + STROC on the same line, side by side, OUT of the EDA plot
-        # area below. Short labels (HRSD / STROC) to fit the ~140 px header
-        # real estate at sidebar_w=280.
-        if snap_hr:
-            hr_text = f"HR {snap_hr[-1]:.0f}bpm"
-            hr_col  = (100, 210, 100)
-        elif snap_hr_sd:
-            hr_text = f"HRSD {snap_hr_sd[-1]:.2f}"
-            hr_col  = (100, 210, 100)
-        else:
-            hr_text = "HR --"
-            hr_col  = (80, 80, 80)
-        cv2.putText(sidebar, hr_text, (sidebar_w - 78, y0 + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
-        # STROC = Skin Temperature Rate Of Change SD. Sits left of HRSD on
-        # the same row header so both readouts stay above the EDA plot.
-        # 2 decimals is enough for the operator view (CSV keeps full precision).
-        temp_roc = snap_metrics.get('temperature_roc_sd')
-        if temp_roc is not None:
-            cv2.putText(sidebar, f"STROC {temp_roc:.2f}",
-                        (sidebar_w - 145, y0 + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 170, 220), 1, cv2.LINE_AA)
-        # EDA spline plot — fills remaining vertical space.
-        # Three render modes, in priority order:
-        #   1) Z-score plot: signed eda_z (post-canteen publisher), centred at
-        #      zero on a fixed ±3 SD axis, per-segment colour bands (yellow /
-        #      orange / red at |z|>1.5 / |z|>2.0). This is the "proper" SD view
-        #      and is preferred whenever post-calibration z-values are present.
-        #   2) Filtered EDA stream (legacy Sowmya path, µS units), autoscaled.
-        #   3) EDA SD magnitude (5 s window wobble), autoscaled.
+
+        # ------ Unified per-wearer physio panel ------
+        # All three traces are unitless per-wearer session-baseline z-scores
+        # (this wearer's deviation from their own mean, in their own SD units),
+        # so plotting HR / EDA / STROC on a single +-3 SD axis is meaningful.
+        # The header shows live numeric values colour-keyed to each spline.
+        # Trace colour DARKENS as |z| grows (more saturated near +-2 SD,
+        # paler near 0) so the eye is drawn to excursions without losing the
+        # quieter traces. Off-wrist suppresses everything and watermarks the
+        # panel rather than faking a zero baseline reading.
         Z_SOFT = 1.5
         Z_HARD = 2.0
-        Z_SAT  = 3.0  # visual saturation
-        COL_NORMAL = (80, 200, 255)   # yellow (BGR)
-        COL_SOFT   = (40, 140, 255)   # orange
-        COL_HARD   = (60, 60, 255)    # red
+        Z_SAT  = 3.0  # axis saturation = full +-3 SD
+        # Publisher emits one physio_metrics every 1.0s, so 10 samples == 10s window.
+        PLOT_WINDOW_SAMPLES = 10
+        # Base hues (BGR). Light variants are used near 0; full saturation past |z|=2.
+        # NB: 'TEMP' label refers to skin-temp rate-of-change (temperature_roc_z)
+        # -- shorter than STROC and matches operator vocabulary.
+        TRACES = (
+            # (label, source_list, last_metric_key, light_col, full_col)
+            ('HR',   snap_hr_z,    'hr_z',              (180, 235, 180), ( 70, 220,  70)),
+            ('EDA',  snap_eda_z,   'eda_z',             (220, 230, 190), (255, 200,  60)),
+            ('TEMP', snap_stroc_z, 'temperature_roc_z', (220, 200, 230), (200, 100, 200)),
+        )
+
         is_calibrating = bool(snap_metrics.get('calibrating', False))
-        if snap_eda_z and not is_calibrating:
-            mode = 'z'
-        elif snap_eda:
-            mode = 'eda'
-        elif snap_eda_sd:
-            mode = 'sd'
-        else:
-            mode = 'none'
-        if mode == 'eda':
-            plot_arr   = snap_eda
-            plot_label = "EDA"
-            plot_unit  = "µS"
-            line_col   = (80, 200, 255)
-        elif mode == 'sd':
-            plot_arr   = snap_eda_sd
-            plot_label = "EDA SD"
-            plot_unit  = ""
-            line_col   = (80, 200, 255)
-        elif mode == 'z':
-            plot_arr   = snap_eda_z
-            plot_label = "EDA z"
-            plot_unit  = "SD"
-            line_col   = COL_NORMAL  # base colour; per-segment overrides below
-        else:
-            plot_arr = []
-            plot_label = "EDA"
-            plot_unit = ""
-            line_col = (80, 200, 255)
+        is_off_wrist   = bool(snap_metrics.get('off_wrist', False))
+
+        # ----- Header: three small colour-keyed readouts, right-aligned.
+        # Label (HR / EDA / TEMP) + number; colour matches the spline so it
+        # doubles as the in-panel legend. When |z| >= Z_HARD the readout is
+        # promoted: thicker stroke + a faint filled pill behind it, so the
+        # operator's eye is pulled to the wearer even out of the corner of
+        # the screen.
+        header_y = y0 + 16
+        cur_x    = sidebar_w - 6
+        font_sc  = 0.34
+        for label, _hist, key, _light, full in reversed(TRACES):
+            val = snap_metrics.get(key)
+            if val is None:
+                txt = f"{label} --"
+                col = (80, 80, 80)
+                hot = False
+            else:
+                txt = f"{label} {val:+.2f}"
+                col = full
+                hot = abs(val) >= Z_HARD
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_sc, 1)
+            tx = max(4, cur_x - tw)
+            if hot:
+                # Translucent pill in the trace's full colour at ~22% opacity.
+                pad_x, pad_y = 3, 2
+                px0, py0 = tx - pad_x, header_y - th - pad_y
+                px1, py1 = tx + tw + pad_x, header_y + pad_y
+                overlay = sidebar.copy()
+                cv2.rectangle(overlay, (px0, py0), (px1, py1), col, -1)
+                cv2.addWeighted(overlay, 0.22, sidebar, 0.78, 0, sidebar)
+            cv2.putText(sidebar, txt, (tx, header_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_sc, col,
+                        2 if hot else 1, cv2.LINE_AA)
+            cur_x -= tw + 8
+
+        # ----- Plot panel: fixed +-Z_SAT axis below the header.
         plot_x  = 4
-        plot_y  = y0 + 22
+        plot_y  = y0 + 24
         plot_pw = sidebar_w - 8
         plot_ph = y1 - plot_y - 3
-        if plot_ph > 12:
-            cv2.rectangle(sidebar, (plot_x, plot_y),
-                          (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
+        if plot_ph <= 12:
+            if i < n - 1:
+                cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
+            continue
 
-            if is_calibrating and not snap_eda_z:
-                remaining = snap_metrics.get('calibration_remaining_s')
-                msg = f"calibrating {remaining:.0f}s" if remaining is not None else "calibrating..."
-                cv2.putText(sidebar, msg,
-                            (plot_x + 4, plot_y + plot_ph // 2 + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (110, 160, 110), 1, cv2.LINE_AA)
-            elif len(plot_arr) > 2:
-                arr = np.array(plot_arr, dtype=np.float32)
+        cv2.rectangle(sidebar, (plot_x, plot_y),
+                      (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
 
-                if mode == 'z':
-                    # Fixed signed axis ±Z_SAT, centred at zero. No autoscaling
-                    # so the operator can read absolute deviation magnitudes
-                    # consistently across wearers and over time.
-                    lo, hi = -Z_SAT, Z_SAT
-                    rng = hi - lo
-                    arr_clipped = np.clip(arr, lo, hi)
-                    xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
-                                     len(arr_clipped)).round().astype(np.int32)
-                    ys = (plot_y + plot_ph - 2
-                          - ((arr_clipped - lo) / rng * (plot_ph - 4))).round().astype(np.int32)
-                    ys = np.clip(ys, plot_y, plot_y + plot_ph - 2)
-                    # Zero baseline.
-                    y_zero = int(plot_y + plot_ph - 2 - ((0.0 - lo) / rng * (plot_ph - 4)))
-                    cv2.line(sidebar, (plot_x + 1, y_zero),
-                             (plot_x + plot_pw - 2, y_zero),
-                             (90, 90, 90), 1, cv2.LINE_AA)
-                    # Per-segment colour bands by max |z| of the two endpoints.
-                    abs_z = np.abs(arr_clipped)
-                    for k in range(len(xs) - 1):
-                        zmax = float(max(abs_z[k], abs_z[k + 1]))
-                        if zmax > Z_HARD:
-                            seg_col = COL_HARD
-                        elif zmax > Z_SOFT:
-                            seg_col = COL_SOFT
-                        else:
-                            seg_col = COL_NORMAL
-                        cv2.line(sidebar, (int(xs[k]), int(ys[k])),
-                                 (int(xs[k + 1]), int(ys[k + 1])),
-                                 seg_col, 1, cv2.LINE_AA)
-                    # Axis labels: +3 top, 0 mid (right of baseline), -3 bottom.
-                    lbl_col = (75, 120, 150)
-                    cv2.putText(sidebar, f"+{Z_SAT:.0f} SD",
-                                (plot_x + 2, plot_y + 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                    cv2.putText(sidebar, f"-{Z_SAT:.0f} SD",
-                                (plot_x + 2, plot_y + plot_ph - 3),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                    # Current z value in top-right, coloured by its own band.
-                    z_now = float(arr[-1])
-                    az = abs(z_now)
-                    cur_col = COL_HARD if az > Z_HARD else (COL_SOFT if az > Z_SOFT else COL_NORMAL)
-                    cv2.putText(sidebar, f"{z_now:+.2f}",
-                                (sidebar_w - 46, plot_y + 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.22, cur_col, 1, cv2.LINE_AA)
-                else:
-                    # True rolling-window zoom: stretch the spline to the full
-                    # height of the plot using the 5th-95th percentile so a single
-                    # startup spike does not flatten the rest of the trace. Tiny
-                    # variations therefore occupy the full y-axis.
-                    lo, hi = np.percentile(arr, [5.0, 95.0])
-                    lo, hi = float(lo), float(hi)
-                    if hi - lo < 1e-9:   # all samples (almost) identical
-                        mn, mx = float(arr.min()), float(arr.max())
-                        if mx - mn < 1e-9:
-                            mid = float(arr[-1])
-                            lo, hi = mid - 0.5, mid + 0.5  # arbitrary unit window
-                        else:
-                            lo, hi = mn, mx
-                    rng = hi - lo
-                    arr_clipped = np.clip(arr, lo, hi)
-                    xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
-                                     len(arr_clipped)).round().astype(np.int32)
-                    ys = (plot_y + plot_ph - 2
-                          - ((arr_clipped - lo) / rng * (plot_ph - 4))).round().astype(np.int32)
-                    ys = np.clip(ys, plot_y, plot_y + plot_ph - 2)
-                    pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
-                    cv2.polylines(sidebar, [pts], False, line_col, 1, cv2.LINE_AA)
-                    lbl_col = (75, 120, 150)
-                    cv2.putText(sidebar, f"{plot_label} {hi:.2f}{plot_unit}",
-                                (plot_x + 2, plot_y + 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                    cv2.putText(sidebar, f"{lo:.2f}",
-                                (plot_x + 2, plot_y + plot_ph - 3),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                    cv2.putText(sidebar, f"{arr[-1]:.3f}",
-                                (sidebar_w - 46, plot_y + 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.22, line_col, 1, cv2.LINE_AA)
-            else:
+        # Axis grid: zero baseline + +-Z_HARD reference lines only.
+        # (Previously also drew +-Z_SOFT in grey -- removed as visual clutter;
+        # the colour-saturation lerp already conveys 'getting noteworthy' and
+        # the red-tinted +-2 lines mark the alert threshold cleanly.)
+        rng    = 2.0 * Z_SAT
+        def _y_for(z):
+            return int(plot_y + plot_ph - 2 - ((float(z) + Z_SAT) / rng * (plot_ph - 4)))
+        for z_ref, col_ref in ((0.0, (90, 90, 90)),
+                               (+Z_HARD, (60, 60, 120)), (-Z_HARD, (60, 60, 120))):
+            yref = _y_for(z_ref)
+            cv2.line(sidebar, (plot_x + 1, yref), (plot_x + plot_pw - 2, yref),
+                     col_ref, 1, cv2.LINE_AA)
+
+        # Axis labels (top / mid / bottom) -- only place "SD" appears.
+        lbl_col = (75, 120, 150)
+        cv2.putText(sidebar, f"+{Z_SAT:.0f} SD", (plot_x + 2, plot_y + 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
+        cv2.putText(sidebar, f"-{Z_SAT:.0f} SD",
+                    (plot_x + 2, plot_y + plot_ph - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
+
+        if is_calibrating and not any((snap_hr_z, snap_eda_z, snap_stroc_z)):
+            remaining = snap_metrics.get('calibration_remaining_s')
+            msg = f"calibrating {remaining:.0f}s" if remaining is not None else "calibrating..."
+            cv2.putText(sidebar, msg,
+                        (plot_x + 4, plot_y + plot_ph // 2 + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (110, 160, 110), 1, cv2.LINE_AA)
+        else:
+            any_drawn = False
+            for label, hist, _key, light, full in TRACES:
+                if len(hist) < 2:
+                    continue
+                any_drawn = True
+                # Rolling 10s window: only show the tail. Older samples stay in
+                # the deque (handy for debugging) but the plot stops compressing
+                # an ever-growing history into the same panel width.
+                tail = list(hist)[-PLOT_WINDOW_SAMPLES:]
+                if len(tail) < 2:
+                    continue
+                arr = np.clip(np.array(tail, dtype=np.float32), -Z_SAT, Z_SAT)
+                xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
+                                 len(arr)).round().astype(np.int32)
+                ys = np.array([_y_for(v) for v in arr], dtype=np.int32)
+                abs_z = np.abs(arr)
+                # Per-segment colour: lerp light -> full as |z| goes 0 -> Z_HARD,
+                # then clamp at full beyond Z_HARD. Vectorised would be nicer but
+                # the per-trace length is bounded (deque maxlen=180) so this loop
+                # is cheap enough.
+                light_arr = np.array(light, dtype=np.float32)
+                full_arr  = np.array(full,  dtype=np.float32)
+                for k in range(len(xs) - 1):
+                    zmax = float(max(abs_z[k], abs_z[k + 1]))
+                    t = min(1.0, zmax / Z_HARD)
+                    seg_col = tuple(int(c) for c in (light_arr * (1.0 - t) + full_arr * t))
+                    # Thicker stroke once the segment crosses the alert band:
+                    # the colour lerp alone is too subtle on a small panel.
+                    seg_thick = 2 if zmax >= Z_HARD else 1
+                    cv2.line(sidebar, (int(xs[k]), int(ys[k])),
+                             (int(xs[k + 1]), int(ys[k + 1])),
+                             seg_col, seg_thick, cv2.LINE_AA)
+                # End-of-trace marker: small filled dot at the latest sample,
+                # growing from r=2 to r=4 as |z| climbs to Z_HARD, then a thin
+                # bright halo if we're in the alert band. Gives a stable focal
+                # point for the eye and makes high-|z| wearers 'pop' from a
+                # multi-row sidebar.
+                last_abs = float(abs_z[-1])
+                t_last   = min(1.0, last_abs / Z_HARD)
+                dot_r    = int(round(2 + 2 * t_last))
+                dot_col  = tuple(int(c) for c in (light_arr * (1.0 - t_last) + full_arr * t_last))
+                cv2.circle(sidebar, (int(xs[-1]), int(ys[-1])), dot_r,
+                           dot_col, -1, cv2.LINE_AA)
+                if last_abs >= Z_HARD:
+                    cv2.circle(sidebar, (int(xs[-1]), int(ys[-1])),
+                               dot_r + 2, (255, 255, 255), 1, cv2.LINE_AA)
+            if not any_drawn:
                 cv2.putText(sidebar, "Physio: no signal",
                             (plot_x + 4, plot_y + plot_ph // 2 + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
+
+        # Off-wrist watermark: drawn over everything so it's unambiguous that
+        # the panel content is stale / suppressed and not a real "near baseline"
+        # reading. The publisher already drops *_z keys when off_wrist=True, so
+        # the splines will gap out within a few render frames as their deques
+        # stop receiving samples; this label explains *why*.
+        if is_off_wrist:
+            wm = "OFF-WRIST"
+            (ww, wh), _ = cv2.getTextSize(wm, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            wx = plot_x + (plot_pw - ww) // 2
+            wy = plot_y + (plot_ph + wh) // 2
+            # Faint dim overlay so traces are still visible but clearly subdued.
+            overlay = sidebar.copy()
+            cv2.rectangle(overlay, (plot_x, plot_y),
+                          (plot_x + plot_pw, plot_y + plot_ph), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.45, sidebar, 0.55, 0, sidebar)
+            cv2.putText(sidebar, wm, (wx, wy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 90, 220), 1, cv2.LINE_AA)
         if i < n - 1:
             cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
     return sidebar
@@ -1753,7 +1758,12 @@ def main():
                                 'hr':  deque(maxlen=125),
                                 'eda_sd': deque(maxlen=180),
                                 'hr_sd':  deque(maxlen=180),
+                                # Three z-score history buffers powering the unified
+                                # ±3 SD spline panel. 180 samples ≈ 3 min at the
+                                # publisher's 1Hz emit cadence for *_z values.
                                 'eda_z':  deque(maxlen=180),
+                                'hr_z':   deque(maxlen=180),
+                                'temperature_roc_z': deque(maxlen=180),
                                 'metrics': {},
                             }
                         if 'EDA_filtered' in data:
@@ -1779,17 +1789,40 @@ def main():
                                         emotibit_data[serial]['eda_sd'].append(v)
                                     elif target_key == 'hr_sd':
                                         emotibit_data[serial]['hr_sd'].append(v)
-                            # Per-wearer z-score / calibration / quality (post-canteen physio update).
-                            # Only append eda_z when post-calibration (publisher omits *_z while calibrating).
+                            # Per-wearer z-scores (post-calibration). The publisher omits any
+                            # *_z key while calibrating OR while off-wrist, and omits
+                            # individual ones whose underlying channel currently has no
+                            # Welford samples. Mirror that: only stash a value when
+                            # present, never carry a stale one.
                             calib = bool(data.get('calibrating', False))
                             emotibit_data[serial]['metrics']['calibrating'] = calib
+                            emotibit_data[serial]['metrics']['off_wrist'] = bool(data.get('off_wrist', False))
                             if 'calibration_remaining_s' in data:
                                 emotibit_data[serial]['metrics']['calibration_remaining_s'] = float(data['calibration_remaining_s'])
-                            if not calib and 'eda_z' in data:
-                                try:
-                                    emotibit_data[serial]['eda_z'].append(float(data['eda_z']))
-                                except (TypeError, ValueError):
-                                    pass
+                            for zk in ('hr_z', 'eda_z', 'ibi_z', 'temperature_roc_z', 'scr_frequency_z'):
+                                if zk in data and data[zk] is not None:
+                                    try:
+                                        emotibit_data[serial]['metrics'][zk] = float(data[zk])
+                                    except (TypeError, ValueError):
+                                        pass
+                                else:
+                                    # Drop a stale value once the publisher stops sending it,
+                                    # so the GUI text falls back to '--' instead of freezing.
+                                    emotibit_data[serial]['metrics'].pop(zk, None)
+                            # Spline history: only push during a valid (non-calibrating,
+                            # on-wrist) reading. The plot then naturally gaps when contact
+                            # is lost rather than freezing on the last good value.
+                            if not calib:
+                                for zk, deque_key in (
+                                    ('hr_z', 'hr_z'),
+                                    ('eda_z', 'eda_z'),
+                                    ('temperature_roc_z', 'temperature_roc_z'),
+                                ):
+                                    if zk in data and data[zk] is not None:
+                                        try:
+                                            emotibit_data[serial][deque_key].append(float(data[zk]))
+                                        except (TypeError, ValueError):
+                                            pass
                 except Exception:
                     pass
         except Exception as e:

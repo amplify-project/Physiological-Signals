@@ -56,7 +56,17 @@ CHANNEL_RESET = "device:{src}:reset_baseline"  # GUI publishes here to reset a w
 # Plausibility gates: samples outside these ranges never enter RF / SD / Welford buffers.
 PLAUSIBLE_HR_BPM   = (40.0, 200.0)
 PLAUSIBLE_IBI_MS   = (300.0, 1500.0)
-PLAUSIBLE_TEMP_C   = (30.0, 38.0)
+# Skin temperature gates depend on which sensor sourced the sample:
+#   - TH (Thermopile / MLX90632, MD hardware only): true non-contact skin temp.
+#     Wider window to tolerate brief excursions while putting on / adjusting the
+#     wearable; values that drift far below 24 C indicate the sensor is pointing
+#     at clothing/air rather than skin.
+#   - T1 (MAX30101 die temperature): board temp -- runs ~4-6 C below skin.
+#     Only a fallback when TH isn't streaming; values 22-32 C are normal at rest.
+#   - T0 (legacy V1-V3 sensor): retained for completeness only.
+PLAUSIBLE_SKIN_TEMP_C  = (24.0, 42.0)
+PLAUSIBLE_DIE_TEMP_C   = (22.0, 36.0)
+PLAUSIBLE_TEMP_C   = (30.0, 38.0)  # legacy alias, used only by manual-T0 path
 PLAUSIBLE_EDA_US   = (0.01, 100.0)
 PLAUSIBLE_SCR_FREQ = (0.0, 20.0)
 IBI_MEDIAN_KERNEL  = 3        # median pre-filter on per-beat IBI
@@ -69,8 +79,17 @@ Z_HARD_THRESHOLD = 2.0        # red GUI indicator + logged event (~5%, matches p
 # happens, so we detect off-wrist by sustained collapse of the contact-driven
 # raw signals instead.
 SWAP_PINNED_SECONDS     = 15.0   # off-wrist must persist >= this to count as a swap
+OFF_WRIST_SECONDS       = 2.0    # short threshold: drop *_z keys from physio_metrics and signal GUI watermark
 EDA_OFFWRIST_THRESHOLD  = 0.10   # µS — below this the wrist is empty
 PPG_OFFWRIST_THRESHOLD  = 1500.0 # PPGGreen counts — below this the LED has no skin to reflect off
+# Frozen-channel fallback: some units (e.g. MD-V5-0000448 on 9 June) don't
+# collapse to floor when removed -- the ADS1114 rails at a high pinned value
+# (~2.6 µS identical to 5 dp for many seconds) and PPGGreen latches on a
+# nearby fabric reflection (~2600 counts). Real skin contact ALWAYS produces
+# measurable jitter, so zero variance over the detection window is a clean
+# tell-tale of disconnected electrodes regardless of magnitude.
+EDA_FROZEN_STD_THRESHOLD = 0.005 # µS — on-wrist swings 0.03-0.10 µS/s, off-wrist literally 0.000
+PPG_FROZEN_STD_THRESHOLD = 5.0   # counts — on-wrist sees ~15-30 count pulse jitter
 SWAP_TEMP_STEP_C        = 1.0    # post-return skin-temp shift confirms different wearer (optional)
 SWAP_DATA_FRESH_SECONDS = 5.0    # "channel is live" threshold
 
@@ -294,8 +313,17 @@ class DeviceAggregator:
         self.filtered_hr = []
         self.filtered_eda = []
         # Track 5 signals for Redis SD metrics
-        self.edl_values = []  # Tonic EDA (EDL)
-        self.temp_values = []  # Temperature
+        self.edl_values = []  # Tonic EDA (EDL / EL tag)  -- ADS1114
+        self.temp_values = []  # Skin temperature buffer (post-source-selection)
+        # Per-wearer selected temperature source. Filled lazily by update() on the
+        # first plausible sample; logged once via log.info so the .log file proves
+        # which physical sensor the z-score was actually computed from. MD hardware
+        # should pick 'Thermopile' (TH / MLX90632 = medical-grade skin sensor).
+        self.temp_source = None
+        # Per-wearer selected EDA source. EDA (EA tag = composite) is the raw
+        # ADS1114 channel and the documented EmotiBit signal; EDL (EL tag = tonic)
+        # is a derived component that some firmware/wearable combos don't emit.
+        self.eda_source = None
         self.scr_freq_values = []  # SCR Frequency
         self.hr_values = []  # Heart Rate
         self.ibi_values = []  # Inter-Beat Interval
@@ -304,6 +332,11 @@ class DeviceAggregator:
         self.start_time = time.time()
         self.last_print_time = 0
         self.print_interval = 30.0  # Print every 30 seconds after initial 3 seconds
+        # Throttle for post-calibration "missing metric" warnings (per metric name -> last log ts).
+        # GUI's EDA spline goes dark when these are None after calibration ends; surfacing it
+        # in the log file is the only way the operator can diagnose it after the fact.
+        self._missing_metric_last_warn = {}
+        self._missing_metric_warn_interval = 30.0
 
         # ---- Per-wearer session-z baseline state ----
         # Welford running mean/SD per channel, anchored to wearer-session start.
@@ -395,12 +428,27 @@ class DeviceAggregator:
                 self.channel_quality['eda'] = 'ok'
                 self.values['EDA'].append(v)
                 self.values['EDA'] = self.values['EDA'][-max_samples:]
+                if self.eda_source is None:
+                    self.eda_source = 'EDA'
+                    log.info(
+                        "%s EDA source = EDA (EA tag, raw ADS1114) -- primary path",
+                        self.source_id,
+                    )
             elif col == "EDL":
                 if not _plausible(v, PLAUSIBLE_EDA_US):
                     self.channel_quality['eda'] = 'low'
                     return
                 self.edl_values.append(v)
                 self.edl_values = self.edl_values[-max_samples:]
+                if self.eda_source is None:
+                    # EDL only becomes primary if no EDA sample was seen first.
+                    # _compute_baseline_extras falls back from edl_values -> values['EDA'],
+                    # so logging this just records the first-arrival fact.
+                    self.eda_source = 'EDL'
+                    log.info(
+                        "%s EDA source = EDL (EL tag, derived tonic) -- fallback path",
+                        self.source_id,
+                    )
             elif col == "InterBeatInterval":
                 if not _plausible(v, PLAUSIBLE_IBI_MS):
                     self.channel_quality['ibi'] = 'low'
@@ -414,11 +462,52 @@ class DeviceAggregator:
                 self.channel_quality['ibi'] = 'ok'
                 self.ibi_values.append(v_filt)
                 self.ibi_values = self.ibi_values[-max_samples:]
-            elif col in ("Temperature0", "Temperature1"):
-                if not _plausible(v, PLAUSIBLE_TEMP_C):
+            elif col == "Thermopile":
+                # TH = MLX90632 medical-grade thermopile (MD hardware). This is
+                # the true non-contact SKIN temperature. Preferred source on MD;
+                # if both TH and T1 arrive on the same wearer, TH wins and T1 is
+                # ignored for the temp_values buffer to avoid mixing scales.
+                if not _plausible(v, PLAUSIBLE_SKIN_TEMP_C):
                     self.channel_quality['temperature_roc'] = 'low'
                     return
                 self.channel_quality['temperature_roc'] = 'ok'
+                if self.temp_source != 'Thermopile':
+                    if self.temp_source is not None:
+                        # Upgrade path: a T0/T1 sample arrived first but TH is
+                        # now available. Reset buffer so ROC isn't computed across
+                        # mismatched scales.
+                        log.info(
+                            "%s upgrading skin-temp source: %s -> Thermopile (TH/MLX90632, true skin)",
+                            self.source_id, self.temp_source,
+                        )
+                        self.temp_values = []
+                    else:
+                        log.info(
+                            "%s skin-temp source = Thermopile (TH/MLX90632, medical-grade skin)",
+                            self.source_id,
+                        )
+                    self.temp_source = 'Thermopile'
+                self.temp_values.append(v)
+                self.temp_values = self.temp_values[-max_samples:]
+            elif col in ("Temperature0", "Temperature1"):
+                # T1 (MAX30101 die) reads ~4-6 C below skin. T0 only exists on
+                # legacy V1-V3 hardware. Used only when TH (Thermopile) isn't
+                # streaming -- on MD hardware TH should always win.
+                if self.temp_source == 'Thermopile':
+                    # TH is the authoritative skin sensor; ignore die-temp samples
+                    # so they don't contaminate the ROC buffer.
+                    return
+                if not _plausible(v, PLAUSIBLE_DIE_TEMP_C):
+                    self.channel_quality['temperature_roc'] = 'low'
+                    return
+                self.channel_quality['temperature_roc'] = 'ok'
+                if self.temp_source != col:
+                    log.info(
+                        "%s skin-temp source = %s (FALLBACK -- not true skin temp; "
+                        "Thermopile/TH not received from this wearable)",
+                        self.source_id, col,
+                    )
+                    self.temp_source = col
                 self.temp_values.append(v)
                 self.temp_values = self.temp_values[-max_samples:]
             elif col == "SCRFrequency":
@@ -456,7 +545,14 @@ class DeviceAggregator:
                 return None
 
         hr_repr = _mean_tail(self.hr_values)
+        # EDL is the tonic component (EmotiBit short tag "EL"). Some firmware
+        # builds / wearable units don't stream EDL at all -- only the composite
+        # "EDA" tag (tonic + phasic). Fall back to plain EDA so the Welford
+        # baseline and downstream eda_z never go permanently dark just because
+        # the wearer's EmotiBit isn't emitting EDL packets.
         eda_repr = _mean_tail(self.edl_values)
+        if eda_repr is None:
+            eda_repr = _mean_tail(self.values.get('EDA', []))
         scr_repr = _mean_tail(self.scr_freq_values)
         # IBI: latest de-duplicated + median-filtered beat (one update per new beat).
         ibi_repr = float(self.ibi_values[-1]) if self.ibi_values else None
@@ -528,15 +624,37 @@ class DeviceAggregator:
         # Mean over last second of raw samples (~25 samples each)
         eda_mean_recent = float(np.mean(eda_recent[-sps:])) if len(eda_recent) >= 3 else None
         ppg_mean_recent = float(np.mean(ppg_recent[-sps:])) if len(ppg_recent) >= 3 else None
-        currently_offwrist = (
+        # Std over the same window -- used by the frozen-channel branch to catch
+        # units whose electrodes rail/latch at a HIGH pinned value when removed.
+        eda_std_recent = float(np.std(eda_recent[-sps:])) if len(eda_recent) >= sps else None
+        ppg_std_recent = float(np.std(ppg_recent[-sps:])) if len(ppg_recent) >= sps else None
+        offwrist_low = (
             eda_mean_recent is not None and ppg_mean_recent is not None and
             eda_mean_recent < EDA_OFFWRIST_THRESHOLD and
             ppg_mean_recent < PPG_OFFWRIST_THRESHOLD
         )
+        # Frozen branch: both channels show no variation across the last
+        # second of RAW samples. Real skin always produces jitter (EDA pulse
+        # noise + PPG cardiac waveform), so zero std on both = no skin contact
+        # regardless of mean magnitude. Requires BOTH (a single frozen channel
+        # could be an ADC glitch; both frozen for a full second is unambiguous).
+        offwrist_frozen = (
+            eda_std_recent is not None and ppg_std_recent is not None and
+            eda_std_recent < EDA_FROZEN_STD_THRESHOLD and
+            ppg_std_recent < PPG_FROZEN_STD_THRESHOLD
+        )
+        currently_offwrist = offwrist_low or offwrist_frozen
         swap_detected = False
+        # Short off-wrist event (>= OFF_WRIST_SECONDS, well below the SWAP_PINNED_SECONDS
+        # baseline-reset threshold). Surfaces an `off_wrist` boolean so the GUI can
+        # drop / watermark the splines without faking values, and the publisher omits
+        # the *_z keys from the payload to keep stale baseline-relative readings off
+        # the operator screen the moment skin contact is lost.
+        off_wrist = False
         if currently_offwrist:
             if self.swap_offwrist_start is None:
                 self.swap_offwrist_start = now_wall
+            off_wrist = (now_wall - self.swap_offwrist_start) >= OFF_WRIST_SECONDS
         elif self.swap_offwrist_start is not None:
             offwrist_duration = now_wall - self.swap_offwrist_start
             if offwrist_duration >= SWAP_PINNED_SECONDS:
@@ -562,6 +680,7 @@ class DeviceAggregator:
             'events': events,
             'quality': quality,
             'swap_detected': swap_detected,
+            'off_wrist': off_wrist,
         }
 
     def process_window(self):
@@ -600,7 +719,14 @@ class DeviceAggregator:
 
             # --- Calculate SD metrics and performance metrics ---
             # SD of 5 signals
-            edl_sd = float(np.std(self.edl_values)) if len(self.edl_values) > 1 else None
+            # SD of tonic EDA buffer. Falls back to the composite EDA stream
+            # when the wearer's EmotiBit doesn't emit the EDL short-tag.
+            if len(self.edl_values) > 1:
+                edl_sd = float(np.std(self.edl_values))
+            elif len(self.values.get('EDA', [])) > 1:
+                edl_sd = float(np.std(self.values['EDA']))
+            else:
+                edl_sd = None
             
             temp_roc_sd = None
             if len(self.temp_values) > 2:
@@ -661,6 +787,7 @@ class DeviceAggregator:
             signal_dict["quality_temperature_roc"] = q.get('temperature_roc', '')
             signal_dict["quality_scr_frequency"] = q.get('scr_frequency', '')
             signal_dict["swap_detected"] = bool(extras['swap_detected'])
+            signal_dict["off_wrist"] = bool(extras.get('off_wrist', False))
 
             # Add performance metric (for CSV storage)
             signal_dict["processing_time_ms"] = processing_time_ms
@@ -700,9 +827,17 @@ class DeviceAggregator:
             physio_metrics['calibration_remaining_s'] = extras['calibration_remaining_s']
             physio_metrics['session_age_s'] = extras['session_age_s']
             physio_metrics['baseline_n'] = extras['baseline_n']
-            for k, v in extras['z_scores'].items():
-                if v is not None:
-                    physio_metrics[k] = round(float(v), 3)
+            # Off-wrist: drop *_z keys from the payload entirely. Faking a value
+            # (e.g. 0) would mislead the operator into reading skin-contact
+            # "baseline" when the device is on a table. The GUI subscriber's
+            # "drop stale key" logic then greys the readouts, and the explicit
+            # boolean below lets it render an OFF-WRIST watermark.
+            off_wrist = bool(extras.get('off_wrist', False))
+            physio_metrics['off_wrist'] = off_wrist
+            if not off_wrist:
+                for k, v in extras['z_scores'].items():
+                    if v is not None:
+                        physio_metrics[k] = round(float(v), 3)
             for k, v in extras['events'].items():
                 physio_metrics[k] = bool(v)
             physio_metrics['quality'] = extras['quality']
@@ -711,6 +846,38 @@ class DeviceAggregator:
             
             # Publish consolidated metrics
             self.redis.publish(CHANNEL_PHYSIO.format(src=self.source_id), json.dumps(physio_metrics))
+
+            # Post-calibration sanity check: if the GUI-facing EDA channels are still empty
+            # after the warm-up window expired, the spline will render as "Physio: no signal".
+            # Log a throttled warning so the cause (e.g. EDA off-wrist, dead electrodes,
+            # plausibility gate rejecting every sample) is captured in the .log file.
+            if not extras['calibrating']:
+                eda_z_val = extras['z_scores'].get('eda_z')
+                now_ts = time.time()
+                if eda_z_val is None:
+                    last = self._missing_metric_last_warn.get('eda_z', 0.0)
+                    if now_ts - last >= self._missing_metric_warn_interval:
+                        log.warning(
+                            "eda_z missing post-calibration for %s (baseline_n=%d, "
+                            "edl_samples=%d, eda_samples=%d). GUI spline will show "
+                            "'Physio: no signal'. Likely off-wrist, dead electrodes, "
+                            "or EDA samples rejected by plausibility gate (%s).",
+                            self.source_id, extras['baseline_n'],
+                            len(self.edl_values), len(self.values.get('EDA', [])),
+                            PLAUSIBLE_EDA_US,
+                        )
+                        self._missing_metric_last_warn['eda_z'] = now_ts
+                if edl_sd is None:
+                    last = self._missing_metric_last_warn.get('edl_sd', 0.0)
+                    if now_ts - last >= self._missing_metric_warn_interval:
+                        log.warning(
+                            "edl_sd missing post-calibration for %s "
+                            "(edl_samples=%d, eda_samples=%d). Fallback EDA-SD "
+                            "spline path is also unavailable.",
+                            self.source_id, len(self.edl_values),
+                            len(self.values.get('EDA', [])),
+                        )
+                        self._missing_metric_last_warn['edl_sd'] = now_ts
 
             # --- Redis publish: continuous val/arousal ---
             self.redis.publish(CHANNEL_VAL.format(src=self.source_id),

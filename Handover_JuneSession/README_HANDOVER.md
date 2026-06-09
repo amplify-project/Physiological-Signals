@@ -93,10 +93,11 @@ The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera vie
 - **Bounding boxes** are labelled `P1`, `P2`, … — small recyclable display IDs that stay stable for the operator. The raw tracker ID is still recorded in the saved data for offline analysis.
 - **Engagement score** is shown as a coloured overlay on each person's bounding box (green = engaged, red = disengaged).
 - A small **cyan dot** in the top-right of a bounding box means that person received fresh MediaPipe extraction this frame (the rest reuse their last score). When the system is throttling under crowd load the HUD shows e.g. `MP: 1/3 rr2`.
-- **Sidebar** shows one row per enrolled person with their EmotiBit serial, plus three readouts:
-  - **EDA spline plot** — live electrodermal activity over the rolling window.
-  - **HRSD** — 5-second standard deviation of heart rate.
-  - **STROC** — 5-second standard deviation of skin-temperature rate-of-change.
+- **Sidebar** shows one row per enrolled person with their EmotiBit serial. Each row has:
+  - **Header readouts** — three small colour-coded values right-aligned next to the serial: `HR ±z.zz`, `EDA ±z.zz`, `TEMP ±z.zz`. Values are per-wearer session z-scores (deviation from this wearer's own running mean, in their own SD units). When `|z| ≥ 2` the readout switches to bold with a faint coloured pill behind it.
+  - **Unified physio panel** — single rolling spline plot on a fixed ±3 SD axis with reference lines at 0 and ±2 SD. Three traces share the panel: HR (green), EDA (yellow / cyan), TEMP (magenta). Each segment darkens and thickens past `|z| = 2` and the latest sample is marked with a small dot (plus a white halo when in the alert band). Window is the most recent **10 seconds** — older points scroll off the left.
+  - **Calibration** — first ~60 s after a wearer is assigned the panel shows `calibrating Ns` while the Welford running mean / SD stabilise. No splines are drawn yet.
+  - **OFF-WRIST** — when sensor contact is lost the panel dims and a faint red `OFF-WRIST` watermark appears within ~2 s. Splines gap out naturally rather than freezing on the last good value. Re-attach the device and the splines resume immediately; only a sustained ≥ 15 s off-wrist event triggers a full baseline reset.
 - **Radio buttons** on the sidebar select which detected person to treat as the "focus target".
 - Press **`R`** to open a picklist of detected-but-unassigned EmotiBit serials; arrow keys / number keys to select, **Enter** to confirm, **Esc** to cancel.
 - Press **`q`** or **Esc** to quit gracefully.
@@ -144,28 +145,31 @@ Replace `{device}` with the EmotiBit's MAC-derived serial (e.g. `MD-V5-0000448`)
 
 | Channel | Payload | Description |
 |---------|---------|-------------|
-| `device:{device}:physio_metrics` | `{device, timestamp, eda_sd, edl_sd, hr_sd, ibi_sd, temperature_roc_sd, scr_frequency_sd}` | All 5 s standard-deviation metrics published once per second. The GUI sidebar consumes this. |
+| `device:{device}:physio_metrics` | `{device, timestamp, eda_sd, edl_sd, hr_sd, ibi_sd, temperature_roc_sd, scr_frequency_sd, hr_z, eda_z, ibi_z, temperature_roc_z, scr_frequency_z, calibrating, calibration_remaining_s, baseline_n, session_age_s, off_wrist, quality, ...events}` | Published once per second. Magnitude `*_sd` fields are always present; signed per-wearer session `*_z` fields are present once calibration is complete AND the wearer is on-wrist (the publisher drops them otherwise, so the GUI can grey the readouts instead of carrying a stale value). `off_wrist` is a boolean the GUI uses to dim the panel and draw an `OFF-WRIST` watermark within ~2 s of contact loss. |
 | `device:{device}:valence_cont` | `{device, valence, timestamp}` | Continuous Valence score [0–2] from the Random Forest. |
 | `device:{device}:arousal_cont` | `{device, arousal, timestamp}` | Continuous Arousal score [0–2] from the Random Forest. |
 
 All payloads are JSON strings.
 
-### Planned change — per-wearer session z-score (under validation on `Post_Canteen_Bug_Fixes`)
+### Per-wearer session z-score (shipped on `Post_Canteen_Bug_Fixes`)
 
-The 4 June canteen recordings revealed two issues with the current `physio_metrics` bundle: (1) impossible EmotiBit beat-detector values (IBI 80 ms / 6,160 ms, HR > 220 BPM) flow untouched into the SDs, producing a ~270 ms `ibi_sd` floor; (2) magnitude-only SDs don't tell the operator whether a wearer is rising above or settling below their own normal. The planned replacement mirrors the methodology in the IMX '26 adult paper (rolling-median + z-score) and the IMEX infant paper (whole-session z-score, motivated by the absence of a resting baseline when sensors rotate across wearers):
+The 4 June canteen recordings revealed two issues with the original magnitude-only `*_sd` bundle: (1) impossible EmotiBit beat-detector values (IBI 80 ms / 6,160 ms, HR > 220 BPM) flowed untouched into the SDs, producing a ~270 ms `ibi_sd` floor; (2) magnitude SDs don't tell the operator whether a wearer is rising above or settling below their own normal. The replacement (live on this branch, mirroring the IMX '26 adult paper rolling-median + z-score and the IMEX infant paper whole-session z-score):
 
-- **Per-device running mean/SD (Welford)** — converges to the true session mean within ~60–90 s and barely moves thereafter, so sustained elevations stay visibly elevated (a short EMA would habituate them away).
-- **Calibration gate** — first ~60 s marked "calibrating" in the GUI; thereafter publish signed $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC, SCR frequency alongside the existing magnitude fields.
-- **Wearer-swap detection (auto)** — fires only on sustained simultaneous silence on all channels (EDA + PPG + temperature + accelerometer) for ≥ 30 s followed by return-to-plausible plus a step change in skin temperature baseline. Biased to miss rather than false-trigger.
-- **Manual "new wearer" button** in each GUI sidebar tile — resets that device's Welford state and re-arms the calibration gate. Operator override for the auto-detector.
-- **Loose-strap handling** — partial channel dropout flags the affected channel as `low-quality` in the publish bundle; does not trigger a reset.
+- **Per-device running mean/SD (Welford)** — numerically stable; converges to the true session mean within ~60–90 s and barely moves thereafter, so sustained elevations stay visibly elevated (a short EMA would habituate them away).
+- **Calibration gate** — first ~60 s marked `calibrating` in the payload. The GUI shows `calibrating Ns` in the panel and the per-trace readouts are absent until calibration completes; thereafter signed $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC and SCR frequency is published alongside the existing magnitude fields.
+- **Wearer-swap detection (auto)** — fires only on sustained simultaneous off-wrist (≥ 15 s) followed by return-to-plausible. Biased to miss rather than false-trigger.
+- **Off-wrist event (≥ 2 s)** — separate, much shorter threshold. While off-wrist the publisher drops `*_z` keys from the payload entirely (faking a baseline-relative value would mislead the operator into reading "calm" when the device is on a table) and sets `off_wrist: true` so the GUI can render an `OFF-WRIST` watermark. Two detection paths cover both common failure modes:
+  - **Low-magnitude rule** — EDA mean < 0.10 µS AND PPGGreen mean < 1500 counts over the last second of raw samples (well-behaved units).
+  - **Frozen-channel rule** — EDA std < 0.005 µS AND PPGGreen std < 5 counts over the same window (catches units whose ADS1114 EDA front-end rails at a high pinned value when removed and whose PPG latches on a fabric reflection — confirmed on `MD-V5-0000448` 9 June, where EDA was pinned at 2.595 µS identical to 5 dp for 20+ consecutive samples).
+- **Skin-temp sensor preference** — if the wearable streams Thermopile (MLX90632, medical-grade skin temp; MD-V5 hardware) it's preferred over the legacy `Temperature1` (MAX30101 die temp, reads ~4–6 °C below skin). Plausibility gates are now per-sensor: 24–42 °C for Thermopile, 22–36 °C for die temp. Original sensor choice is logged once at startup per device.
+- **Loose-strap handling** — partial channel dropout flags the affected channel as `low-quality` in the publish bundle; does **not** trigger a reset.
 
 **Required upstream filtering** (precondition; rejected samples are excluded from Welford updates):
-- HR ∈ [40, 200] BPM, IBI ∈ [300, 1500] ms, temperature ∈ [30, 38] °C plausibility gates.
+- HR ∈ [40, 200] BPM, IBI ∈ [300, 1500] ms, temperature per-sensor gates as above.
 - Median pre-filter on per-beat IBI to suppress EmotiBit sample-and-hold artefacts.
 - Hampel filter on EDA for spike rejection.
 
-Existing `eda_sd` / `hr_sd` / `ibi_sd` / `temperature_roc_sd` / `scr_frequency_sd` fields stay in the payload (so Unity and the GUI sidebar continue to work unchanged); `*_z` fields and a `quality` flag are added alongside. The Valence/Arousal RF path is unchanged. To be validated by Sowmya + Eoghan on `Post_Canteen_Bug_Fixes` before merging to `main`.
+Backwards-compat: the original `*_sd` magnitude fields stay in the payload so the Unity subscriber and any legacy consumer continue to work unchanged. The signed `*_z` fields and the `off_wrist` / `calibrating` booleans are additive. The Valence/Arousal RF path is unchanged.
 
 ---
 
