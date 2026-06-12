@@ -52,6 +52,8 @@ CHANNEL_PHYSIO = "device:{src}:physio_metrics"
 CHANNEL_VAL = "device:{src}:valence_cont"
 CHANNEL_ARO = "device:{src}:arousal_cont"
 CHANNEL_RESET = "device:{src}:reset_baseline"  # GUI publishes here to reset a wearer's baseline
+CHANNEL_RECONNECT = "emotibit:reconnect"        # GUI/operator publishes here to re-run device discovery at runtime
+CHANNEL_RECONNECT_STATUS = "emotibit:reconnect_status"  # publisher reports the outcome back to the GUI
 
 # ---- Per-wearer session-z baseline / artefact-rejection settings ----
 # Plausibility gates: samples outside these ranges never enter RF / SD / Welford buffers.
@@ -71,7 +73,15 @@ PLAUSIBLE_TEMP_C   = (30.0, 38.0)  # legacy alias, used only by manual-T0 path
 PLAUSIBLE_EDA_US   = (0.01, 100.0)
 PLAUSIBLE_SCR_FREQ = (0.0, 20.0)
 IBI_MEDIAN_KERNEL  = 3        # median pre-filter on per-beat IBI
-CALIBRATION_SECONDS = 60      # warm-up window before z-scores are published
+# Warm-up before z-scores are published. A z-score needs a mean AND a standard
+# deviation, so the hard floor is BASELINE_MIN_SAMPLES (below) -- you cannot
+# compute a meaningful z from a single reading. With the baseline updated once
+# per second this is ~5 s, which is the smallest statistically valid warm-up.
+# We deliberately do NOT impose any extra fixed wall-clock wait on top of that,
+# so plotting begins almost immediately once a sensor is fitted (first fit or
+# any subsequent re-fit after a swap reset).
+CALIBRATION_SECONDS = 5       # minimal warm-up window (matches the sample floor)
+BASELINE_MIN_SAMPLES = 5      # Welford samples needed before a z-score is valid
 Z_SOFT_THRESHOLD = 1.5        # amber GUI indicator (~13% fire rate)
 Z_HARD_THRESHOLD = 2.0        # red GUI indicator + logged event (~5%, matches published methodology)
 # Wearer-swap auto-detection (pinned-floor heuristic).
@@ -79,7 +89,7 @@ Z_HARD_THRESHOLD = 2.0        # red GUI indicator + logged event (~5%, matches p
 # (EDA near zero, PPG near zero, HR/IBI sample-and-hold). UDP silence never
 # happens, so we detect off-wrist by sustained collapse of the contact-driven
 # raw signals instead.
-SWAP_PINNED_SECONDS     = 15.0   # off-wrist must persist >= this to count as a swap
+SWAP_PINNED_SECONDS     = 2.0    # off-wrist must persist >= this to count as a swap -> fresh baseline on re-fit
 OFF_WRIST_SECONDS       = 2.0    # short threshold: drop *_z keys from physio_metrics and signal GUI watermark
 EDA_OFFWRIST_THRESHOLD  = 0.10   # µS — below this the wrist is empty
 PPG_OFFWRIST_THRESHOLD  = 1500.0 # PPGGreen counts — below this the LED has no skin to reflect off
@@ -99,6 +109,7 @@ EMOTIBIT_CONTROL_PORT = 3131
 EMOTIBIT_DATA_PORT    = 3132
 EMOTIBIT_TCP_PORT     = 3133
 DISCOVERY_TIMEOUT_S   = 20
+RECONNECT_TIMEOUT_S   = 8     # non-interactive re-discovery window for runtime reconnects
 HEARTBEAT_INTERVAL_S  = 1
 
 # EmotiBit type-tag ’ canonical stream name
@@ -581,7 +592,7 @@ class DeviceAggregator:
 
         # Per-channel signed z-scores (None during calibration or insufficient data)
         def _z(val, w):
-            if val is None or calibrating or w.n < 5 or w.sd <= 0:
+            if val is None or calibrating or w.n < BASELINE_MIN_SAMPLES or w.sd <= 0:
                 return None
             return (val - w.mean) / w.sd
 
@@ -658,18 +669,14 @@ class DeviceAggregator:
             off_wrist = (now_wall - self.swap_offwrist_start) >= OFF_WRIST_SECONDS
         elif self.swap_offwrist_start is not None:
             offwrist_duration = now_wall - self.swap_offwrist_start
+            # Any sustained off-wrist gap >= SWAP_PINNED_SECONDS forces a fresh
+            # baseline the moment the sensor is re-fitted. We intentionally do NOT
+            # require a skin-temp step here: the operator may re-fit the same OR a
+            # different wearer, and in both cases the z-score baseline must be
+            # recomputed from scratch so a new wearer is never plotted against the
+            # previous wearer's mean/SD.
             if offwrist_duration >= SWAP_PINNED_SECONDS:
-                # Optional temperature-step confirmer: if a baseline temp was captured
-                # AND the temp stream is currently live, require >= SWAP_TEMP_STEP_C
-                # shift. Otherwise (temp stream unavailable) the sustained off-wrist
-                # duration alone is sufficient.
-                temp_step_ok = True
-                if self.baseline_temp_c is not None and self.temp_values:
-                    current_temp = _mean_tail(self.temp_values, sps)
-                    if current_temp is not None:
-                        temp_step_ok = abs(current_temp - self.baseline_temp_c) >= SWAP_TEMP_STEP_C
-                if temp_step_ok:
-                    swap_detected = True
+                swap_detected = True
             self.swap_offwrist_start = None
 
         return {
@@ -979,14 +986,20 @@ def _broadcast_targets():
     return list(targets)
 
 
-def discover_devices(adv_sock, timeout_s, own_ips=None):
-    """Discover EmotiBit devices via HE/HH/EC/PO handshake on UDP 3131."""
+def discover_devices(adv_sock, timeout_s, own_ips=None, interactive=True):
+    """Discover EmotiBit devices via HE/HH/EC/PO handshake on UDP 3131.
+
+    interactive=False is used for runtime reconnects (triggered from the GUI
+    reconnect button): it skips the keyboard 'press ENTER' wait and just
+    auto-accepts whatever responds within the window, so it can run unattended
+    from a background thread.
+    """
     _IS_WINDOWS = platform.system() == 'Windows'
     if _IS_WINDOWS:
         import msvcrt
 
     def _enter_pressed():
-        if not sys.stdin.isatty():
+        if not interactive or not sys.stdin.isatty():
             return False
         if _IS_WINDOWS:
             if msvcrt.kbhit():
@@ -1012,7 +1025,8 @@ def discover_devices(adv_sock, timeout_s, own_ips=None):
     print(f"  Data port:        {EMOTIBIT_DATA_PORT}")
     print(f"  TCP control port: {EMOTIBIT_TCP_PORT}")
     print("Power on devices or ensure they are already broadcasting.")
-    print(">>> Press ENTER once all devices are found to continue <<<\n")
+    if interactive:
+        print(">>> Press ENTER once all devices are found to continue <<<\n")
 
     while time.time() < deadline:
         if connected and _enter_pressed():
@@ -1240,6 +1254,13 @@ def main():
     tcp_sock.settimeout(1.0)
 
     stop_flag = threading.Event()
+    # Serialises all ctrl_sock access (heartbeat vs runtime reconnect handshake)
+    # so the two threads never steal each other's UDP control-port packets.
+    ctrl_lock = threading.Lock()
+    # Guards the live device collections (device_aggs / agg_list / aggs_by_source /
+    # discovered) which a runtime reconnect can mutate while the UDP + prediction
+    # threads are iterating them.
+    agg_lock = threading.Lock()
 
     def _tcp_accept():
         while True:
@@ -1333,21 +1354,22 @@ def main():
     def heartbeat_thread():
         while not stop_flag.is_set():
             pkt = make_pkt("PN", ["DP", EMOTIBIT_DATA_PORT])
-            for dev_ip in discovered:
+            with ctrl_lock:
+                for dev_ip in list(discovered):
+                    try:
+                        ctrl_sock.sendto(pkt, (dev_ip, EMOTIBIT_CONTROL_PORT))
+                    except Exception:
+                        pass
+                # Drain PO responses so ctrl_sock buffer doesn't fill up
                 try:
-                    ctrl_sock.sendto(pkt, (dev_ip, EMOTIBIT_CONTROL_PORT))
+                    ctrl_sock.settimeout(0.05)
+                    while True:
+                        try:
+                            ctrl_sock.recvfrom(4096)
+                        except socket.timeout:
+                            break
                 except Exception:
                     pass
-            # Drain PO responses so ctrl_sock buffer doesn't fill up
-            try:
-                ctrl_sock.settimeout(0.05)
-                while True:
-                    try:
-                        ctrl_sock.recvfrom(4096)
-                    except socket.timeout:
-                        break
-            except Exception:
-                pass
             time.sleep(HEARTBEAT_INTERVAL_S)
 
     threading.Thread(target=heartbeat_thread, daemon=True).start()
@@ -1387,6 +1409,64 @@ def main():
             print(f"[WARN] reset listener exited: {e}")
 
     threading.Thread(target=reset_listener_thread, daemon=True).start()
+
+    # ---- RUNTIME RECONNECT ----
+    # When an EmotiBit drops mid-session (Wi-Fi blip, power glitch) it stops
+    # streaming and previously the only fix was to kill and relaunch the whole
+    # pipeline. Instead, the GUI publishes to CHANNEL_RECONNECT and we re-run the
+    # discovery handshake live: known devices resume streaming and any brand-new
+    # device gets its own aggregator with a fresh per-wearer baseline. No restart.
+    def do_reconnect(trigger='redis'):
+        print(f"\n[RECONNECT] requested ({trigger}) - re-scanning for EmotiBit devices...")
+        log.info('reconnect_requested', extra={'trigger': trigger})
+        # Hold ctrl_lock for the whole handshake so the heartbeat thread doesn't
+        # consume the HH/PO replies discovery is waiting for.
+        with ctrl_lock:
+            try:
+                found = discover_devices(ctrl_sock, RECONNECT_TIMEOUT_S, own_ips,
+                                         interactive=False)
+            except Exception as e:
+                found = {}
+                print(f"[RECONNECT] discovery error: {e}")
+            finally:
+                ctrl_sock.settimeout(1.0)
+        new_count = 0
+        with agg_lock:
+            for ip, dev_id in found.items():
+                if ip in device_aggs:
+                    continue  # known device -- EC handshake already re-sent, streaming resumes
+                src_label = dev_id if dev_id != "unknown" else ip.replace('.', '_')
+                agg = DeviceAggregator(src_label, clf_val, clf_aro, r,
+                                       all_signal_types=signal_types)
+                device_aggs[ip] = agg
+                agg_list.append(agg)
+                aggs_by_source[agg.source_id] = agg
+                discovered[ip] = dev_id
+                new_count += 1
+                print(f"[RECONNECT] new device online: {ip} (ID: {dev_id}) - fresh baseline")
+        print(f"[RECONNECT] done. {len(found)} device(s) responded, {new_count} new.")
+        log.info('reconnect_done', extra={'responded': len(found), 'new': new_count})
+        try:
+            r.publish(CHANNEL_RECONNECT_STATUS,
+                      json.dumps({'responded': len(found), 'new': new_count,
+                                  'ts': time.time()}))
+        except Exception:
+            pass
+
+    def reconnect_listener_thread():
+        try:
+            pubsub = r.pubsub()
+            pubsub.subscribe(CHANNEL_RECONNECT)
+            for message in pubsub.listen():
+                if stop_flag.is_set():
+                    return
+                if message.get('type') != 'message':
+                    continue
+                do_reconnect(trigger='redis')
+        except Exception as e:
+            print(f"[WARN] reconnect listener exited: {e}")
+
+    threading.Thread(target=reconnect_listener_thread, daemon=True).start()
 
     # ---- UDP RECEIVE THREAD ----
     def udp_thread():
@@ -1435,7 +1515,9 @@ def main():
     # ---- PREDICTION LOOP ----
     def prediction_loop():
         while not stop_flag.is_set():
-            for agg in agg_list:
+            with agg_lock:
+                aggs = list(agg_list)
+            for agg in aggs:
                 agg.process_window()
                 agg.data_logger.flush()
             time.sleep(1.0)
@@ -1490,7 +1572,7 @@ def main():
         tcp_sock.close()
 
         # 4. Flush and close every logger file handle
-        for agg in agg_list:
+        for agg in list(agg_list):
             try:
                 agg.data_logger.close()
             except Exception:

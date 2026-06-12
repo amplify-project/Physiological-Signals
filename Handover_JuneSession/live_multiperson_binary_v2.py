@@ -1377,13 +1377,37 @@ SIDEBAR_W = 280  # pixel width of the EmotiBit physio sidebar panel
 # =============================================================================
 
 def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
-                          focus_target, sidebar_radio_rects, sidebar_w):
+                          focus_target, sidebar_radio_rects, sidebar_w,
+                          reconnect_rect_out=None):
     """Return a (h, sidebar_w, 3) uint8 image for the physio sidebar.
-    Mutates sidebar_radio_rects in place with (y_top, y_bot, serial) tuples."""
+    Mutates sidebar_radio_rects in place with (y_top, y_bot, serial) tuples.
+    If reconnect_rect_out is given, it is filled with a single
+    (x0, y0, x1, y1) tuple (sidebar-local coords) for the reconnect button."""
     sidebar = np.full((h, sidebar_w, 3), 28, dtype=np.uint8)
     cv2.putText(sidebar, "EmotiBit", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
     sidebar_radio_rects.clear()
+
+    # Reconnect button: a fixed strip at the bottom of the sidebar. Clicking it
+    # tells the EmotiBit publisher to re-run discovery without restarting the
+    # whole pipeline (see on_mouse). Drawn last (on top) but its geometry is
+    # reserved up-front so device rows never overlap it.
+    _BTN_H = 34
+    _BTN_M = 8
+    _btn_y0 = h - _BTN_H - _BTN_M
+    _btn_y1 = h - _BTN_M
+    _btn_x0 = 6
+    _btn_x1 = sidebar_w - 6
+
+    def _draw_reconnect_button():
+        cv2.rectangle(sidebar, (_btn_x0, _btn_y0), (_btn_x1, _btn_y1), (40, 95, 40), -1)
+        cv2.rectangle(sidebar, (_btn_x0, _btn_y0), (_btn_x1, _btn_y1), (80, 210, 80), 1)
+        cv2.putText(sidebar, "RECONNECT", (_btn_x0 + 12, _btn_y0 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (190, 255, 190), 1, cv2.LINE_AA)
+        cv2.putText(sidebar, "click to re-scan EmotiBits", (_btn_x0 + 12, _btn_y0 + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 200, 140), 1, cv2.LINE_AA)
+        if reconnect_rect_out is not None:
+            reconnect_rect_out[:] = [(_btn_x0, _btn_y0, _btn_x1, _btn_y1)]
 
     # Snapshot connected device serials once under the lock
     with emotibit_lock:
@@ -1403,11 +1427,12 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         cv2.putText(sidebar, "(start EmotiBit publisher)", (8, 95),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+        _draw_reconnect_button()
         return sidebar
 
     n = len(rows)
     # Scale row height to fit up to 6 devices: generous when few, compact when many
-    available_h = h - 28
+    available_h = h - 28 - (_BTN_H + 2 * _BTN_M)
     row_h = max(60, min(140, available_h // max(n, 1)))
     for i, (serial, is_enrolled) in enumerate(rows):
         y0 = 28 + i * row_h
@@ -1618,6 +1643,7 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 90, 220), 1, cv2.LINE_AA)
         if i < n - 1:
             cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
+    _draw_reconnect_button()
     return sidebar
 
 
@@ -1706,6 +1732,9 @@ def main():
     registration_mode = False
     registration_flash_until = 0  # timestamp for on-screen flash message
     registration_flash_msg = ''
+    # Reconnect button flash (separate from registration so they don't clobber)
+    reconnect_flash_until = 0.0
+    reconnect_flash_msg = ''
     
     # Face ID throttle: run MTCNN matching every N frames, carry forward results
     FACE_ID_INTERVAL = 10  # frames between face matching runs
@@ -1721,16 +1750,33 @@ def main():
     emotibit_data = {}        # {serial: {'eda': deque, 'hr': deque, 'metrics': dict}}
     emotibit_lock = threading.Lock()
     sidebar_radio_rects = []  # [(y_top, y_bot, serial), ...] updated each frame
+    reconnect_btn_rect = []   # [(x0, y0, x1, y1)] sidebar-local, updated each frame
     video_w_box    = [0]      # video pixel width, set on first frame
     _mouse_cb_set  = [False]  # set mouse callback once after first imshow
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal focus_target
+        nonlocal focus_target, reconnect_flash_until, reconnect_flash_msg
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         vw = video_w_box[0]
         if vw == 0 or x < vw:   # click is inside the video, not the sidebar
             return
+        lx = x - vw             # x relative to the sidebar's left edge
+        # Reconnect button (sidebar-local coords) takes priority over radio rows.
+        if reconnect_btn_rect:
+            bx0, by0, bx1, by1 = reconnect_btn_rect[0]
+            if bx0 <= lx <= bx1 and by0 <= y <= by1:
+                ok = False
+                try:
+                    if system.redis_client is not None:
+                        system.redis_client.publish('emotibit:reconnect', '1')
+                        ok = True
+                except Exception as e:
+                    print(f"\u26a0\ufe0f  reconnect publish failed: {e}")
+                reconnect_flash_msg = ('Reconnecting EmotiBits...' if ok
+                                       else 'Redis unavailable - cannot reconnect')
+                reconnect_flash_until = time.time() + 2.5
+                return
         for (y0, y1, serial) in sidebar_radio_rects:
             if y0 <= y <= y1:
                 focus_target = serial if focus_target != serial else 'all'
@@ -2622,6 +2668,16 @@ def main():
             cv2.putText(display_frame, flash_text, (fx, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
             cv2.putText(display_frame, flash_text, (fx, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, IDENTIFIED_COLOR, 2)
 
+        # Reconnect flash message (green, below centre so it doesn't collide
+        # with the registration flash)
+        if reconnect_flash_until > time.time():
+            rf_text = reconnect_flash_msg
+            (rtw, rth), _ = cv2.getTextSize(rf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            rx = (w - rtw) // 2
+            ry = h // 2 + 50
+            cv2.putText(display_frame, rf_text, (rx, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+            cv2.putText(display_frame, rf_text, (rx, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 255, 120), 2)
+
         # --- DATA LOGGING ---
         if logger:
             logger.log_frame(people_data, crowd_avg, live_fps, is_360=is_360, frame_size=(w, h))
@@ -2639,6 +2695,7 @@ def main():
             h,
             face_id.enrolled_names if face_id and not is_360 else [],
             emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
+            reconnect_btn_rect,
         )
         # Lazily create the main window as resizable on the very first frame.
         # Doing this here (after any --select-camera preview has been torn
@@ -2720,6 +2777,7 @@ def main():
                         face_id.enrolled_names if face_id and not is_360 else [],
                         emotibit_data, emotibit_lock, focus_target,
                         sidebar_radio_rects, SIDEBAR_W,
+                        reconnect_btn_rect,
                     )
                     cv2.imshow(_WIN_NAME, np.hstack([overlay, _sb_reg]))
                     k = cv2.waitKey(50) & 0xFF
