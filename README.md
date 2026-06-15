@@ -336,6 +336,30 @@ Start-Process -FilePath "redis\redis-server.exe" -ArgumentList "redis\redis.wind
 - Publishes affect outputs to Redis on `device:{serial}:valence_cont` and `device:{serial}:arousal_cont`
 - Logs all raw signals, SD metrics, predictions, and processing time to CSV in `emotibit_recordings/`
 
+#### Per-wearer session z-score (shipped on `Post_Canteen_Bug_Fixes`)
+
+The original `physio_metrics` bundle published raw `numpy.std()` of the 5 s buffer as magnitude-only SDs. The 4 June canteen recordings exposed two limitations: (1) impossible EmotiBit beat-detector values (IBI 80 ms / 6,160 ms, HR > 220 BPM) propagated untouched into the SDs, producing a ~270 ms `ibi_sd` floor; (2) magnitudes don't tell the operator whether a person is rising above or settling below their own normal — the question the stage-side view actually needs to answer.
+
+The replacement is live on `Post_Canteen_Bug_Fixes` and matches the methodology already published in the IMX '26 adult paper (rolling-median + z-score) and the IMEX infant paper (whole-session z-score, motivated by the absence of a resting baseline when sensors are rotated across wearers):
+
+- **Per-device running mean/SD via Welford's algorithm** — one-pass, numerically stable; converges to the true session mean within ~60–90 s and barely moves thereafter, so sustained elevations stay visibly elevated (unlike a short EMA, which habituates).
+- **Calibration gate** — first ~60 s after a wearer assignment marked as `calibrating: true` in the published payload; the GUI shows `calibrating Ns` and suppresses spline / readout values until done. Z-scores published thereafter as $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC and SCR frequency.
+- **Off-wrist event (≥ 2 s, short threshold)** — separate from the 15 s baseline-reset threshold. While off-wrist the publisher drops `*_z` keys from the payload entirely and sets `off_wrist: true` so the GUI dims the panel and renders an `OFF-WRIST` watermark within ~2 s of skin-contact loss. Two detection paths:
+  - *Low-magnitude rule* — EDA mean < 0.10 µS AND PPGGreen mean < 1500 counts over the last second of raw samples (well-behaved units).
+  - *Frozen-channel rule* — EDA std < 0.005 µS AND PPGGreen std < 5 counts over the same window. Catches units whose ADS1114 EDA front-end rails at a high pinned value when removed and whose PPG latches on a fabric reflection (confirmed on `MD-V5-0000448` 9 June, EDA pinned at 2.595 µS identical to 5 dp for 20+ consecutive samples). Reads from the raw `all_signal_values` buffer with no smoothing in front of it.
+- **Wearer-swap detection (auto)** — multi-condition trigger: sustained simultaneous off-wrist on EDA + PPG for ≥ 15 s, followed by return-to-plausible, optionally confirmed by a step change in skin temperature baseline. Biased toward missing resets rather than firing false ones.
+- **Skin-temp sensor preference** — if Thermopile (MLX90632, medical-grade skin temp; MD-V5 hardware) is streaming it's preferred over the legacy `Temperature1` (MAX30101 die temp, reads ~4–6 °C below skin). Per-sensor plausibility gates: 24–42 °C for Thermopile, 22–36 °C for die temp. Original sensor choice is logged once at startup per device. *(Original code path used `Temperature0`/`Temperature1` with a 30–38 °C gate, so every die-temp sample was being rejected on MD-V5 hardware and STROC never plotted.)*
+- **EDA channel fallback** — z-score representative is computed from `EDL` (derived tonic) if available, otherwise falls back to `EDA` (ADS1114 raw, the actual primary path on MD-V5 wearers in current bundle). *(Original code only consulted `EDL`, so on wearers that emit `EA` but not `EL` the EDA spline was silently empty for the whole session.)*
+- **Loose-strap handling** — partial channel dropout (EDA falls but PPG/accelerometer continue) does **not** trigger a reset; instead the affected channel is flagged `low-quality` in the publish bundle so the GUI can render it greyed-out rather than as a falsely calm baseline.
+
+**Required upstream filtering (precondition for any baseline approach):**
+- Plausibility gates: HR ∈ [40, 200] BPM, IBI ∈ [300, 1500] ms, temperature per-sensor gates as above.
+- Short median pre-filter on per-beat IBI to suppress the EmotiBit sample-and-hold artefacts.
+- Hampel filter on EDA for spike rejection.
+- Rejected samples are excluded from the Welford update so artefacts never enter the running stats.
+
+Backwards-compatibility: the original `eda_sd` / `hr_sd` / `ibi_sd` / `temperature_roc_sd` / `scr_frequency_sd` magnitude fields remain in the `physio_metrics` payload (the operator still wants to read "this person is at HR 110 right now"); the signed `*_z` fields and the `off_wrist` / `calibrating` booleans are added alongside them. The Valence/Arousal RF path is unchanged. To be validated by Sowmya + Eoghan against the canteen recordings before merging to `main`.
+
 **GUI sidebar (280px panel hstacked on the right):**
 - One row per enrolled participant — radio button, EmotiBit serial label, and live Physio values
 - Accepts `hr_sd` and `eda_sd` from `device:{serial}:physio_metrics`; falls back to legacy HR/EDA plots when those channels are available
@@ -383,23 +407,46 @@ Completed work against this roadmap, in commit order:
 
 **Outstanding under Item 2.d:** if the round-robin throttle alone doesn't hit 12 FPS on the largest expected audiences, the next lever is a thread pool of per-worker MediaPipe holistic instances (true parallel extraction). Not implemented yet because MediaPipe holistic objects are not thread-safe — needs a `threading.local` of holistic instances and a `ThreadPoolExecutor` around the per-person loop.
 
-**All work above is in sync across `scripts/inference/live_multiperson_binary_v2.py` (project copy) and `Handover_JuneSession/live_multiperson_binary_v2.py` (Sowmya's bundle copy).**
+### Progress log — June 2026 (branch `Post_Canteen_Bug_Fixes`)
+
+Quality-of-life fixes from the 4 June canteen run review (data saving + GUI clarity):
+
+- **Console-output throttle (engagement side)** — Redis-publish line now mirrors the EmotiBit publisher's pattern: prints every second for the first 3 publishes, then once per 60 s. Keeps terminal I/O off the hot path during long sessions without losing the ability to confirm the pipeline is alive at startup.
+
+- **MP throttle visibility** — when MediaPipe is round-robin throttled the HUD now shows e.g. `MP: 1/3 rr2`; the `rr` offset increments every frame so the operator can see the rotation cycling. Each bbox of a person who got fresh MediaPipe **this frame** also gets a small cyan dot top-right, so the round-robin is visually traceable across the crowd.
+
+- **Sidebar HRSD + STROC layout** — the temperature ROC SD readout (`Ṡ SD …`) was being drawn on top of the EDA spline plot and was therefore invisible. Both readouts now sit side-by-side on the same row header line **above** the plot rectangle, with shorter labels (`HRSD`, `STROC`) so they fit at `sidebar_w=280`. EDA / EDA SD spline behaviour unchanged. *(Superseded by the unified z-score panel rework — see below.)*
+
+- **Display-ID remap on the overlay** — the on-screen bbox label was using the raw YOLO `bytetrack` id which inflates rapidly in crowds (2 058 distinct ids over a 47 min canteen run with ~6 people on screen). Boxes now read `P1`, `P2`, … from a recyclable pool of small integer slots; raw `track_id` is still what's written to `engagement_data.jsonl` and the keypoint NPZ chunks for offline analysis. Slots are returned to the pool when their underlying track is dropped by `_evict_stale_tracks()` (>60 frames absent or `MAX_TRACKED_IDS=64` cap), so the next new person picks up the smallest free `P*` slot. **Caveat:** if churn is severe enough that >64 distinct tracks are seen within any ~2 s window, eviction will recycle slots while their tracks are still live, which would visibly jump the numbers in front of the operator. The fix in that regime is to bump `MAX_TRACKED_IDS` (the eviction cap) or `STALE_TRACK_TIMEOUT_FRAMES` (the absence threshold) — both constants near line 320 of `live_multiperson_binary_v2.py`.
+
+- **Data-saving validation (canteen run, 47 min, ~6 people on screen, MediaPipe throttled)** — NPZ chunks compress to ~4 MB total across 27 files; the engagement JSONL is 29 MB. NPZ schema is correct (`frames`, `track_ids`, `keypoints (N,543,3) float16`, `bboxes`, `frame_size`). The "MB not GB" surprise is dominated by 2.d throttling (only ~1 of every ~6 detected people gets MP → NPZ) plus ~39 % of buffered keypoint rows being all-zero (Holistic returned no landmarks for that crop). No corruption.
+
+- **Physio rework — unified z-score sidebar + off-wrist watermark (9 June)** — wires the per-wearer Welford z-score path described earlier into the GUI and fixes several silent-bug regressions exposed during the 9 June bench session:
+  - **Single panel per wearer, three traces**: HR (green), EDA (yellow / cyan), TEMP (magenta) all share one fixed ±3 SD axis. Header carries three colour-keyed numeric readouts (`HR +z.zz  EDA +z.zz  TEMP +z.zz`) that switch to bold with a faint coloured pill behind them when `|z| ≥ 2`. Each spline segment thickens past `|z| = 2` and the latest sample is marked with a dot (white halo in the alert band). Replaces the old EDA-spline / HRSD-text / STROC-text layout.
+  - **Rolling 10-second window** on the plot — publisher emits one `physio_metrics` per second so the panel shows the most recent 10 samples spread across the panel width. Full history stays in the subscriber deque for debugging / replay; only the plot is windowed.
+  - **`OFF-WRIST` watermark** within ~2 s of contact loss. The publisher drops `*_z` keys from the payload entirely while off-wrist (faking a zero baseline would lie about skin contact when the device is on a table), so the splines gap out naturally rather than freezing on the last good value. Re-attach and the splines resume immediately; only a sustained ≥ 15 s off-wrist event triggers a full baseline reset.
+  - **Frozen-channel off-wrist detector** — some EmotiBit units (`MD-V5-0000448` on 9 June) don't collapse to floor when removed; the ADS1114 EDA front-end rails at a high pinned value (~2.6 µS identical to 5 dp for 20+ consecutive samples) and PPGGreen latches on a fabric reflection (~2 600 counts). Real skin contact always produces measurable jitter, so the detector now ORs the original magnitude rule with a zero-std fallback (EDA std < 0.005 µS AND PPG std < 5 counts over the last second of raw samples). Reads from `DeviceAggregator.all_signal_values` (raw UDP stream, no smoothing in front of it) so the frozen-std signal is genuine.
+  - **Skin-temp sensor preference** — Thermopile (MLX90632 medical-grade) is now preferred over `Temperature1` (MAX30101 die temp) where available, with per-sensor plausibility gates (24–42 °C vs 22–36 °C). Fixes the silent-STROC bug on MD-V5 hardware where every die-temp sample was being rejected by the legacy 30–38 °C gate.
+  - **EDA fallback (EDL → EDA)** — z-score representative now falls back to `EDA` when `EDL` is empty. Fixes the silent-EDA-spline bug on wearers that emit the `EA` tag but not `EL`.
+  - **Main window resizable** — the engagement `cv2.namedWindow` flag was switched from default `WINDOW_AUTOSIZE` (which locks to source frame size) to `WINDOW_NORMAL` so Windows can maximise / snap / fullscreen the GUI.
+
+**Sync status (June 2026):** both `Handover_JuneSession/live_multiperson_binary_v2.py` and `scripts/inference/live_multiperson_binary_v2.py` carry the Post-Bremen and Post-Canteen progress-log items. The only intentional divergence is the `applog` import bootstrap (Handover copy resolves it from its own folder; project-tree copy resolves it from `src/`).
 
 ---
 
-### 1. EmotiBit visibility before face registration
-- [ ] EmotiBit plots should be visible even before being registered to a facial ID.
-- [ ] Decouple physio visibility from face-enrollment state so operators can validate sensor health immediately.
+### 1. EmotiBit visibility before face registration ✅
+- [x] EmotiBit plots should be visible even before being registered to a facial ID.
+- [x] Decouple physio visibility from face-enrollment state so operators can validate sensor health immediately.
 
 **Proposed solutions**
-- [ ] Standard practice: render all discovered EmotiBit streams as unassigned rows immediately, independent of face ID state.
-- [ ] Standard practice: add assignment states (`unassigned`, `assigned`, `stale`) and keep plotting active in all states.
+- [x] Standard practice: render all discovered EmotiBit streams as unassigned rows immediately, independent of face ID state.
+- [x] Standard practice: add assignment states (`unassigned`, `assigned`, `stale`) and keep plotting active in all states.
 - [ ] State-of-the-art: add confidence-based auto-association between tracked people and devices using temporal cues, with manual override.
 
-### 2. Multi-person FPS collapse and runtime efficiency
-- [ ] During demoing, many people were simultaneously detected. Some FPS reduction per additional person is expected, but frame rate dropped to around 3 FPS.
-- [ ] Maintain a minimum FPS target of 12 at all times.
-- [ ] Evaluate adaptive frame processing to maintain 12 FPS (for example, controlled frame dropping, selective per-frame work, or phased inference).
+### 2. Multi-person FPS collapse and runtime efficiency (partially ✅)
+- [x] During demoing, many people were simultaneously detected. Some FPS reduction per additional person is expected, but frame rate dropped to around 3 FPS.
+- [ ] Maintain a minimum FPS target of 12 at all times. *(2D path holds 9–12 FPS post 2.b/2.c/2.d on canteen-class crowds; not yet validated at 30+ people. See Item 2.e for the GPU-keypoint follow-up if the throttle alone is insufficient.)*
+- [x] Evaluate adaptive frame processing to maintain 12 FPS (for example, controlled frame dropping, selective per-frame work, or phased inference).
 
 **Proposed solutions**
 - [ ] Standard practice: implement a hard real-time budget loop with degradation tiers to enforce minimum 12 FPS.
@@ -408,39 +455,39 @@ Completed work against this roadmap, in commit order:
 - [ ] State-of-the-art: asynchronous multi-rate pipeline (capture, detect, pose, classify, render, publish) with bounded queues and frame dropping under backpressure.
 - [ ] State-of-the-art: export detector/inference path to optimized runtime (ONNX/TensorRT where available) for lower latency.
 
-#### 2.b. ID inflation and tracker stability
-- [ ] Additional IDs were repeatedly assigned to the same people after detect/lost/redetect cycles.
-- [ ] IDs reached the 1000s for about 20 people.
-- [ ] Review tracker identity persistence and reuse strategy to reduce duplicate IDs.
-- [ ] Evaluate memory impact of large ID churn and buffer retention.
+#### 2.b. ID inflation and tracker stability ✅
+- [x] Additional IDs were repeatedly assigned to the same people after detect/lost/redetect cycles.
+- [x] IDs reached the 1000s for about 20 people.
+- [x] Review tracker identity persistence and reuse strategy to reduce duplicate IDs.
+- [x] Evaluate memory impact of large ID churn and buffer retention.
 - [ ] Depending on achieved frame-rate solutions, consider a mode that prioritizes visual tracking of the 6 people wearing EmotiBits.
 
 **Proposed solutions**
 - [ ] Standard practice: switch to or tune robust MOT settings (track age, minimum hits, reactivation window) to reduce identity churn.
-- [ ] Standard practice: separate detector-internal IDs from stable application-level person IDs.
-- [ ] Standard practice: enforce lifecycle cleanup and caps for inactive tracks and stale buffers.
+- [x] Standard practice: separate detector-internal IDs from stable application-level person IDs. *(Display-ID remap `P1`/`P2`/… on overlay; raw `track_id` retained in saved data.)*
+- [x] Standard practice: enforce lifecycle cleanup and caps for inactive tracks and stale buffers. *(`_evict_stale_tracks()`, `STALE_TRACK_TIMEOUT_FRAMES=60`, `MAX_TRACKED_IDS=64`.)*
 - [ ] State-of-the-art: add appearance re-identification embeddings for long occlusion recovery and identity stitching.
 
-#### 2.c. Context duration drift
-- [ ] In demo images, FPS was around 3 but context grew to around 20 seconds.
-- [ ] Context window should stay at 10 seconds.
-- [ ] Investigate and fix context-duration drift so temporal context remains pinned to target duration.
+#### 2.c. Context duration drift ✅
+- [x] In demo images, FPS was around 3 but context grew to around 20 seconds.
+- [x] Context window should stay at 10 seconds.
+- [x] Investigate and fix context-duration drift so temporal context remains pinned to target duration.
 
 **Proposed solutions**
-- [ ] Standard practice: convert context control to time-based buffering instead of fixed frame-floor behavior.
-- [ ] Standard practice: keep a 10-second target window and resample buffered features to the model input length when FPS is low.
-- [ ] Standard practice: set minimum sequence constraints from inference viability (first estimate threshold), not from static frame counts.
+- [x] Standard practice: convert context control to time-based buffering instead of fixed frame-floor behavior.
+- [x] Standard practice: keep a 10-second target window and resample buffered features to the model input length when FPS is low.
+- [x] Standard practice: set minimum sequence constraints from inference viability (first estimate threshold), not from static frame counts. *(Now `MIN_INFERENCE_SECONDS=1.0`.)*
 - [ ] State-of-the-art: include time-delta encoding for irregular frame spacing in the temporal model.
 
-#### 2.d. Underutilized hardware at low FPS
-- [ ] Demo images show around 3 FPS while CPU and GPU were not fully burdened.
-- [ ] Profile pipeline stages to identify serialization bottlenecks and non-hardware-limited stalls.
-- [ ] Evaluate parallel and asynchronous execution paths where safe and measurable.
+#### 2.d. Underutilized hardware at low FPS ✅
+- [x] Demo images show around 3 FPS while CPU and GPU were not fully burdened.
+- [x] Profile pipeline stages to identify serialization bottlenecks and non-hardware-limited stalls. *(MediaPipe Holistic on CPU TFLite identified as the dominant per-person cost.)*
+- [x] Evaluate parallel and asynchronous execution paths where safe and measurable.
 
 **Proposed solutions**
-- [ ] Standard practice: add stage-level wall-time instrumentation (capture, detect, pose, classify, render, publish, logging).
+- [x] Standard practice: add stage-level wall-time instrumentation (capture, detect, pose, classify, render, publish, logging). *(EWMA per-person extract cost feeds the budget loop.)*
 - [ ] Standard practice: remove blocking synchronization points and pre-allocate tensors/buffers to reduce per-frame overhead.
-- [ ] Standard practice: parallelize independent CPU-heavy tasks (pose per target/view) with bounded worker pools.
+- [ ] Standard practice: parallelize independent CPU-heavy tasks (pose per target/view) with bounded worker pools. *(Round-robin throttle in place; true thread pool deferred — MediaPipe holistic is not thread-safe.)*
 - [ ] State-of-the-art: add timeline tracing for queue wait vs compute time and schedule work by deadlines.
 
 #### 2.e. GPU-native keypoint extractor (move off MediaPipe)
@@ -455,10 +502,10 @@ Completed work against this roadmap, in commit order:
 - [ ] State-of-the-art: **Sapiens (Meta, 2024).** Best-in-class accuracy, larger VRAM footprint, batched. Overkill for live demo today, viable target if hardware scales.
 - [ ] Evaluation plan: small benchmark script — batched DWPose vs current MediaPipe on a recorded demo clip — comparing FPS at N = {1, 10, 20, 30} persons and per-keypoint agreement on the points that exist in both schemas. Decide adapter-vs-retrain from the agreement numbers and a held-out DAiSEE pass.
 
-### 3. Pipeline redundancy and 2D-first optimization gate
-- [ ] There is pipeline redundancy with double plotting and related duplicate work.
-- [ ] Streamline plotting/data paths before adding complexity.
-- [ ] Establish an efficiency gate for 2D perspective mode before proceeding to 360 feeds.
+### 3. Pipeline redundancy and 2D-first optimization gate (partially ✅)
+- [x] There is pipeline redundancy with double plotting and related duplicate work. *(Sowmya's matplotlib live-plot loop removed; publisher runs headless.)*
+- [x] Streamline plotting/data paths before adding complexity.
+- [ ] Establish an efficiency gate for 2D perspective mode before proceeding to 360 feeds. *(Gate is the 12 FPS floor under Item 2; not yet formalised as a regression check.)*
 - [ ] 360 processing currently scales roughly 4x and can drop FPS to less than 1, which is unacceptable for live use.
 
 **Proposed solutions**
@@ -499,10 +546,10 @@ Completed work against this roadmap, in commit order:
 - [ ] Standard practice: enforce an enrollment quality gate (minimum face-pixel size, frontal pose, sharpness) and prompt the user to re-enrol if not met, so the runtime envelope is predictable.
 - [ ] State-of-the-art: fuse face and body re-identification embeddings for longer-range identity persistence.
 
-### 6. Data saving overhead not yet demo-validated
-- [ ] The demo did not include data saving overhead.
-- [ ] Run end-to-end performance validation with save options enabled.
-- [ ] Quantify FPS and latency impact for `--save`, `--save-engagement`, and `--save-keypoints` in realistic multi-person sessions.
+### 6. Data saving overhead not yet demo-validated (partially ✅)
+- [x] The demo did not include data saving overhead. *(47-min canteen run with `--save-engagement` + `--save-keypoints` did not destabilise FPS; NPZ schema validated.)*
+- [x] Run end-to-end performance validation with save options enabled.
+- [ ] Quantify FPS and latency impact for `--save`, `--save-engagement`, and `--save-keypoints` in realistic multi-person sessions. *(Comparative no-save vs save benchmark still pending.)*
 
 **Proposed solutions**
 - [ ] Standard practice: benchmark no-save vs each save mode under the same scripted workload and report FPS/latency deltas.
@@ -518,4 +565,4 @@ Completed work against this roadmap, in commit order:
 
 ## 🗺️ Roadmap
 
-See [docs/NextSteps.md](docs/NextSteps.md) for planned features and technical details.
+See the **Post Jazzahead Demo Roadmap** above for the live tracker of efficiency, ID stability, and model-fairness work.

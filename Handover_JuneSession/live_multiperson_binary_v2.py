@@ -779,6 +779,14 @@ class MultiPersonEngagementSystem:
         # Publish throttle (1 Hz)
         self.last_publish_time = 0
         self.publish_interval = 1.0  # seconds
+        # Console-print throttle for the per-publish line: print every second
+        # for the first 3 publishes (so the user can confirm the pipeline is
+        # alive), then once per 60 s. Mirrors multiemotibit_UDP_SD_RFv2's
+        # throttling pattern to keep terminal I/O off the hot path.
+        self._console_pub_count = 0
+        self._console_pub_last = 0.0
+        self._console_pub_interval = 60.0
+        self._console_pub_warmup = 3
 
         # 2. Load YOLO (person detection)
         def _check_lfs(p):
@@ -858,6 +866,16 @@ class MultiPersonEngagementSystem:
         # Updated each time a track is seen; consulted by _evict_stale_tracks().
         self.person_last_seen = {}
         self._frame_counter = 0
+
+        # Display-label remap (issue 5): YOLO's bytetrack inflates the id space
+        # in crowded scenes (2k+ ids over a 47 min run). The raw ids are still
+        # logged to JSONL/NPZ for analysis, but the on-screen overlay uses a
+        # compact recyclable pool of P1/P2/... labels so the operator sees a
+        # stable, audience-sized set of names. Slots are returned to the pool
+        # when their underlying track is evicted by _evict_stale_tracks().
+        self._display_id_map = {}    # track_id -> "P12"
+        self._display_id_pool = []   # free integer slots, smallest-first
+        self._display_id_next = 1    # next never-used integer
 
         # Longest wall-clock buffer span across active tracks, refreshed at the
         # end of each process_frame / process_view. Read by the overlay so the
@@ -1115,6 +1133,7 @@ class MultiPersonEngagementSystem:
             self.person_buffers.pop(tid, None)
             self.person_scores.pop(tid, None)
             self.person_last_seen.pop(tid, None)
+            self._release_display_id(tid)
         if len(self.person_buffers) > MAX_TRACKED_IDS:
             ordered = sorted(self.person_last_seen.items(), key=lambda kv: kv[1])
             n_drop = len(self.person_buffers) - MAX_TRACKED_IDS
@@ -1124,6 +1143,43 @@ class MultiPersonEngagementSystem:
                 self.person_buffers.pop(tid, None)
                 self.person_scores.pop(tid, None)
                 self.person_last_seen.pop(tid, None)
+                self._release_display_id(tid)
+
+    # --- Display-label remap -------------------------------------------------
+    def display_label(self, track_id):
+        """Return a short, recyclable on-screen label (e.g. 'P3') for a YOLO
+        track id. Allocates the smallest free slot, or a fresh one if the
+        pool is empty. Slots are returned to the pool when the track is
+        evicted by _evict_stale_tracks(). Raw track_id is still kept in the
+        JSONL/NPZ logs for offline analysis."""
+        tid = int(track_id)
+        lbl = self._display_id_map.get(tid)
+        if lbl is not None:
+            return lbl
+        if self._display_id_pool:
+            slot = self._display_id_pool.pop(0)
+        else:
+            slot = self._display_id_next
+            self._display_id_next += 1
+        lbl = f"P{slot}"
+        self._display_id_map[tid] = lbl
+        return lbl
+
+    def _release_display_id(self, track_id):
+        tid = int(track_id)
+        lbl = self._display_id_map.pop(tid, None)
+        if lbl is None:
+            return
+        try:
+            slot = int(lbl[1:])
+        except ValueError:
+            return
+        # Insert in sorted order so display_label() always picks the smallest
+        # free slot first — keeps the visible numbers small and stable.
+        idx = 0
+        while idx < len(self._display_id_pool) and self._display_id_pool[idx] < slot:
+            idx += 1
+        self._display_id_pool.insert(idx, slot)
 
     # --- Time-windowed feature buffer (roadmap 2.c) -------------------------
     # Buffer entries are (monotonic_timestamp, features_flat) tuples. Stored in
@@ -1304,7 +1360,11 @@ class MultiPersonEngagementSystem:
                 payload = f"{crowd_average:.4f}"
                 self.redis_client.publish(REDIS_CHANNEL, payload)
                 self.last_publish_time = current_time
-                print(f"📡 Redis pub → {REDIS_CHANNEL}: {payload}")
+                self._console_pub_count += 1
+                if (self._console_pub_count <= self._console_pub_warmup
+                        or (current_time - self._console_pub_last) >= self._console_pub_interval):
+                    print(f"📡 Redis pub → {REDIS_CHANNEL}: {payload}")
+                    self._console_pub_last = current_time
             except Exception as e:
                 print(f"Redis Error: {e}")
 
@@ -1317,13 +1377,37 @@ SIDEBAR_W = 280  # pixel width of the EmotiBit physio sidebar panel
 # =============================================================================
 
 def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
-                          focus_target, sidebar_radio_rects, sidebar_w):
+                          focus_target, sidebar_radio_rects, sidebar_w,
+                          reconnect_rect_out=None):
     """Return a (h, sidebar_w, 3) uint8 image for the physio sidebar.
-    Mutates sidebar_radio_rects in place with (y_top, y_bot, serial) tuples."""
+    Mutates sidebar_radio_rects in place with (y_top, y_bot, serial) tuples.
+    If reconnect_rect_out is given, it is filled with a single
+    (x0, y0, x1, y1) tuple (sidebar-local coords) for the reconnect button."""
     sidebar = np.full((h, sidebar_w, 3), 28, dtype=np.uint8)
     cv2.putText(sidebar, "EmotiBit", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
     sidebar_radio_rects.clear()
+
+    # Reconnect button: a fixed strip at the bottom of the sidebar. Clicking it
+    # tells the EmotiBit publisher to re-run discovery without restarting the
+    # whole pipeline (see on_mouse). Drawn last (on top) but its geometry is
+    # reserved up-front so device rows never overlap it.
+    _BTN_H = 34
+    _BTN_M = 8
+    _btn_y0 = h - _BTN_H - _BTN_M
+    _btn_y1 = h - _BTN_M
+    _btn_x0 = 6
+    _btn_x1 = sidebar_w - 6
+
+    def _draw_reconnect_button():
+        cv2.rectangle(sidebar, (_btn_x0, _btn_y0), (_btn_x1, _btn_y1), (40, 95, 40), -1)
+        cv2.rectangle(sidebar, (_btn_x0, _btn_y0), (_btn_x1, _btn_y1), (80, 210, 80), 1)
+        cv2.putText(sidebar, "RECONNECT", (_btn_x0 + 12, _btn_y0 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (190, 255, 190), 1, cv2.LINE_AA)
+        cv2.putText(sidebar, "click to re-scan EmotiBits", (_btn_x0 + 12, _btn_y0 + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 200, 140), 1, cv2.LINE_AA)
+        if reconnect_rect_out is not None:
+            reconnect_rect_out[:] = [(_btn_x0, _btn_y0, _btn_x1, _btn_y1)]
 
     # Snapshot connected device serials once under the lock
     with emotibit_lock:
@@ -1343,11 +1427,12 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         cv2.putText(sidebar, "(start EmotiBit publisher)", (8, 95),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+        _draw_reconnect_button()
         return sidebar
 
     n = len(rows)
     # Scale row height to fit up to 6 devices: generous when few, compact when many
-    available_h = h - 28
+    available_h = h - 28 - (_BTN_H + 2 * _BTN_M)
     row_h = max(60, min(140, available_h // max(n, 1)))
     for i, (serial, is_enrolled) in enumerate(rows):
         y0 = 28 + i * row_h
@@ -1369,103 +1454,196 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             cv2.line(sidebar, (rb_cx - 5, rb_cy), (rb_cx + 5, rb_cy),
                      (80, 80, 80), 1, cv2.LINE_AA)
         # Serial label — truncate long IDs to fit. Unassigned dimmed.
-        label = serial if len(serial) <= 14 else serial[-14:]
+        # Last 5 chars is enough to disambiguate wearers in operator view; the
+        # full ID is in the CSV. Keeps the row header clear for STROC / HRSD.
+        label = serial if len(serial) <= 5 else serial[-5:]
         label_col = (220, 220, 220) if is_enrolled else (150, 150, 150)
         cv2.putText(sidebar, f"#{label}", (22, y0 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, label_col, 1, cv2.LINE_AA)
         if not is_enrolled:
             cv2.putText(sidebar, "unassigned", (22, y0 + 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1, cv2.LINE_AA)
-        # HR — same line as label, right-aligned area
+        # ------ Snapshot subscriber state under lock ------
         with emotibit_lock:
             d = emotibit_data.get(serial, {})
-            snap_eda    = list(d.get('eda', []))
-            snap_hr     = list(d.get('hr',  []))
-            snap_eda_sd = list(d.get('eda_sd', []))
-            snap_hr_sd  = list(d.get('hr_sd',  []))
+            snap_eda_z   = list(d.get('eda_z',  []))
+            snap_hr_z    = list(d.get('hr_z',   []))
+            snap_stroc_z = list(d.get('temperature_roc_z', []))
             snap_metrics = dict(d.get('metrics', {}))
-        if snap_hr:
-            hr_text = f"{snap_hr[-1]:.0f}bpm"
-            hr_col  = (100, 210, 100)
-        elif snap_hr_sd:
-            hr_text = f"HR SD {snap_hr_sd[-1]:.2f}"
-            hr_col  = (100, 210, 100)
-        else:
-            hr_text = "--"
-            hr_col  = (80, 80, 80)
-        cv2.putText(sidebar, hr_text, (sidebar_w - 86, y0 + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, hr_col, 1, cv2.LINE_AA)
-        # Temp ROC SD — small secondary readout right under HR
-        temp_roc = snap_metrics.get('temperature_roc_sd')
-        if temp_roc is not None:
-            cv2.putText(sidebar, f"Ṫ SD {temp_roc:.3f}",
-                        (sidebar_w - 86, y0 + 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (170, 170, 220), 1, cv2.LINE_AA)
-        # EDA spline plot — fills remaining vertical space.
-        # Prefer raw EDA stream when available; otherwise plot the EDA SD stream
-        # (which is what the SD-pipeline publishes since May 28 2026).
-        if snap_eda:
-            plot_arr   = snap_eda
-            plot_label = "EDA"
-            plot_unit  = "µS"
-            line_col   = (80, 200, 255)
-        elif snap_eda_sd:
-            plot_arr   = snap_eda_sd
-            plot_label = "EDA SD"
-            plot_unit  = ""
-            line_col   = (80, 200, 255)
-        else:
-            plot_arr = []
-            plot_label = "EDA"
-            plot_unit = ""
-            line_col = (80, 200, 255)
+
+        # ------ Unified per-wearer physio panel ------
+        # All three traces are unitless per-wearer session-baseline z-scores
+        # (this wearer's deviation from their own mean, in their own SD units),
+        # so plotting HR / EDA / STROC on a single +-3 SD axis is meaningful.
+        # The header shows live numeric values colour-keyed to each spline.
+        # Trace colour DARKENS as |z| grows (more saturated near +-2 SD,
+        # paler near 0) so the eye is drawn to excursions without losing the
+        # quieter traces. Off-wrist suppresses everything and watermarks the
+        # panel rather than faking a zero baseline reading.
+        Z_SOFT = 1.5
+        Z_HARD = 2.0
+        Z_SAT  = 3.0  # axis saturation = full +-3 SD
+        # Publisher emits one physio_metrics every 1.0s, so 10 samples == 10s window.
+        PLOT_WINDOW_SAMPLES = 10
+        # Base hues (BGR). Light variants are used near 0; full saturation past |z|=2.
+        # NB: 'TEMP' label refers to skin-temp rate-of-change (temperature_roc_z)
+        # -- shorter than STROC and matches operator vocabulary.
+        TRACES = (
+            # (label, source_list, last_metric_key, light_col, full_col)
+            ('HR',   snap_hr_z,    'hr_z',              (180, 235, 180), ( 70, 220,  70)),
+            ('EDA',  snap_eda_z,   'eda_z',             (220, 230, 190), (255, 200,  60)),
+            ('TEMP', snap_stroc_z, 'temperature_roc_z', (220, 200, 230), (200, 100, 200)),
+        )
+
+        is_calibrating = bool(snap_metrics.get('calibrating', False))
+        is_off_wrist   = bool(snap_metrics.get('off_wrist', False))
+
+        # ----- Header: three small colour-keyed readouts, right-aligned.
+        # Label (HR / EDA / TEMP) + number; colour matches the spline so it
+        # doubles as the in-panel legend. When |z| >= Z_HARD the readout is
+        # promoted: thicker stroke + a faint filled pill behind it, so the
+        # operator's eye is pulled to the wearer even out of the corner of
+        # the screen.
+        header_y = y0 + 16
+        cur_x    = sidebar_w - 6
+        font_sc  = 0.34
+        for label, _hist, key, _light, full in reversed(TRACES):
+            val = snap_metrics.get(key)
+            if val is None:
+                txt = f"{label} --"
+                col = (80, 80, 80)
+                hot = False
+            else:
+                txt = f"{label} {val:+.2f}"
+                col = full
+                hot = abs(val) >= Z_HARD
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_sc, 1)
+            tx = max(4, cur_x - tw)
+            if hot:
+                # Translucent pill in the trace's full colour at ~22% opacity.
+                pad_x, pad_y = 3, 2
+                px0, py0 = tx - pad_x, header_y - th - pad_y
+                px1, py1 = tx + tw + pad_x, header_y + pad_y
+                overlay = sidebar.copy()
+                cv2.rectangle(overlay, (px0, py0), (px1, py1), col, -1)
+                cv2.addWeighted(overlay, 0.22, sidebar, 0.78, 0, sidebar)
+            cv2.putText(sidebar, txt, (tx, header_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_sc, col,
+                        2 if hot else 1, cv2.LINE_AA)
+            cur_x -= tw + 8
+
+        # ----- Plot panel: fixed +-Z_SAT axis below the header.
         plot_x  = 4
-        plot_y  = y0 + 22
+        plot_y  = y0 + 24
         plot_pw = sidebar_w - 8
         plot_ph = y1 - plot_y - 3
-        if plot_ph > 12:
-            cv2.rectangle(sidebar, (plot_x, plot_y),
-                          (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
-            if len(plot_arr) > 2:
-                arr = np.array(plot_arr, dtype=np.float32)
-                # True rolling-window zoom: stretch the spline to the full
-                # height of the plot using the 5th-95th percentile so a single
-                # startup spike does not flatten the rest of the trace. Tiny
-                # variations therefore occupy the full y-axis.
-                lo, hi = np.percentile(arr, [5.0, 95.0])
-                lo, hi = float(lo), float(hi)
-                if hi - lo < 1e-9:   # all samples (almost) identical
-                    mn, mx = float(arr.min()), float(arr.max())
-                    if mx - mn < 1e-9:
-                        mid = float(arr[-1])
-                        lo, hi = mid - 0.5, mid + 0.5  # arbitrary unit window
-                    else:
-                        lo, hi = mn, mx
-                rng = hi - lo
-                arr_clipped = np.clip(arr, lo, hi)
+        if plot_ph <= 12:
+            if i < n - 1:
+                cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
+            continue
+
+        cv2.rectangle(sidebar, (plot_x, plot_y),
+                      (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
+
+        # Axis grid: zero baseline + +-Z_HARD reference lines only.
+        # (Previously also drew +-Z_SOFT in grey -- removed as visual clutter;
+        # the colour-saturation lerp already conveys 'getting noteworthy' and
+        # the red-tinted +-2 lines mark the alert threshold cleanly.)
+        rng    = 2.0 * Z_SAT
+        def _y_for(z):
+            return int(plot_y + plot_ph - 2 - ((float(z) + Z_SAT) / rng * (plot_ph - 4)))
+        for z_ref, col_ref in ((0.0, (90, 90, 90)),
+                               (+Z_HARD, (60, 60, 120)), (-Z_HARD, (60, 60, 120))):
+            yref = _y_for(z_ref)
+            cv2.line(sidebar, (plot_x + 1, yref), (plot_x + plot_pw - 2, yref),
+                     col_ref, 1, cv2.LINE_AA)
+
+        # Axis labels (top / mid / bottom) -- only place "SD" appears.
+        lbl_col = (75, 120, 150)
+        cv2.putText(sidebar, f"+{Z_SAT:.0f} SD", (plot_x + 2, plot_y + 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
+        cv2.putText(sidebar, f"-{Z_SAT:.0f} SD",
+                    (plot_x + 2, plot_y + plot_ph - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
+
+        if is_calibrating and not any((snap_hr_z, snap_eda_z, snap_stroc_z)):
+            remaining = snap_metrics.get('calibration_remaining_s')
+            msg = f"calibrating {remaining:.0f}s" if remaining is not None else "calibrating..."
+            cv2.putText(sidebar, msg,
+                        (plot_x + 4, plot_y + plot_ph // 2 + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (110, 160, 110), 1, cv2.LINE_AA)
+        else:
+            any_drawn = False
+            for label, hist, _key, light, full in TRACES:
+                if len(hist) < 2:
+                    continue
+                any_drawn = True
+                # Rolling 10s window: only show the tail. Older samples stay in
+                # the deque (handy for debugging) but the plot stops compressing
+                # an ever-growing history into the same panel width.
+                tail = list(hist)[-PLOT_WINDOW_SAMPLES:]
+                if len(tail) < 2:
+                    continue
+                arr = np.clip(np.array(tail, dtype=np.float32), -Z_SAT, Z_SAT)
                 xs = np.linspace(plot_x + 1, plot_x + plot_pw - 2,
-                                 len(arr_clipped)).round().astype(np.int32)
-                ys = (plot_y + plot_ph - 2
-                      - ((arr_clipped - lo) / rng * (plot_ph - 4))).round().astype(np.int32)
-                ys = np.clip(ys, plot_y, plot_y + plot_ph - 2)
-                pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
-                cv2.polylines(sidebar, [pts], False, line_col, 1, cv2.LINE_AA)
-                lbl_col = (75, 120, 150)
-                cv2.putText(sidebar, f"{plot_label} {hi:.2f}{plot_unit}",
-                            (plot_x + 2, plot_y + 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                cv2.putText(sidebar, f"{lo:.2f}",
-                            (plot_x + 2, plot_y + plot_ph - 3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
-                cv2.putText(sidebar, f"{arr[-1]:.3f}",
-                            (sidebar_w - 46, plot_y + 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, line_col, 1, cv2.LINE_AA)
-            else:
+                                 len(arr)).round().astype(np.int32)
+                ys = np.array([_y_for(v) for v in arr], dtype=np.int32)
+                abs_z = np.abs(arr)
+                # Per-segment colour: lerp light -> full as |z| goes 0 -> Z_HARD,
+                # then clamp at full beyond Z_HARD. Vectorised would be nicer but
+                # the per-trace length is bounded (deque maxlen=180) so this loop
+                # is cheap enough.
+                light_arr = np.array(light, dtype=np.float32)
+                full_arr  = np.array(full,  dtype=np.float32)
+                for k in range(len(xs) - 1):
+                    zmax = float(max(abs_z[k], abs_z[k + 1]))
+                    t = min(1.0, zmax / Z_HARD)
+                    seg_col = tuple(int(c) for c in (light_arr * (1.0 - t) + full_arr * t))
+                    # Thicker stroke once the segment crosses the alert band:
+                    # the colour lerp alone is too subtle on a small panel.
+                    seg_thick = 2 if zmax >= Z_HARD else 1
+                    cv2.line(sidebar, (int(xs[k]), int(ys[k])),
+                             (int(xs[k + 1]), int(ys[k + 1])),
+                             seg_col, seg_thick, cv2.LINE_AA)
+                # End-of-trace marker: small filled dot at the latest sample,
+                # growing from r=2 to r=4 as |z| climbs to Z_HARD, then a thin
+                # bright halo if we're in the alert band. Gives a stable focal
+                # point for the eye and makes high-|z| wearers 'pop' from a
+                # multi-row sidebar.
+                last_abs = float(abs_z[-1])
+                t_last   = min(1.0, last_abs / Z_HARD)
+                dot_r    = int(round(2 + 2 * t_last))
+                dot_col  = tuple(int(c) for c in (light_arr * (1.0 - t_last) + full_arr * t_last))
+                cv2.circle(sidebar, (int(xs[-1]), int(ys[-1])), dot_r,
+                           dot_col, -1, cv2.LINE_AA)
+                if last_abs >= Z_HARD:
+                    cv2.circle(sidebar, (int(xs[-1]), int(ys[-1])),
+                               dot_r + 2, (255, 255, 255), 1, cv2.LINE_AA)
+            if not any_drawn:
                 cv2.putText(sidebar, "Physio: no signal",
                             (plot_x + 4, plot_y + plot_ph // 2 + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
+
+        # Off-wrist watermark: drawn over everything so it's unambiguous that
+        # the panel content is stale / suppressed and not a real "near baseline"
+        # reading. The publisher already drops *_z keys when off_wrist=True, so
+        # the splines will gap out within a few render frames as their deques
+        # stop receiving samples; this label explains *why*.
+        if is_off_wrist:
+            wm = "OFF-WRIST"
+            (ww, wh), _ = cv2.getTextSize(wm, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            wx = plot_x + (plot_pw - ww) // 2
+            wy = plot_y + (plot_ph + wh) // 2
+            # Faint dim overlay so traces are still visible but clearly subdued.
+            overlay = sidebar.copy()
+            cv2.rectangle(overlay, (plot_x, plot_y),
+                          (plot_x + plot_pw, plot_y + plot_ph), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.45, sidebar, 0.55, 0, sidebar)
+            cv2.putText(sidebar, wm, (wx, wy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 90, 220), 1, cv2.LINE_AA)
         if i < n - 1:
             cv2.line(sidebar, (4, y1), (sidebar_w - 4, y1), (50, 50, 50), 1)
+    _draw_reconnect_button()
     return sidebar
 
 
@@ -1554,6 +1732,9 @@ def main():
     registration_mode = False
     registration_flash_until = 0  # timestamp for on-screen flash message
     registration_flash_msg = ''
+    # Reconnect button flash (separate from registration so they don't clobber)
+    reconnect_flash_until = 0.0
+    reconnect_flash_msg = ''
     
     # Face ID throttle: run MTCNN matching every N frames, carry forward results
     FACE_ID_INTERVAL = 10  # frames between face matching runs
@@ -1569,16 +1750,33 @@ def main():
     emotibit_data = {}        # {serial: {'eda': deque, 'hr': deque, 'metrics': dict}}
     emotibit_lock = threading.Lock()
     sidebar_radio_rects = []  # [(y_top, y_bot, serial), ...] updated each frame
+    reconnect_btn_rect = []   # [(x0, y0, x1, y1)] sidebar-local, updated each frame
     video_w_box    = [0]      # video pixel width, set on first frame
     _mouse_cb_set  = [False]  # set mouse callback once after first imshow
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal focus_target
+        nonlocal focus_target, reconnect_flash_until, reconnect_flash_msg
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         vw = video_w_box[0]
         if vw == 0 or x < vw:   # click is inside the video, not the sidebar
             return
+        lx = x - vw             # x relative to the sidebar's left edge
+        # Reconnect button (sidebar-local coords) takes priority over radio rows.
+        if reconnect_btn_rect:
+            bx0, by0, bx1, by1 = reconnect_btn_rect[0]
+            if bx0 <= lx <= bx1 and by0 <= y <= by1:
+                ok = False
+                try:
+                    if system.redis_client is not None:
+                        system.redis_client.publish('emotibit:reconnect', '1')
+                        ok = True
+                except Exception as e:
+                    print(f"\u26a0\ufe0f  reconnect publish failed: {e}")
+                reconnect_flash_msg = ('Reconnecting EmotiBits...' if ok
+                                       else 'Redis unavailable - cannot reconnect')
+                reconnect_flash_until = time.time() + 2.5
+                return
         for (y0, y1, serial) in sidebar_radio_rects:
             if y0 <= y <= y1:
                 focus_target = serial if focus_target != serial else 'all'
@@ -1606,6 +1804,12 @@ def main():
                                 'hr':  deque(maxlen=125),
                                 'eda_sd': deque(maxlen=180),
                                 'hr_sd':  deque(maxlen=180),
+                                # Three z-score history buffers powering the unified
+                                # ±3 SD spline panel. 180 samples ≈ 3 min at the
+                                # publisher's 1Hz emit cadence for *_z values.
+                                'eda_z':  deque(maxlen=180),
+                                'hr_z':   deque(maxlen=180),
+                                'temperature_roc_z': deque(maxlen=180),
                                 'metrics': {},
                             }
                         if 'EDA_filtered' in data:
@@ -1631,6 +1835,40 @@ def main():
                                         emotibit_data[serial]['eda_sd'].append(v)
                                     elif target_key == 'hr_sd':
                                         emotibit_data[serial]['hr_sd'].append(v)
+                            # Per-wearer z-scores (post-calibration). The publisher omits any
+                            # *_z key while calibrating OR while off-wrist, and omits
+                            # individual ones whose underlying channel currently has no
+                            # Welford samples. Mirror that: only stash a value when
+                            # present, never carry a stale one.
+                            calib = bool(data.get('calibrating', False))
+                            emotibit_data[serial]['metrics']['calibrating'] = calib
+                            emotibit_data[serial]['metrics']['off_wrist'] = bool(data.get('off_wrist', False))
+                            if 'calibration_remaining_s' in data:
+                                emotibit_data[serial]['metrics']['calibration_remaining_s'] = float(data['calibration_remaining_s'])
+                            for zk in ('hr_z', 'eda_z', 'ibi_z', 'temperature_roc_z', 'scr_frequency_z'):
+                                if zk in data and data[zk] is not None:
+                                    try:
+                                        emotibit_data[serial]['metrics'][zk] = float(data[zk])
+                                    except (TypeError, ValueError):
+                                        pass
+                                else:
+                                    # Drop a stale value once the publisher stops sending it,
+                                    # so the GUI text falls back to '--' instead of freezing.
+                                    emotibit_data[serial]['metrics'].pop(zk, None)
+                            # Spline history: only push during a valid (non-calibrating,
+                            # on-wrist) reading. The plot then naturally gaps when contact
+                            # is lost rather than freezing on the last good value.
+                            if not calib:
+                                for zk, deque_key in (
+                                    ('hr_z', 'hr_z'),
+                                    ('eda_z', 'eda_z'),
+                                    ('temperature_roc_z', 'temperature_roc_z'),
+                                ):
+                                    if zk in data and data[zk] is not None:
+                                        try:
+                                            emotibit_data[serial][deque_key].append(float(data[zk]))
+                                        except (TypeError, ValueError):
+                                            pass
                 except Exception:
                     pass
         except Exception as e:
@@ -2235,9 +2473,9 @@ def main():
                             bar_h = 4
                             bar_w = int((x2 - x1) * bf)
                             cv2.rectangle(view_bgr, (x1, bar_y), (x1 + bar_w, bar_y + bar_h), (255, 255, 0), -1)
-                            plabel = f"ID:{pid} {score:.0%} conf:{bf:.0%}"
+                            plabel = f"{system.display_label(pid)} {score:.0%} conf:{bf:.0%}"
                         else:
-                            plabel = f"ID:{pid} {score:.0%}"
+                            plabel = f"{system.display_label(pid)} {score:.0%}"
                         cv2.putText(view_bgr, plabel, (x1, y1 - 10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                 
@@ -2302,6 +2540,10 @@ def main():
                 pid = person['id']
                 bf = person.get('buffer_fill', 1.0)
                 identified = person.get('identified_as')
+                # Fresh-MP marker: this person got a MediaPipe pass this frame
+                # (vs reusing cached score). Helps visualise the round-robin
+                # so the throttle ratio in the HUD is not just a static number.
+                fresh_mp = person.get('keypoints') is not None
                 
                 # Determine if this person should be highlighted
                 # Magenta box only when a specific EmotiBit is selected for this person
@@ -2321,8 +2563,10 @@ def main():
                     # Standard engagement gradient box
                     color = (0, int(255 * score), int(255 * (1-score)))
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    # Always show EmotiBit serial if enrolled; fall back to auto ID
-                    id_str = identified if identified else f"ID:{pid}"
+                    # Always show EmotiBit serial if enrolled; otherwise a short,
+                    # recyclable display label (P1/P2/...) instead of the raw
+                    # YOLO track id which inflates rapidly in dense crowds.
+                    id_str = identified if identified else system.display_label(pid)
                     if bf < 0.9:
                         label = f"{id_str} {score:.0%} conf:{bf:.0%}"
                         cv2.putText(display_frame, label, (x1, y1 - 10),
@@ -2336,6 +2580,11 @@ def main():
                     else:
                         cv2.putText(display_frame, f"{id_str} {score:.0%}", (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Fresh-MP marker: small filled dot top-right of bbox when this
+                # person was MediaPipe-refreshed this frame. Visualises the
+                # round-robin rotation so MP: x/N is not just a static digit.
+                if fresh_mp:
+                    cv2.circle(display_frame, (x2 - 5, y1 + 5), 3, (0, 255, 255), -1)
         
         # Calculate live FPS
         frame_duration = time.time() - frame_start_time
@@ -2385,7 +2634,8 @@ def main():
         context_seconds = system.current_context_seconds
         throttle_str = ""
         if system.last_total_count > 0 and system.last_selected_count < system.last_total_count:
-            throttle_str = f" | MP: {system.last_selected_count}/{system.last_total_count}"
+            throttle_str = (f" | MP: {system.last_selected_count}/{system.last_total_count}"
+                            f" rr{system._rr_offset}")
         fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s{throttle_str}"
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
@@ -2418,6 +2668,16 @@ def main():
             cv2.putText(display_frame, flash_text, (fx, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
             cv2.putText(display_frame, flash_text, (fx, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, IDENTIFIED_COLOR, 2)
 
+        # Reconnect flash message (green, below centre so it doesn't collide
+        # with the registration flash)
+        if reconnect_flash_until > time.time():
+            rf_text = reconnect_flash_msg
+            (rtw, rth), _ = cv2.getTextSize(rf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            rx = (w - rtw) // 2
+            ry = h // 2 + 50
+            cv2.putText(display_frame, rf_text, (rx, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+            cv2.putText(display_frame, rf_text, (rx, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 255, 120), 2)
+
         # --- DATA LOGGING ---
         if logger:
             logger.log_frame(people_data, crowd_avg, live_fps, is_360=is_360, frame_size=(w, h))
@@ -2435,6 +2695,7 @@ def main():
             h,
             face_id.enrolled_names if face_id and not is_360 else [],
             emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
+            reconnect_btn_rect,
         )
         # Lazily create the main window as resizable on the very first frame.
         # Doing this here (after any --select-camera preview has been torn
@@ -2516,6 +2777,7 @@ def main():
                         face_id.enrolled_names if face_id and not is_360 else [],
                         emotibit_data, emotibit_lock, focus_target,
                         sidebar_radio_rects, SIDEBAR_W,
+                        reconnect_btn_rect,
                     )
                     cv2.imshow(_WIN_NAME, np.hstack([overlay, _sb_reg]))
                     k = cv2.waitKey(50) & 0xFF
