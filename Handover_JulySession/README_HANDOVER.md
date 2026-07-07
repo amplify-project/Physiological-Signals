@@ -66,17 +66,17 @@ This will:
 
 ---
 
-### Every session — run in order
+### Every session — just double-click the batch files, in order
 
-Open **three separate terminal/command prompt windows** and run one script in each:
+**No terminal or typing needed** — from Windows Explorer, double-click the three numbered `.bat` files **in order**. Each opens its own window; leave all three open for the whole session, and wait for each to be ready before starting the next:
 
-| Window | Script | Purpose |
-|--------|--------|---------|
-| 1 | `1_START_REDIS.bat` | Redis message broker (keep open the whole session) |
-| 2 | `2_START_EMOTIBIT.bat` | EmotiBit multi-device EDA/HR processing → publishes to Redis |
-| 3 | `3_START_ENGAGEMENT.bat` | Camera + AI engagement inference → publishes to Redis |
+| # | Double-click | What happens |
+|---|--------------|--------------|
+| 1 | `1_START_REDIS.bat` | Starts the Redis message broker — keep this window open the whole session |
+| 2 | `2_START_EMOTIBIT.bat` | Discovers your EmotiBit(s) and publishes EDA/HR to Redis (press **ENTER** once your devices are listed) |
+| 3 | `3_START_ENGAGEMENT.bat` | Starts the camera + AI engagement inference and opens the GUI |
 
-**Order matters** — start Redis first, then EmotiBit, then Engagement.
+**Order matters** — Redis (1) must be running before EmotiBit (2), and both before Engagement (3).
 
 > **VS Code users:** The batch files are designed to be double-clicked from Explorer (each opens its own `cmd.exe` window). Inside VS Code's integrated terminal they all run in the same tab and block each other. Either double-click from Explorer, or open three separate VS Code terminal tabs and run the venv + script directly:
 > ```
@@ -271,6 +271,74 @@ Camera feed         ──────▶  live_multiperson_binary_v2.py
             AR Glasses (Unity)            Any other subscriber
             UnityRedisSubscriber.cs       test_subscriber.py
 ```
+
+---
+
+## ⚖️ EU AI Act & Data-Protection Compliance
+
+> **Not legal advice.** This section is an engineering-informed summary to guide
+> compliance work, not a legal determination. Verify with your DPO / legal
+> counsel and the official
+> [EU AI Act Compliance Checker](https://ai-act-service-desk.ec.europa.eu/en/eu-ai-act-compliance-checker).
+
+This system is **in scope** of Regulation (EU) 2024/1689 (the **AI Act**) and the
+GDPR, because it combines three heavily regulated capabilities:
+
+- **Emotion recognition** — engagement/affect inferred from face + pose video (`live_multiperson_binary_v2.py`).
+- **Biometric identification** — face matching / enrolment (`face_identifier.py`, VGGFace2 embeddings).
+- **Physiological inference** — EmotiBit EDA/HR → valence/arousal (`multiemotibit_UDP_SD_RFv2.py`).
+
+Face embeddings and physiological readings are **special-category personal data**.
+
+### Key legal touchpoints
+
+| Ref | Obligation | Relevance here |
+|-----|-----------|----------------|
+| **Art. 5(1)(f)** | Emotion recognition is **prohibited in workplace & education** (narrow medical/safety exceptions), in force since **2 Feb 2025** | ✅ OK for live-events/audience use; ⛔ **must not** be redeployed in classrooms, staff or training settings |
+| **Art. 50** | Deployers of emotion-recognition / biometric-categorisation systems must **inform the people exposed** | Requires clear audience notice/signage + information notice |
+| **Annex III** | Biometric & some emotion-recognition uses may be **high-risk** → risk mgmt, data governance, logging, human oversight, accuracy docs, registration | Confirm final risk class via the checker |
+| **GDPR Art. 9 / 35** | Special-category data needs an explicit lawful basis + a **DPIA** | Face embeddings + physio signals |
+| **Timeline** | Prohibitions: Feb 2025 · Transparency (Art. 50): Aug 2026 · High-risk: Aug 2026–2027 | Plan accordingly |
+
+### Compliance checklist
+
+Tick items as they are completed and evidenced. Most are **team/legal actions**,
+not code changes.
+
+**Scope & classification**
+- [ ] Run the official [EU AI Act Compliance Checker](https://ai-act-service-desk.ec.europa.eu/en/eu-ai-act-compliance-checker) and archive the result
+- [ ] Record our **role(s)**: provider (building) and/or deployer (operating)
+- [ ] Document the **intended purpose** and an explicit statement that it is **not** for workplace/education (Art. 5(1)(f))
+- [ ] Confirm final **risk classification** (prohibited / high-risk / limited-risk + transparency)
+
+**Transparency (Art. 50)**
+- [ ] Audience **signage / notice** at the venue before capture
+- [ ] Written **information notice** (what is captured, why, retention, contact, rights)
+- [ ] On-device / on-screen indication that emotion & biometric processing is active
+
+**Data protection (GDPR)**
+- [ ] Complete a **DPIA** covering biometric + physiological processing
+- [ ] Define **lawful basis** (explicit consent for special-category data where required)
+- [ ] Set and enforce **retention limits** for face embeddings, physio CSVs and session recordings
+- [ ] **Data minimisation** review; document who can access stored data and how it's secured
+- [ ] Data Processing Agreements with any third parties / cloud
+
+**If high-risk (Annex III)**
+- [ ] Risk-management system and technical documentation (Annex IV)
+- [ ] Data governance / dataset documentation for the trained models
+- [ ] Event **logging & traceability** of operation
+- [ ] Defined **human oversight** measures
+- [ ] **Accuracy, robustness & bias** evaluation documented
+- [ ] Registration in the EU database (where applicable)
+
+### Privacy-supporting measures already in the design
+
+These are engineering facts about the current build — helpful evidence, not proof of full compliance:
+
+- **Registered-people-only mode** — only enrolled (consented) participants are scored, drawn and logged; bystanders are tracked by YOLO solely to enable enrolment and are **not** scored, displayed or aggregated.
+- **Recyclable display IDs** (`P1`, `P2`, …) are shown on screen instead of raw identifiers.
+- **Off-wrist / stale-data handling** — physiological z-scores are dropped (not faked) when sensor contact is lost, avoiding misleading inferences.
+- **Local-first data flow** — Redis and all processing run on `localhost`; nothing is sent off-device by default.
 
 ---
 
