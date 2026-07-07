@@ -6,3 +6,5 @@
 # Keep these weights as regular git blobs.
 Handover_JuneSession/**/*.pth -filter -diff -merge -text
 Handover_JuneSession/**/*.pt  -filter -diff -merge -text
+Handover_JulySession/**/*.pth -filter -diff -merge -text
+Handover_JulySession/**/*.pt  -filter -diff -merge -text

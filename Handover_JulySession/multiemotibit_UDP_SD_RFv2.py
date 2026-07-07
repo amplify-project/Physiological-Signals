@@ -79,9 +79,19 @@ IBI_MEDIAN_KERNEL  = 3        # median pre-filter on per-beat IBI
 # per second this is ~5 s, which is the smallest statistically valid warm-up.
 # We deliberately do NOT impose any extra fixed wall-clock wait on top of that,
 # so plotting begins almost immediately once a sensor is fitted (first fit or
-# any subsequent re-fit after a swap reset).
-CALIBRATION_SECONDS = 5       # minimal warm-up window (matches the sample floor)
-BASELINE_MIN_SAMPLES = 5      # Welford samples needed before a z-score is valid
+# any subsequent re-fit after a swap reset). The baseline is an EXPANDING window:
+# z-scores publish as soon as the floor is met and keep getting more accurate as
+# Welford accumulates more samples (it converges over ~60-90 s, but plotting no
+# longer waits for that).
+CALIBRATION_SECONDS = 2       # minimal warm-up window (matches the sample floor)
+BASELINE_MIN_SAMPLES = 2      # Welford samples needed before a z-score is valid
+# Hard cap on how long the expanding baseline keeps accumulating. After this the
+# mean/SD freeze and every later sample is scored against that fixed reference.
+# Without it, a wearer who stays aroused for the whole (often <=90 s) wear slowly
+# drags their own mean up, so it takes ever more arousal to register the same z --
+# the elevation normalises itself away. Welford has converged by ~60 s anyway, so
+# freezing then keeps sustained elevations visible at negligible accuracy cost.
+BASELINE_CAP_SECONDS = 60
 Z_SOFT_THRESHOLD = 1.5        # amber GUI indicator (~13% fire rate)
 Z_HARD_THRESHOLD = 2.0        # red GUI indicator + logged event (~5%, matches published methodology)
 # Wearer-swap auto-detection (pinned-floor heuristic).
@@ -578,12 +588,16 @@ class DeviceAggregator:
                 if np.isfinite(m):
                     temp_roc_repr = m
 
-        # Update Welford with the per-channel representative
-        if hr_repr is not None: self.welford['hr'].update(hr_repr)
-        if eda_repr is not None: self.welford['eda'].update(eda_repr)
-        if ibi_repr is not None: self.welford['ibi'].update(ibi_repr)
-        if temp_roc_repr is not None: self.welford['temperature_roc'].update(temp_roc_repr)
-        if scr_repr is not None: self.welford['scr_frequency'].update(scr_repr)
+        # Update Welford with the per-channel representative -- but only while the
+        # baseline is still expanding. Once BASELINE_CAP_SECONDS has elapsed the
+        # mean/SD freeze, so sustained arousal is scored against the early-wear
+        # reference instead of inflating it.
+        if age_s < BASELINE_CAP_SECONDS:
+            if hr_repr is not None: self.welford['hr'].update(hr_repr)
+            if eda_repr is not None: self.welford['eda'].update(eda_repr)
+            if ibi_repr is not None: self.welford['ibi'].update(ibi_repr)
+            if temp_roc_repr is not None: self.welford['temperature_roc'].update(temp_roc_repr)
+            if scr_repr is not None: self.welford['scr_frequency'].update(scr_repr)
 
         # Capture baseline skin temperature at end of calibration window
         # (used as the reference for swap detection's temperature step).

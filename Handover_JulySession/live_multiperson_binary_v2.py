@@ -87,12 +87,11 @@ import shutil
 from face_identifier import FaceIdentifier, IDENTIFIED_COLOR
 
 # Shared async logger (writes to data/logs/engagement/<ts>.log).
-# Imported via a sys.path insert so the script still works when launched
-# directly (not as a package).
+# In the handover folder applog.py sits beside this script.
 import sys as _sys
-_repo_root = Path(__file__).resolve().parents[2]
-if str(_repo_root / 'src') not in _sys.path:
-    _sys.path.insert(0, str(_repo_root / 'src'))
+_here = Path(__file__).resolve().parent
+if str(_here) not in _sys.path:
+    _sys.path.insert(0, str(_here))
 from applog import setup_logging, install_excepthook  # noqa: E402
 import logging as _logging
 log = _logging.getLogger('engagement')

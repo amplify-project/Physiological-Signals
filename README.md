@@ -13,7 +13,7 @@ Work should proceed from Sowmya's `amplify-project/Physiological-Signals` remote
 - Computer-vision engagement inference, multi-person tracking, face registration, 360-video support, logging, analysis, and training utilities are now in the project-level `scripts/`, `src/`, `models/`, and `docs/` folders.
 - Sowmya's newer EmotiBit physiological pipeline is now the project-level Physio implementation in `physio/multiemotibit_UDP_SD_RFv2.py`.
 - The multiperson GUI consumes the new physiological standard-deviation stream (`eda_sd` and `hr_sd`) from `device:{serial}:physio_metrics`.
-- `Handover_JuneSession/` remains as the up-to-date handover package and reference copy for the demo-ready workflow.
+- `Handover_JulySession/` remains as the up-to-date handover package and reference copy for the demo-ready workflow.
 
 In short: clone and work from this repository for future changes to either the vision or physiological parts of the pipeline.
 
@@ -125,6 +125,8 @@ python scripts/inference/console_subscriber.py
 
 **Output**: Crowd engagement score (0.0-1.0) published to Redis channel `engagement_score` at 1 Hz. Visual overlay shows red→green engagement bar at top of window. Progressive confidence scoring produces initial estimates within ~1 second of launch, with per-person confidence indicators during buffer ramp-up. Data logging is opt-in via `--save` (both), `--save-engagement` (JSONL only), or `--save-keypoints` (NPZ only). Sessions are saved to `data/sessions/`.
 
+> **Registered-only engagement (29 June):** the crowd score now aggregates only people identified by facial recognition as **registered** attendees (the EmotiBit-wearing parents), not the whole crowd. Bystanders are still YOLO-tracked (so they can be face-matched and enrolled) but skip MediaPipe + the transformer entirely and are **not** drawn — only registered parents get bounding boxes, restoring the 12 fps floor. A registered parent's box turns **magenta** only when their EmotiBit row is selected in the sidebar, for at-a-glance owner identification. The physio sidebar now reflows to **two columns** beyond four wearers (up to 8 combos). With face ID active (2D), registered-only stays on even before anyone enrols — **zero registered means zero crowd score** (no bystander is ever averaged in). Only `--no-face-id` or 360° mode (no per-face matching) falls back to whole-crowd aggregation.
+
 ---
 
 ## 📋 Requirements
@@ -183,7 +185,7 @@ The script verifies the output round-trips under `weights_only=True` before
 overwriting. **Do not** revert the loader to `weights_only=False` to "fix" a
 load error — re-export the checkpoint instead.
 
-The pinned stack is `torch==2.6.0+cu124` (see `Handover_JuneSession/constraints.txt`).
+The pinned stack is `torch==2.6.0+cu124` (see `Handover_JulySession/constraints.txt`).
 
 ---
 
@@ -194,7 +196,7 @@ The pinned stack is `torch==2.6.0+cu124` (see `Handover_JuneSession/constraints.
 - **Phase 2**: Quick-scans remaining indices (0–9) with a 3-frame test to detect any additional cameras
 - When only one real camera is found, selects it automatically
 - **When multiple real cameras exist**, opens a tiled live-preview window showing all feeds simultaneously — press `1`/`2`/`3`... to choose (1-indexed by list position, not OS device index), `Enter` to accept the default (last-used first, then 360°), `Q` to quit
-- **`--select-camera` / `-s`** forces the picker to appear on every run, even when only one camera is detected, and bypasses the last-used cache so a freshly plugged-in USB webcam is always discovered. Useful for non-technical end users handing the laptop between people. The bundled `Handover_JuneSession/3_START_ENGAGEMENT.bat` passes this flag by default.
+- **`--select-camera` / `-s`** forces the picker to appear on every run, even when only one camera is detected, and bypasses the last-used cache so a freshly plugged-in USB webcam is always discovered. Useful for non-technical end users handing the laptop between people. The bundled `Handover_JulySession/3_START_ENGAGEMENT.bat` passes this flag by default.
 - Default camera highlighted in green in the picker; camera used most recently labelled "last used"
 - Filters out virtual cameras (OBS, NDI, SMPTE colour bars) using brightness, uniformity, and frame-diff checks — static or blank feeds are rejected
 - Caches the selected camera index for instant startup next time
@@ -343,7 +345,8 @@ The original `physio_metrics` bundle published raw `numpy.std()` of the 5 s buff
 The replacement is live on `Post_Canteen_Bug_Fixes` and matches the methodology already published in the IMX '26 adult paper (rolling-median + z-score) and the IMEX infant paper (whole-session z-score, motivated by the absence of a resting baseline when sensors are rotated across wearers):
 
 - **Per-device running mean/SD via Welford's algorithm** — one-pass, numerically stable; converges to the true session mean within ~60–90 s and barely moves thereafter, so sustained elevations stay visibly elevated (unlike a short EMA, which habituates).
-- **Calibration gate** — first ~60 s after a wearer assignment marked as `calibrating: true` in the published payload; the GUI shows `calibrating Ns` and suppresses spline / readout values until done. Z-scores published thereafter as $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC and SCR frequency.
+- **Expanding baseline, capped at 60 s (`BASELINE_CAP_SECONDS`)** — the baseline grows with every plausible 1 Hz sample and gets steadily more accurate, then **freezes** once 60 s have elapsed. Capping matters for short wears (~90 s): without it, a wearer who stays aroused slowly drags their own mean up, so it takes ever more arousal to register the same z and the elevation normalises itself away. Welford has effectively converged by 60 s, so freezing there preserves accuracy while keeping sustained elevations visible. *(Updated 29 June: was previously an uncapped whole-session mean.)*
+- **Calibration gate** — first ~2 s after a wearer assignment marked as `calibrating: true` (`CALIBRATION_SECONDS = 2`, `BASELINE_MIN_SAMPLES = 2`); the GUI shows `calibrating Ns` and suppresses spline / readout values until done. Z-scores publish thereafter as $z_t = (x_t - \mu_n)/\sigma_n$ for HR, EDA, IBI, temperature ROC and SCR frequency, becoming more accurate as the baseline expands toward the 60 s cap. *(Updated 29 June: warm-up shortened from ~60 s to ~2 s so SDs plot almost immediately after a re-fit; a swap still resets the baseline from scratch — never reused across wearers.)*
 - **Off-wrist event (≥ 2 s, short threshold)** — separate from the 15 s baseline-reset threshold. While off-wrist the publisher drops `*_z` keys from the payload entirely and sets `off_wrist: true` so the GUI dims the panel and renders an `OFF-WRIST` watermark within ~2 s of skin-contact loss. Two detection paths:
   - *Low-magnitude rule* — EDA mean < 0.10 µS AND PPGGreen mean < 1500 counts over the last second of raw samples (well-behaved units).
   - *Frozen-channel rule* — EDA std < 0.005 µS AND PPGGreen std < 5 counts over the same window. Catches units whose ADS1114 EDA front-end rails at a high pinned value when removed and whose PPG latches on a fabric reflection (confirmed on `MD-V5-0000448` 9 June, EDA pinned at 2.595 µS identical to 5 dp for 20+ consecutive samples). Reads from the raw `all_signal_values` buffer with no smoothing in front of it.
@@ -430,7 +433,7 @@ Quality-of-life fixes from the 4 June canteen run review (data saving + GUI clar
   - **EDA fallback (EDL → EDA)** — z-score representative now falls back to `EDA` when `EDL` is empty. Fixes the silent-EDA-spline bug on wearers that emit the `EA` tag but not `EL`.
   - **Main window resizable** — the engagement `cv2.namedWindow` flag was switched from default `WINDOW_AUTOSIZE` (which locks to source frame size) to `WINDOW_NORMAL` so Windows can maximise / snap / fullscreen the GUI.
 
-**Sync status (June 2026):** both `Handover_JuneSession/live_multiperson_binary_v2.py` and `scripts/inference/live_multiperson_binary_v2.py` carry the Post-Bremen and Post-Canteen progress-log items. The only intentional divergence is the `applog` import bootstrap (Handover copy resolves it from its own folder; project-tree copy resolves it from `src/`).
+**Sync status (June 2026):** both `Handover_JulySession/live_multiperson_binary_v2.py` and `scripts/inference/live_multiperson_binary_v2.py` carry the Post-Bremen and Post-Canteen progress-log items. The only intentional divergence is the `applog` import bootstrap (Handover copy resolves it from its own folder; project-tree copy resolves it from `src/`).
 
 ---
 
