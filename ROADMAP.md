@@ -122,10 +122,32 @@ young-families model flips the single class `staring` from *disengagement* →
 *engagement* (its only dataset change). This assumes `staring` in Kinetics-700
 means **gaze held steady / low head movement** (an attentive parent watching the
 stage). If, instead, the Kinetics `staring` clips actually depict staring
-*toward the camera*, the flip is wrong for our setup — the audience is filmed
-from behind and should never be looking at the camera, so a camera-facing
-"staring" cue would be a false engagement signal. Confirm which meaning holds
-when reviewing the model's predictions on the family-concert videos.
+*toward the camera*, the flip is wrong for our setup — the audience is **not**
+looking at the camera, so a camera-facing "staring" cue would be a false
+engagement signal. Confirm which meaning holds when reviewing the model's
+predictions on the family-concert videos.
+
+**Gaze concern (camera-relative vs stage-relative).** More generally, any
+gaze/head-orientation cue is only meaningful **relative to the stage**, not the
+camera. Because the camera can sit **behind, to the side of, or in front of** the
+audience (see below), "looking forward" in the frame does not reliably mean
+"looking at the performers." Gaze/orientation features must therefore be
+interpreted relative to the (unknown, per-setup) stage direction, or they will
+misfire when the camera angle changes. Flag any gaze-based signal as
+camera-angle-dependent until we can calibrate the stage direction per recording.
+
+**Camera angle — must cater for multiple viewpoints.** The audience will **not**
+necessarily be filmed from directly behind; a **side** angle is likely, and a
+**front** angle is also possible. The pipeline must tolerate all three
+(rear / side / front) rather than assuming backs-of-heads. Practically: pose,
+posture and motion features are fairly view-robust, but face/gaze features and
+any "facing forward = engaged" logic are **not** and need the stage-relative
+calibration noted above.
+
+**Evaluation plan — two viewpoints.** We will evaluate the v0 model on **two
+videos: one filmed from the rear and one from the front** of the audience, to
+measure how sensitive accuracy is to camera angle (and to sanity-check the
+`staring`/gaze behaviour under each viewpoint).
 
 **If accuracy is poor — revisit the dataset.** If validation on the family
 footage shows the v0 model is not accurate enough, the next step is to **revisit
@@ -142,6 +164,7 @@ a fixed ceiling.
   - Concert starts **~15:48** into the video.
   - File is **corrupted at the half-way mark** — usable footage ≈ 15:48 → mid-point.
 - [ ] Obtain a companion video filmed **from in front** of the audience (faces/gaze visible).
+- [ ] **Evaluation set = one rear video + one front video** (camera-angle sensitivity check; expect side angles in real deployments too).
 
 **Plan:**
 - [ ] Define objective and label schema (engagement vs arousal; binary vs graded).
