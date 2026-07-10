@@ -117,6 +117,24 @@ rule-based "Young Families" post-processor over the existing model (down-weight
 motion/arousal, strip camera-gaze bias) so there's something usable while data
 for a full retrain is assembled.
 
+**Validation caveat — `staring` semantics (verify on footage).** The v0
+young-families model flips the single class `staring` from *disengagement* →
+*engagement* (its only dataset change). This assumes `staring` in Kinetics-700
+means **gaze held steady / low head movement** (an attentive parent watching the
+stage). If, instead, the Kinetics `staring` clips actually depict staring
+*toward the camera*, the flip is wrong for our setup — the audience is filmed
+from behind and should never be looking at the camera, so a camera-facing
+"staring" cue would be a false engagement signal. Confirm which meaning holds
+when reviewing the model's predictions on the family-concert videos.
+
+**If accuracy is poor — revisit the dataset.** If validation on the family
+footage shows the v0 model is not accurate enough, the next step is to **revisit
+the Kinetics-700 dataset and consider downloading/adding new action classes** we
+previously excluded (e.g. `snapping fingers`, `smiling`, `carrying baby`,
+`scratching head`) and/or re-deriving the `staring` label, then re-extract
+features and retrain. Treat the current 86-class subset as a starting point, not
+a fixed ceiling.
+
 **Data assets:**
 - `D:\Wspc\Python\Amplify\TUS Evaluations\Data Anal\Timestamped Audio\2nd FAMILY LABORATORY - 21 MARCH\2nd Family Laboratory.mp4`
   - Broadly annotatable as **Engaged**.
