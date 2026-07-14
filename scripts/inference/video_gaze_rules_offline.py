@@ -62,14 +62,20 @@ FLOOR_PITCH_FRAC = 0.80          # nose below ear-line by this * head_size also 
 
 # --- focal point ---
 MIN_RAYS = 3                     # absolute floor of valid audience rays for a focal point
-QUORUM_FRAC = 0.5                # focal point needs > this fraction of the seated audience
+QUORUM_FRAC = 0.35               # focal point needs > this fraction of the seated audience
                                  # (members with a measurable gaze ray) to converge on it
-MAX_MEAN_DEV_DEG = 30.0          # mean ray->focal angular deviation above this => "no focal point"
+MAX_MEAN_DEV_DEG = 45.0          # mean ray->focal angular deviation above this => "no focal point"
 FOCAL_EMA = 0.25                 # smoothing of the focal point position
+FOCAL_HOLD_FRAMES = 45           # keep the last valid focal point alive this many processed
+                                 # frames after quorum is momentarily lost (stops flicker)
 
 # --- per-person engagement rules ---
-THETA_OK_DEG = 25.0              # gaze within this angle of the focal point => engaged
+# Gaze is scored as a CONE, not a thin ray: full credit within THETA_OK_DEG of
+# the target, linear falloff to zero at THETA_ZERO_DEG.
+THETA_OK_DEG = 40.0              # inside this cone half-angle => fully engaged
+THETA_ZERO_DEG = 75.0            # beyond this => fully off-target
 SCORE_EMA = 0.15                 # smoothing of the displayed 0..1 score
+SCORE_SEED = 1.0                 # presume ENGAGED by default (young-families stance)
 ENGAGED_THRESH = 0.5
 
 # --- synchronized gaze-shift (off-stage distraction) ---
@@ -82,6 +88,8 @@ SHIFT_COOLDOWN = 20              # processed frames the distraction event lasts
 # --- performer detection (standing adults; sticky) ---
 LEG_TORSO_RATIO = 1.15           # (hip->ankle) > ratio * (shoulder->hip) => legs extended
 KNEE_DROP_FRAC = 0.55            # (hip->knee) > frac * torso => not folded (seated knees ~ hip level)
+THIGH_STAND_FRAC = 0.75          # ankle-free fallback (long pants/occlusion): knee this far
+                                 # below the hip (in torso units) => standing
 PERFORMER_STAND_FRAMES = 10      # consecutive standing frames before promotion (sticky)
 PERFORMER_BOX_PAD = 0.20         # focal point within performer bbox padded by this => "gazed at"
 
@@ -117,6 +125,34 @@ def ang_between(d1, d2):
     """Angle in degrees between two 2D unit vectors."""
     dot = float(np.clip(d1[0] * d2[0] + d1[1] * d2[1], -1.0, 1.0))
     return math.degrees(math.acos(dot))
+
+
+def cone_score(dev_deg):
+    """Graded gaze-cone credit: 1.0 inside THETA_OK_DEG, linear falloff to 0
+    at THETA_ZERO_DEG."""
+    if dev_deg <= THETA_OK_DEG:
+        return 1.0
+    if dev_deg >= THETA_ZERO_DEG:
+        return 0.0
+    return 1.0 - (dev_deg - THETA_OK_DEG) / (THETA_ZERO_DEG - THETA_OK_DEG)
+
+
+def ray_box_entry_t(p, d, box):
+    """Distance t >= 0 at which ray (p, d unit) first enters an AABB, or None."""
+    x1, y1, x2, y2 = box
+    t0, t1 = 0.0, float('inf')
+    for axis, (lo, hi) in enumerate(((x1, x2), (y1, y2))):
+        if abs(d[axis]) < 1e-9:
+            if not (lo <= p[axis] <= hi):
+                return None
+        else:
+            ta = (lo - p[axis]) / d[axis]
+            tb = (hi - p[axis]) / d[axis]
+            if ta > tb:
+                ta, tb = tb, ta
+            t0 = max(t0, ta)
+            t1 = min(t1, tb)
+    return t0 if t0 <= t1 else None
 
 
 def least_squares_focal(points, dirs):
@@ -210,16 +246,21 @@ def person_geometry(kp, pbox):
                 out['floor'] = d[1] > FLOOR_GAZE_DY or pitch_drop > FLOOR_PITCH_FRAC
 
     # ---- posture: standing vs seated ----
-    need = [L_SHOULDER, R_SHOULDER, L_HIP, R_HIP, L_KNEE, R_KNEE, L_ANKLE, R_ANKLE]
-    if all(vis(i) >= VIS_THRESH for i in need):
+    need_core = [L_SHOULDER, R_SHOULDER, L_HIP, R_HIP, L_KNEE, R_KNEE]
+    if all(vis(i) >= VIS_THRESH for i in need_core):
         sho_y = 0.5 * (pt(L_SHOULDER)[1] + pt(R_SHOULDER)[1])
         hip_y = 0.5 * (pt(L_HIP)[1] + pt(R_HIP)[1])
         knee_y = 0.5 * (pt(L_KNEE)[1] + pt(R_KNEE)[1])
-        ank_y = 0.5 * (pt(L_ANKLE)[1] + pt(R_ANKLE)[1])
         torso = hip_y - sho_y
         if torso > 1.0:
-            legs_extended = (ank_y - hip_y) > LEG_TORSO_RATIO * torso
             knees_dropped = (knee_y - hip_y) > KNEE_DROP_FRAC * torso
+            if vis(L_ANKLE) >= VIS_THRESH and vis(R_ANKLE) >= VIS_THRESH:
+                ank_y = 0.5 * (pt(L_ANKLE)[1] + pt(R_ANKLE)[1])
+                legs_extended = (ank_y - hip_y) > LEG_TORSO_RATIO * torso
+            else:
+                # ankles hidden (long pants / occluded by seated audience):
+                # a near-vertical thigh (knee well below hip) is enough
+                legs_extended = (knee_y - hip_y) > THIGH_STAND_FRAC * torso
             out['standing'] = bool(legs_extended and knees_dropped)
     return out
 
@@ -238,6 +279,7 @@ class GazeRulesEngine:
         self.score = {}                         # tid -> EMA engagement 0..1
         self.focal = None                       # smoothed focal point (np.array)
         self.focal_valid = False
+        self.focal_hold_until = -1              # keep focal alive through brief quorum loss
         self.shift_until = -1                   # distraction cooldown deadline
         self.shifted_tids = set()
 
@@ -293,6 +335,9 @@ class GazeRulesEngine:
             self.focal = (raw_focal if self.focal is None
                           else FOCAL_EMA * raw_focal + (1 - FOCAL_EMA) * self.focal)
             self.focal_valid = True
+            self.focal_hold_until = proc_idx + FOCAL_HOLD_FRAMES
+        elif self.focal is not None and proc_idx <= self.focal_hold_until:
+            self.focal_valid = True           # hold last focal through brief dropouts
         else:
             self.focal_valid = False          # PRE-SHOW / lost convergence
 
@@ -317,6 +362,29 @@ class GazeRulesEngine:
         distraction = proc_idx <= self.shift_until
 
         # ---- 4. per-person rules -> instantaneous engaged/neutral/disengaged ----
+        # Gaze targets: the common focal point AND any performer's box centre.
+        # The performer target matters when the performer is close to the
+        # audience: her bbox overlaps theirs, the focal estimate gets noisy,
+        # but a ray aimed at her should still count as engaged.
+        def best_target_dev(a, d):
+            best = None
+            if self.focal_valid:
+                to_focal, dist = unit(self.focal - a)
+                if dist > 1.0:
+                    best = (ang_between(d, to_focal), 'focal')
+            for ptid in self.performers:
+                if ptid not in people:
+                    continue
+                x1, y1, x2, y2 = people[ptid]['bbox']
+                c = np.array([0.5 * (x1 + x2), 0.5 * (y1 + y2)])
+                to_perf, dist = unit(c - a)
+                if dist < 1.0:
+                    continue
+                dev = ang_between(d, to_perf)
+                if best is None or dev < best[0]:
+                    best = (dev, 'performer')
+            return best if best is not None else (None, '')
+
         status = {}
         for tid, p in audience.items():
             g = p['geom']
@@ -326,17 +394,19 @@ class GazeRulesEngine:
                 inst, reason = 0.0, 'floor'
             elif distraction and tid in self.shifted_tids:
                 inst, reason = 0.0, 'shift'
-            elif self.focal_valid and g['gaze'] is not None and g['anchor'] is not None:
-                to_focal, dist = unit(self.focal - np.array(g['anchor']))
-                if dist < 2.0 * g['head_size']:
+            elif g['gaze'] is not None and g['anchor'] is not None:
+                a = np.array(g['anchor'], dtype=float)
+                d = np.array(g['gaze'], dtype=float)
+                if self.focal_valid and float(np.hypot(*(self.focal - a))) < 2.0 * g['head_size']:
                     inst, reason = 1.0, 'at-focal'   # person effectively AT the focal point
                 else:
-                    dev = ang_between(np.array(g['gaze']), to_focal)
-                    inst = 1.0 if dev <= THETA_OK_DEG else 0.0
-                    reason = 'on-focal' if inst else 'off-focal'
+                    dev, src = best_target_dev(a, d)
+                    if dev is not None:
+                        inst = cone_score(dev)
+                        reason = f'on-{src}' if inst >= 0.5 else 'off-focal'
             # movement is never penalised: no motion term anywhere.
             if inst is not None:
-                prev = self.score.get(tid, inst)
+                prev = self.score.get(tid, SCORE_SEED)   # presume engaged
                 self.score[tid] = SCORE_EMA * inst + (1 - SCORE_EMA) * prev
             status[tid] = {'score': self.score.get(tid), 'reason': reason,
                            'contributed': tid in [ray_tids[i] for i in contributors]}
@@ -392,10 +462,10 @@ def extract_keypoints(holistic, frame_rgb, bbox):
 # =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
-def draw_gaze_rays(frame, people, focal):
-    """Plain gaze lines (no arrowheads). When a common focal point exists,
-    every ray is projected out to its closest approach to that point so the
-    convergence is visible; otherwise a short stub is drawn."""
+def draw_gaze_rays(frame, people, focal, performer_boxes):
+    """Plain gaze lines (no arrowheads). Rays are projected out to the common
+    focal point when one exists, else to a performer's box if the ray hits one,
+    else drawn as a short stub."""
     for tid, p in people.items():
         g = p['geom']
         if g['gaze'] is None or g['anchor'] is None:
@@ -407,6 +477,11 @@ def draw_gaze_rays(frame, people, focal):
             t_focal = float(np.dot(np.array(focal) - a, d))
             if t_focal > 0:
                 L = t_focal
+        else:
+            for box in performer_boxes:
+                t = ray_box_entry_t(a, d, box)
+                if t is not None and t > L:
+                    L = t                         # extend to the performer
         end = (int(a[0] + d[0] * L), int(a[1] + d[1] * L))
         cv2.line(frame, (int(a[0]), int(a[1])), end, COL_GAZE, 2, cv2.LINE_AA)
 
@@ -566,7 +641,8 @@ def main():
 
         # --- overlay ---
         n_scored = sum(1 for s in result['status'].values() if s['score'] is not None)
-        draw_gaze_rays(frame, people, result['focal'])
+        performer_boxes = [people[t]['bbox'] for t in engine.performers if t in people]
+        draw_gaze_rays(frame, people, result['focal'], performer_boxes)
         for tid, p in people.items():
             draw_person(frame, tid, p['bbox'], p['geom'],
                         tid in engine.performers,
