@@ -100,11 +100,14 @@ SHIFT_COOLDOWN = 20              # processed frames the distraction event lasts
 
 # --- performer detection (sticky) ---
 # The audience is seated on the floor and does NOT translate through the
-# scene; performers move a lot. MOBILITY is therefore the primary cue:
-# Cue 0 (sufficient alone): sustained bbox-centre translation.
-MOVE_MIN_STEP = 0.06             # per-processed-frame centre displacement (in bbox-height
-                                 # units) that counts as "moving" (seated sway is below this)
-MOVE_MAX_STEP = 1.2              # above this = YOLO id-switch teleport; ignored, not evidence
+# scene; performers move a lot. MOBILITY is therefore the primary cue, but it
+# must be NET displacement over a window - an audience member shifting in
+# place moves and RETURNS, a performer travels.
+MOVE_WINDOW = 8                  # processed frames over which net displacement is measured
+MOVE_NET_FRAC = 0.5              # net centre travel (in bbox-height units) over the window
+                                 # that counts as "moving" (in-place shifting stays below)
+MOVE_MAX_STEP = 1.2              # per-frame step above this = YOLO id-switch teleport;
+                                 # position history is reset, never counted as motion
 MOVE_FRAMES = 4                  # movement evidence (leaky: hit +1, still -1) before promotion
 # Cues 1+2 (must BOTH hold - the audience sits with legs straight out, so the
 # standing test alone misfires on seated audience):
@@ -114,6 +117,8 @@ KNEE_DROP_FRAC = 0.55            # (hip->knee) > frac * torso => not folded (sea
 THIGH_STAND_FRAC = 0.75          # ankle-free fallback (long pants/occlusion): knee this far
                                  # below the hip (in torso units) => standing
 PERFORMER_STAND_FRAMES = 3       # standing evidence (leaky: hit +1, miss -1) before promotion
+PERFORMER_STAND_STRONG = 15      # OVERWHELMING standing evidence promotes ALONE (a musician
+                                 # planted at the mic; seated audience never sustains this)
 # Cue 2: facing the audience. A performer faces TOWARD the seated audience, so
 # their gaze direction is roughly opposite the audience's mean gaze direction.
 # (Only needed for PROMOTION; once promoted, performers need no gaze ray.)
@@ -270,15 +275,18 @@ def person_geometry(kp, pbox):
         elif l_ok or r_ok:
             ear = pt(L_EAR if l_ok else R_EAR)
             eye = pt(L_EYE if l_ok else R_EYE)
-            # profile sanity: the eye must lie AHEAD of the ear, on the way to
-            # the nose - otherwise the "nose" is a misdetection (e.g. back of
-            # head) and the ray would fire off from the ear in a wild direction
+            # profile sanity: the eye must sit ON the ear->nose line, roughly
+            # midway - otherwise the "nose" is a misdetection (neighbour's
+            # face / back of head) and the ray would fire off from the ear
             v_en = nose - ear
             v_ey = eye - ear
-            if (float(np.dot(v_en, v_ey)) > 0 and
-                    float(np.hypot(*v_ey)) < float(np.hypot(*v_en))):
-                ear_mid = ear
-                ear_dist = 0.5 * out['head_size']     # profile: scale from bbox
+            nlen = float(np.hypot(*v_en))
+            if nlen >= 0.3 * out['head_size']:
+                along = float(np.dot(v_ey, v_en)) / (nlen * nlen)   # eye position along ear->nose
+                perp = abs(float(v_ey[0] * v_en[1] - v_ey[1] * v_en[0])) / nlen
+                if 0.15 <= along <= 0.85 and perp <= 0.35 * nlen:
+                    ear_mid = ear
+                    ear_dist = 0.5 * out['head_size']     # profile: scale from bbox
         if ear_mid is not None:
             out['head_size'] = max(ear_dist, 1.0)
             d, n = unit(nose - ear_mid)
@@ -340,7 +348,7 @@ class GazeRulesEngine:
         self.stand_streak = defaultdict(int)    # tid -> consecutive standing frames
         self.facing_streak = defaultdict(int)   # tid -> consecutive facing-audience frames
         self.move_streak = defaultdict(int)     # tid -> sustained-translation evidence
-        self.prev_centre = {}                   # tid -> last bbox centre (np.array)
+        self.pos_hist = defaultdict(lambda: deque(maxlen=MOVE_WINDOW + 1))  # tid -> centres
         self.dir_hist = defaultdict(lambda: deque(maxlen=SHIFT_WINDOW + 1))
         self.score = {}                         # tid -> EMA engagement 0..1
         self.focal = None                       # smoothed focal point (np.array)
@@ -356,7 +364,7 @@ class GazeRulesEngine:
         self.stand_streak.pop(tid, None)
         self.facing_streak.pop(tid, None)
         self.move_streak.pop(tid, None)
-        self.prev_centre.pop(tid, None)
+        self.pos_hist.pop(tid, None)
         self.dir_hist.pop(tid, None)
         self.score.pop(tid, None)
         self.shifted_tids.discard(tid)
@@ -398,22 +406,24 @@ class GazeRulesEngine:
             else:
                 self.stand_streak[tid] = max(0, self.stand_streak[tid] - 1)
 
-            # mobility: the seated audience never translates through the
-            # scene; performers do. Per-frame centre step, normalized by the
-            # person's own bbox height; huge steps are id-switch teleports.
+            # mobility: the seated audience never TRAVELS through the scene;
+            # in-place shifting moves and returns, a performer translates.
+            # Net displacement over a window, normalized by bbox height;
+            # per-frame teleports (id switches) reset the history.
             x1, y1, x2, y2 = p['bbox']
             centre = np.array([0.5 * (x1 + x2), 0.5 * (y1 + y2)])
             scale = max(1.0, float(y2 - y1))
-            prev_c = self.prev_centre.get(tid)
-            self.prev_centre[tid] = centre
-            if prev_c is not None:
-                step = float(np.hypot(*(centre - prev_c))) / scale
-                if MOVE_MIN_STEP <= step <= MOVE_MAX_STEP:
+            hist = self.pos_hist[tid]
+            if hist and float(np.hypot(*(centre - hist[-1]))) / scale > MOVE_MAX_STEP:
+                hist.clear()                     # id-switch teleport
+            hist.append(centre)
+            if len(hist) > MOVE_WINDOW:
+                net = float(np.hypot(*(centre - hist[0]))) / scale
+                if net >= MOVE_NET_FRAC:
                     self.move_streak[tid] += 1
                     self.dbg_move_peak = max(self.dbg_move_peak, self.move_streak[tid])
-                elif step < MOVE_MIN_STEP:
+                else:
                     self.move_streak[tid] = max(0, self.move_streak[tid] - 1)
-                # step > MOVE_MAX_STEP: teleport, leave evidence untouched
 
         def gather_rays():
             aud = {tid: p for tid, p in people.items() if tid not in self.performers}
@@ -447,15 +457,17 @@ class GazeRulesEngine:
                     else:
                         self.facing_streak[tid] = max(0, self.facing_streak[tid] - 1)
 
-        # ---- 1c. promotion: sustained MOBILITY alone, or standing AND
-        # facing-audience together (the audience sits on the floor with legs
-        # straight out, so posture alone misfires on seated audience members)
+        # ---- 1c. promotion: sustained MOBILITY alone, overwhelming STANDING
+        # alone (musician planted at the mic), or standing AND facing-audience
+        # together (the audience sits on the floor with legs straight out, so
+        # weak posture evidence alone misfires on seated audience members)
         promoted = False
         for tid, p in list(audience.items()):
             mobile = self.move_streak[tid] >= MOVE_FRAMES
+            strong_stand = self.stand_streak[tid] >= PERFORMER_STAND_STRONG
             stand_and_face = (self.stand_streak[tid] >= PERFORMER_STAND_FRAMES and
                               self.facing_streak[tid] >= FACING_FRAMES)
-            if mobile or stand_and_face:
+            if mobile or strong_stand or stand_and_face:
                 self.performers.add(tid)
                 if p.get('sig') is not None:
                     self.perf_sig[tid] = p['sig']
@@ -620,11 +632,14 @@ def extract_keypoints(holistic, frame_rgb, bbox):
 # =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
-def draw_gaze_rays(frame, people, focal, performer_boxes):
-    """Plain gaze lines (no arrowheads). Rays are projected out to the common
-    focal point when one exists, else to a performer's box if the ray hits one,
-    else drawn as a short stub."""
+def draw_gaze_rays(frame, people, focal, performer_boxes, performer_tids):
+    """Plain gaze lines (no arrowheads) for AUDIENCE members only - performers
+    never get a ray. Rays are projected out to the common focal point when one
+    exists, else toward a performer's box, and always CLIPPED at the first
+    performer box they hit (a ray must not pass through the performer)."""
     for tid, p in people.items():
+        if tid in performer_tids:
+            continue
         g = p['geom']
         if g['gaze'] is None or g['anchor'] is None:
             continue
@@ -635,11 +650,14 @@ def draw_gaze_rays(frame, people, focal, performer_boxes):
             t_focal = float(np.dot(np.array(focal) - a, d))
             if t_focal > 0:
                 L = t_focal
-        else:
-            for box in performer_boxes:
-                t = ray_box_entry_t(a, d, box)
-                if t is not None and t > L:
-                    L = t                         # extend to the performer
+        # clip (or extend) to the first performer box the ray enters
+        t_perf = None
+        for box in performer_boxes:
+            t = ray_box_entry_t(a, d, box)
+            if t is not None and t > 1e-6 and (t_perf is None or t < t_perf):
+                t_perf = t
+        if t_perf is not None:
+            L = t_perf if focal is None else min(L, t_perf)
         end = (int(a[0] + d[0] * L), int(a[1] + d[1] * L))
         cv2.line(frame, (int(a[0]), int(a[1])), end, COL_GAZE, 2, cv2.LINE_AA)
 
@@ -821,7 +839,7 @@ def main():
         # --- overlay ---
         n_scored = sum(1 for s in result['status'].values() if s['score'] is not None)
         performer_boxes = [people[t]['bbox'] for t in engine.performers if t in people]
-        draw_gaze_rays(frame, people, result['focal'], performer_boxes)
+        draw_gaze_rays(frame, people, result['focal'], performer_boxes, engine.performers)
         for tid, p in people.items():
             draw_person(frame, tid, p['bbox'], p['geom'],
                         tid in engine.performers,
