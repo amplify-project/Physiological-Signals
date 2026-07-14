@@ -18,11 +18,14 @@ Implements the 2D gaze-first engagement rules from ROADMAP.md
         started yet (PRE-SHOW; nobody is scored)
       - body movement is NEVER penalised while gaze stays on the focal point
   * PERFORMER promotion (sticky: once a performer, always a performer, even
-    after sitting/bending) via two cues: (1) standing adults (audience is
-    seated), (2) facing the audience - a gaze direction contrary to the
-    audience's mean gaze direction. Performers are excluded from audience
-    scoring and from the focal-point estimate (they need no gaze ray). A
-    performer holding the crowd focal point gets an ORANGE bounding box.
+    after sitting/bending) requires BOTH cues: (1) standing (the audience sits
+    on the floor, often with legs straight out, so posture alone misfires),
+    AND (2) facing the audience - a gaze direction contrary to the audience's
+    mean gaze direction. Once promoted, performers need no gaze ray, are
+    excluded from audience scoring and the focal-point estimate, and are
+    re-identified across track-id switches by a torso clothes-colour
+    signature. A performer holding the crowd focal point gets an ORANGE
+    bounding box.
 
 Overlay: per-person gaze lines projected out to the common focal point so the
 convergence is visible, orange performer boxes, green/red audience boxes,
@@ -80,9 +83,13 @@ THETA_ZERO_DEG = 75.0            # beyond this => fully off-target
 # Asymmetric smoothing: engagement is the default state. Divergence from the
 # focal point dents the score slowly; re-alignment recovers it quickly.
 SCORE_EMA_DOWN = 0.08            # alpha when the instantaneous cue is WORSE than the score
+SCORE_EMA_DOWN_OFF = 0.25        # faster decay for sustained 'off-focal' gaze (a genuine
+                                 # individual distraction, hits harder than a crowd 'shift')
 SCORE_EMA_UP = 0.40              # alpha when the instantaneous cue is BETTER (fast recovery)
 SCORE_SEED = 1.0                 # presume ENGAGED by default (young-families stance)
-ENGAGED_THRESH = 0.5
+ENGAGED_THRESH = 0.5             # green box at/above this
+RED_THRESH = 0.30                # red box below this; between = amber (partially engaged,
+                                 # NOT "disengaged" - scores are graded, not binary)
 
 # --- synchronized gaze-shift (off-stage distraction) ---
 SHIFT_WINDOW = 5                 # processed frames over which a direction change is measured
@@ -92,7 +99,9 @@ SHIFT_MIN_FRAC = 0.4             # ... and this fraction of valid audience must 
 SHIFT_COOLDOWN = 20              # processed frames the distraction event lasts
 
 # --- performer detection (sticky) ---
-# Cue 1: standing (audience adults are seated).
+# Promotion requires BOTH cues (the audience sits on the floor with legs
+# straight out, so the standing test alone misfires on seated audience):
+# Cue 1: standing (legs extended AND knees dropped below the hip).
 LEG_TORSO_RATIO = 1.15           # (hip->ankle) > ratio * (shoulder->hip) => legs extended
 KNEE_DROP_FRAC = 0.55            # (hip->knee) > frac * torso => not folded (seated knees ~ hip level)
 THIGH_STAND_FRAC = 0.75          # ankle-free fallback (long pants/occlusion): knee this far
@@ -100,10 +109,15 @@ THIGH_STAND_FRAC = 0.75          # ankle-free fallback (long pants/occlusion): k
 PERFORMER_STAND_FRAMES = 3       # standing evidence (leaky: hit +1, miss -1) before promotion
 # Cue 2: facing the audience. A performer faces TOWARD the seated audience, so
 # their gaze direction is roughly opposite the audience's mean gaze direction.
+# (Only needed for PROMOTION; once promoted, performers need no gaze ray.)
 FACING_DOT = -0.5                # gaze . audience_mean_dir below this (>120 deg apart) => facing them
 FACING_FRAMES = 3                # facing evidence (leaky: hit +1, contrary obs -1) before promotion
 FACING_COHERENCE = 0.5           # audience mean-dir resultant length required for the cue to apply
 PERFORMER_BOX_PAD = 0.20         # focal point within performer bbox padded by this => "gazed at"
+# Appearance registration: performers are re-identified across YOLO track-id
+# switches by a torso colour histogram (clothes colour) taken at promotion.
+APPEAR_MATCH = 0.85              # min histogram correlation to re-claim performer status
+APPEAR_MAX_LOST = 8              # remember at most this many lost performer signatures
 
 # --- harness ---
 NUM_KEYPOINTS = 543
@@ -118,8 +132,9 @@ L_KNEE, R_KNEE = 25, 26
 L_ANKLE, R_ANKLE = 27, 28
 
 # colors (BGR)
-COL_ENGAGED = (0, 200, 0)
-COL_DISENGAGED = (0, 0, 230)
+COL_ENGAGED = (0, 200, 0)            # >= ENGAGED_THRESH
+COL_PARTIAL = (0, 200, 230)          # RED_THRESH..ENGAGED_THRESH (partially engaged)
+COL_LOW = (0, 0, 230)                # < RED_THRESH
 COL_WARMING = (160, 160, 160)
 COL_PERFORMER = (0, 140, 255)        # orange
 COL_GAZE = (255, 220, 0)             # cyan-ish gaze rays
@@ -285,6 +300,25 @@ def person_geometry(kp, pbox):
     return out
 
 
+def appearance_sig(frame, bbox):
+    """Torso clothes-colour signature: normalized H-S histogram of the central
+    upper region of the person bbox. Used to re-identify performers across
+    YOLO track-id switches."""
+    x1, y1, x2, y2 = bbox
+    w, h = x2 - x1, y2 - y1
+    tx1, tx2 = x1 + int(0.25 * w), x1 + int(0.75 * w)
+    ty1, ty2 = y1 + int(0.25 * h), y1 + int(0.60 * h)
+    if tx2 - tx1 < 4 or ty2 - ty1 < 4:
+        return None
+    roi = frame[max(0, ty1):ty2, max(0, tx1):tx2]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
+
+
 # =============================================================================
 # GAZE RULES ENGINE
 # =============================================================================
@@ -294,6 +328,8 @@ class GazeRulesEngine:
 
     def __init__(self):
         self.performers = set()                 # sticky performer track ids
+        self.perf_sig = {}                      # tid -> appearance signature (clothes colour)
+        self.lost_sigs = deque(maxlen=APPEAR_MAX_LOST)  # signatures of lost performers
         self.stand_streak = defaultdict(int)    # tid -> consecutive standing frames
         self.facing_streak = defaultdict(int)   # tid -> consecutive facing-audience frames
         self.dir_hist = defaultdict(lambda: deque(maxlen=SHIFT_WINDOW + 1))
@@ -312,9 +348,12 @@ class GazeRulesEngine:
         self.dir_hist.pop(tid, None)
         self.score.pop(tid, None)
         self.shifted_tids.discard(tid)
-        # NOTE: performer stickiness intentionally survives eviction only while
-        # the track id is stable; a re-detected performer gets a fresh id and
-        # must be re-promoted. Acceptable for v1.
+        # A lost performer's appearance signature is remembered so the person
+        # can re-claim performer status under a NEW track id (see re-ID below).
+        if tid in self.performers:
+            sig = self.perf_sig.pop(tid, None)
+            if sig is not None:
+                self.lost_sigs.append(sig)
         self.performers.discard(tid)
 
     def update(self, people, proc_idx):
@@ -323,15 +362,27 @@ class GazeRulesEngine:
         Returns dict with focal point, per-tid status, gazed performer ids and
         the distraction flag.
         """
-        # ---- 1. performer promotion (sticky): standing OR facing the audience ----
-        # Leaky evidence accumulators: MediaPipe detections flicker frame to
-        # frame, so a single miss must not wipe out accumulated evidence.
+        # ---- 1a. performer re-identification (appearance / clothes colour) ----
+        # A performer whose YOLO track was lost re-appears with a new id; match
+        # the new person's torso signature against remembered performer sigs.
+        if self.lost_sigs:
+            for tid, p in people.items():
+                if tid in self.performers or p.get('sig') is None:
+                    continue
+                for sig in list(self.lost_sigs):
+                    if cv2.compareHist(p['sig'], sig, cv2.HISTCMP_CORREL) >= APPEAR_MATCH:
+                        self.performers.add(tid)
+                        self.perf_sig[tid] = p['sig']
+                        self.lost_sigs.remove(sig)
+                        break
+
+        # ---- 1b. performer evidence (leaky accumulators) ----
+        # MediaPipe detections flicker frame to frame, so a single miss must
+        # not wipe out accumulated evidence.
         for tid, p in people.items():
             if p['geom']['standing']:
                 self.stand_streak[tid] += 1
                 self.dbg_stand_peak = max(self.dbg_stand_peak, self.stand_streak[tid])
-                if self.stand_streak[tid] >= PERFORMER_STAND_FRAMES:
-                    self.performers.add(tid)
             else:
                 self.stand_streak[tid] = max(0, self.stand_streak[tid] - 1)
 
@@ -348,8 +399,8 @@ class GazeRulesEngine:
 
         audience, pts, dirs, ray_tids = gather_rays()
 
-        # facing-audience cue: performers face TOWARD the audience, so their
-        # gaze runs contrary to the audience's mean gaze direction
+        # facing-audience evidence: performers face TOWARD the audience, so
+        # their gaze runs contrary to the audience's mean gaze direction
         dbg_coherence = 0.0
         if len(dirs) >= MIN_RAYS:
             mean_vec = np.mean(np.stack(dirs), axis=0)
@@ -357,21 +408,29 @@ class GazeRulesEngine:
             dbg_coherence = coherence
             if coherence > FACING_COHERENCE:
                 mean_dir = mean_vec / coherence
-                promoted = False
                 for tid, p in list(audience.items()):
                     g = p['geom']['gaze']
                     if g is None:
-                        continue
+                        continue          # no ray = neutral, keep evidence
                     if float(np.dot(np.array(g), mean_dir)) < FACING_DOT:
                         self.facing_streak[tid] += 1
                         self.dbg_face_peak = max(self.dbg_face_peak, self.facing_streak[tid])
-                        if self.facing_streak[tid] >= FACING_FRAMES:
-                            self.performers.add(tid)
-                            promoted = True
                     else:
                         self.facing_streak[tid] = max(0, self.facing_streak[tid] - 1)
-                if promoted:
-                    audience, pts, dirs, ray_tids = gather_rays()
+
+        # ---- 1c. promotion: requires BOTH standing AND facing-audience ----
+        # (the audience sits on the floor with legs straight out, so either
+        # cue alone misfires on seated audience members)
+        promoted = False
+        for tid, p in list(audience.items()):
+            if (self.stand_streak[tid] >= PERFORMER_STAND_FRAMES and
+                    self.facing_streak[tid] >= FACING_FRAMES):
+                self.performers.add(tid)
+                if p.get('sig') is not None:
+                    self.perf_sig[tid] = p['sig']
+                promoted = True
+        if promoted:
+            audience, pts, dirs, ray_tids = gather_rays()
 
         # ---- 2. common focal point from audience gaze rays ----
 
@@ -461,9 +520,14 @@ class GazeRulesEngine:
             # movement is never penalised: no motion term anywhere.
             # asymmetric smoothing: dips are slow, recovery is fast - the
             # audience is presumed engaged; divergence is usually transient.
+            # Sustained individual 'off-focal' gaze is a genuine distraction
+            # and decays the score faster than a brief crowd 'shift'.
             if inst is not None:
                 prev = self.score.get(tid, SCORE_SEED)   # presume engaged
-                alpha = SCORE_EMA_UP if inst >= prev else SCORE_EMA_DOWN
+                if inst >= prev:
+                    alpha = SCORE_EMA_UP
+                else:
+                    alpha = SCORE_EMA_DOWN_OFF if reason == 'off-focal' else SCORE_EMA_DOWN
                 self.score[tid] = alpha * inst + (1 - alpha) * prev
             status[tid] = {'score': self.score.get(tid), 'reason': reason,
                            'contributed': tid in [ray_tids[i] for i in contributors]}
@@ -559,10 +623,14 @@ def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
         label = f"ID{tid} ..."
     else:
         s = stat['score']
-        engaged = s >= ENGAGED_THRESH
-        color = COL_ENGAGED if engaged else COL_DISENGAGED
+        if s >= ENGAGED_THRESH:
+            color = COL_ENGAGED
+        elif s >= RED_THRESH:
+            color = COL_PARTIAL          # partially engaged, not "disengaged"
+        else:
+            color = COL_LOW
         thick = 2
-        label = f"ID{tid} {'ENG' if engaged else 'DIS'} {s*100:.0f}%"
+        label = f"ID{tid} {s*100:.0f}%"
         if stat['reason'] in ('shift', 'off-focal'):
             label += f" [{stat['reason']}]"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
@@ -581,7 +649,12 @@ def draw_global(frame, result, n_scored, src_w):
     else:
         scores = [s['score'] for s in result['status'].values() if s['score'] is not None]
         crowd = float(np.mean(scores)) if scores else 0.0
-        col = COL_ENGAGED if crowd >= ENGAGED_THRESH else (0, 120, 230)
+        if crowd >= 0.75:
+            col = COL_ENGAGED
+        elif crowd >= RED_THRESH:
+            col = COL_PARTIAL
+        else:
+            col = COL_LOW
         txt = f"CROWD ENGAGEMENT (gaze rules): {crowd*100:.0f}%  |  scored: {n_scored}"
         if result['distraction']:
             txt += "  |  SYNC GAZE SHIFT!"
@@ -701,7 +774,8 @@ def main():
             kp, pbox = extract_keypoints(holistic, frame_rgb, bbox)
             if kp is None:
                 continue
-            people[tid] = {'geom': person_geometry(kp, pbox), 'bbox': bbox}
+            people[tid] = {'geom': person_geometry(kp, pbox), 'bbox': bbox,
+                           'sig': appearance_sig(frame, bbox)}
 
         # --- rules engine ---
         result = engine.update(people, proc_idx)
