@@ -25,6 +25,7 @@ EPOCHS=50
 LR=0.0001
 SEQUENCE_LENGTH=64
 ENGAGEMENT_WEIGHT=1.5  # presume-engaged tilt
+NUM_WORKERS=8          # background .npz prefetchers per rank (2 ranks -> 16 total; box has 104 cores)
 
 mkdir -p "$OUTPUT_DIR" logs
 
@@ -45,6 +46,7 @@ nohup python3 scripts/train_young_families.py \
     --epochs "$EPOCHS" \
     --lr "$LR" \
     --sequence-length "$SEQUENCE_LENGTH" \
+    --num-workers "$NUM_WORKERS" \
     > "$LOGFILE" 2>&1 &
 
 PID=$!

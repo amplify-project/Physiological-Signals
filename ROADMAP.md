@@ -149,6 +149,52 @@ videos: one filmed from the rear and one from the front** of the audience, to
 measure how sensitive accuracy is to camera angle (and to sanity-check the
 `staring`/gaze behaviour under each viewpoint).
 
+## Gaze-first retrain (observations from "4th lab video.mp4")
+
+Validation of the current model on `Family Lab Videos/4th lab video.mp4`
+suggests the tiny/basic model should be retrained to be **primarily about gaze
+rather than actions**. Key scene structure observed:
+
+- **Audience adults are typically seated**; musicians and dancers are typically
+  standing / walking / mobile.
+- **The mean of the audience gaze converges on a single point** — the active
+  performer. This shared focal point is the core engagement signal.
+
+### Core gaze mechanics
+- [ ] Model gaze as a **straight vector out from the front of the face** (no eye tracking needed initially).
+- [ ] Compute per-person gaze vectors each frame and estimate the **common focal point** (e.g. least-squares intersection / density peak of vector crossings).
+- [ ] **Departures from the common focal point = distraction = disengagement** for that individual.
+- [ ] **Staring at own feet / down at the floor = disengaged.**
+- [ ] **Sudden synchronized deviation** of multiple gazes to a new rapid common direction = an off-stage event (e.g. a child fell) — a distraction, so **disengaged from the concert** (even though gazes still agree).
+- [ ] **No common gaze focal point at all → the concert likely hasn't started yet** (pre-show state; suppress scoring or mark session as not-started).
+- [ ] **Audience movement is NOT penalised** as disengagement if the person's gaze stays on the crowd-average focal point — people shift position to get a better view.
+
+### Performer identification & attribution
+- [ ] **Standing adults are identified as performers** (audience adults are seated).
+- [ ] Performer status is **sticky**: once detected standing as a performer, they remain a performer even if they later sit.
+- [ ] **Performers currently being gazed at get an orange bounding box** in the overlay.
+- [ ] Record each **performer's engagement contribution to file** — especially when multiple performers are standing at once (they usually take turns), attribute audience gaze/engagement to whichever performer holds the focal point.
+- [ ] (Stretch) Use YOLO to **identify the instrument being played** (saxophone, guitar, accordion — each musician plays exactly one), to help distinguish/track individual musicians.
+
+### Overlay
+- [ ] Draw the per-person **gaze vectors** on the overlay.
+- [ ] Mark the estimated common focal point.
+- [ ] Orange bounding box on the performer(s) being gazed at (above).
+
+### Fallback if gaze-focal-point doesn't improve accuracy — parent–child linking
+- [ ] Use YOLO to identify **infants as roughly 1/3 the size of adults**.
+- [ ] The **adult sitting closest to a child is likely its parent**; an **adult touching a child is almost certainly its parent**.
+- [ ] With parent–child links established: **adult gaze on their own child = definitively acceptable** (not disengagement).
+- [ ] **Adult fixation on another audience adult = disengaged.**
+
+### Staged model plan
+1. **v1 — gaze-based model:** retrain the tiny model around gaze-vector /
+   focal-point features (above) as the primary engagement signal.
+2. **v2 — fortify with actions:** reintroduce the action head (existing
+   Kinetics-subset classes) on top of the gaze core.
+3. **v3 — rhythmic/participation features:** add sing-along, clapping, and
+   tapping detection as pro-engagement features.
+
 **If accuracy is poor — revisit the dataset.** If validation on the family
 footage shows the v0 model is not accurate enough, the next step is to **revisit
 the Kinetics-700 dataset and consider downloading/adding new action classes** we

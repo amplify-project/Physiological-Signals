@@ -30,6 +30,9 @@ ARGS_PATCH = """    parser.add_argument('--sequence-length', type=int, default=3
                         help='Young-families fine->binary label file (overrides label_conversion)')
     parser.add_argument('--engagement-weight', type=float, default=1.5,
                         help='CrossEntropy class weight for the engagement class (disengagement stays 1.0)')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='DataLoader worker processes per rank (0 = main-thread loading). '
+                             '>0 prefetches .npz files in the background to keep the GPU fed.')
     args = parser.parse_args()"""
 
 LOAD_ANCHOR = "    total_load_time = time.time() - start_time"
@@ -75,6 +78,24 @@ CRIT_PATCH = """    if args.label_level == 'binary' and getattr(args, 'engagemen
     else:
         criterion = nn.CrossEntropyLoss()"""
 
+# Pipeline the .npz loading with background workers (only when --num-workers > 0).
+# The Nov-2025 DDP hang was caused by on-the-fly DistributedSampler index
+# generation, since fixed by PrecomputedDistributedSampler; workers are safe now.
+TRAIN_LOADER_ANCHOR = """    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
+                              sampler=train_sampler, num_workers=0, pin_memory=True)"""
+
+TRAIN_LOADER_PATCH = """    _dl_kwargs = dict(num_workers=args.num_workers, pin_memory=True)
+    if args.num_workers > 0:
+        _dl_kwargs.update(persistent_workers=True, prefetch_factor=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                              sampler=train_sampler, **_dl_kwargs)"""
+
+VAL_LOADER_ANCHOR = """    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                            sampler=val_sampler, num_workers=0, pin_memory=True)"""
+
+VAL_LOADER_PATCH = """    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                            sampler=val_sampler, **_dl_kwargs)"""
+
 
 def main():
     text = SRC.read_text()
@@ -82,6 +103,8 @@ def main():
         (ARGS_ANCHOR, ARGS_PATCH),
         (LOAD_ANCHOR, LOAD_PATCH),
         (CRIT_ANCHOR, CRIT_PATCH),
+        (TRAIN_LOADER_ANCHOR, TRAIN_LOADER_PATCH),
+        (VAL_LOADER_ANCHOR, VAL_LOADER_PATCH),
     ):
         count = text.count(anchor)
         if count != 1:
