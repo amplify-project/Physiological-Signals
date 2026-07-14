@@ -18,12 +18,12 @@ Implements the 2D gaze-first engagement rules from ROADMAP.md
         started yet (PRE-SHOW; nobody is scored)
       - body movement is NEVER penalised while gaze stays on the focal point
   * PERFORMER promotion (sticky: once a performer, always a performer, even
-    after sitting/bending) requires BOTH cues: (1) standing (the audience sits
-    on the floor, often with legs straight out, so posture alone misfires),
-    AND (2) facing the audience - a gaze direction contrary to the audience's
-    mean gaze direction. Once promoted, performers need no gaze ray, are
-    excluded from audience scoring and the focal-point estimate, and are
-    re-identified across track-id switches by a torso clothes-colour
+    after sitting/bending). Primary cue: MOBILITY - the audience is seated on
+    the floor and never translates through the scene, performers move a lot,
+    so sustained bbox translation alone promotes. Secondary path: standing
+    AND facing the audience together. Once promoted, performers need no gaze
+    ray, are excluded from audience scoring and the focal-point estimate, and
+    are re-identified across track-id switches by a torso clothes-colour
     signature. A performer holding the crowd focal point gets an ORANGE
     bounding box.
 
@@ -99,8 +99,15 @@ SHIFT_MIN_FRAC = 0.4             # ... and this fraction of valid audience must 
 SHIFT_COOLDOWN = 20              # processed frames the distraction event lasts
 
 # --- performer detection (sticky) ---
-# Promotion requires BOTH cues (the audience sits on the floor with legs
-# straight out, so the standing test alone misfires on seated audience):
+# The audience is seated on the floor and does NOT translate through the
+# scene; performers move a lot. MOBILITY is therefore the primary cue:
+# Cue 0 (sufficient alone): sustained bbox-centre translation.
+MOVE_MIN_STEP = 0.06             # per-processed-frame centre displacement (in bbox-height
+                                 # units) that counts as "moving" (seated sway is below this)
+MOVE_MAX_STEP = 1.2              # above this = YOLO id-switch teleport; ignored, not evidence
+MOVE_FRAMES = 4                  # movement evidence (leaky: hit +1, still -1) before promotion
+# Cues 1+2 (must BOTH hold - the audience sits with legs straight out, so the
+# standing test alone misfires on seated audience):
 # Cue 1: standing (legs extended AND knees dropped below the hip).
 LEG_TORSO_RATIO = 1.15           # (hip->ankle) > ratio * (shoulder->hip) => legs extended
 KNEE_DROP_FRAC = 0.55            # (hip->knee) > frac * torso => not folded (seated knees ~ hip level)
@@ -332,6 +339,8 @@ class GazeRulesEngine:
         self.lost_sigs = deque(maxlen=APPEAR_MAX_LOST)  # signatures of lost performers
         self.stand_streak = defaultdict(int)    # tid -> consecutive standing frames
         self.facing_streak = defaultdict(int)   # tid -> consecutive facing-audience frames
+        self.move_streak = defaultdict(int)     # tid -> sustained-translation evidence
+        self.prev_centre = {}                   # tid -> last bbox centre (np.array)
         self.dir_hist = defaultdict(lambda: deque(maxlen=SHIFT_WINDOW + 1))
         self.score = {}                         # tid -> EMA engagement 0..1
         self.focal = None                       # smoothed focal point (np.array)
@@ -341,10 +350,13 @@ class GazeRulesEngine:
         self.shifted_tids = set()
         self.dbg_face_peak = 0                  # max facing streak ever seen
         self.dbg_stand_peak = 0                 # max standing streak ever seen
+        self.dbg_move_peak = 0                  # max movement streak ever seen
 
     def evict(self, tid):
         self.stand_streak.pop(tid, None)
         self.facing_streak.pop(tid, None)
+        self.move_streak.pop(tid, None)
+        self.prev_centre.pop(tid, None)
         self.dir_hist.pop(tid, None)
         self.score.pop(tid, None)
         self.shifted_tids.discard(tid)
@@ -369,12 +381,12 @@ class GazeRulesEngine:
             for tid, p in people.items():
                 if tid in self.performers or p.get('sig') is None:
                     continue
-                for sig in list(self.lost_sigs):
+                for i, sig in enumerate(self.lost_sigs):
                     if cv2.compareHist(p['sig'], sig, cv2.HISTCMP_CORREL) >= APPEAR_MATCH:
                         self.performers.add(tid)
                         self.perf_sig[tid] = p['sig']
-                        self.lost_sigs.remove(sig)
-                        break
+                        del self.lost_sigs[i]   # remove by index: numpy arrays
+                        break                   # break == comparison in remove()
 
         # ---- 1b. performer evidence (leaky accumulators) ----
         # MediaPipe detections flicker frame to frame, so a single miss must
@@ -385,6 +397,23 @@ class GazeRulesEngine:
                 self.dbg_stand_peak = max(self.dbg_stand_peak, self.stand_streak[tid])
             else:
                 self.stand_streak[tid] = max(0, self.stand_streak[tid] - 1)
+
+            # mobility: the seated audience never translates through the
+            # scene; performers do. Per-frame centre step, normalized by the
+            # person's own bbox height; huge steps are id-switch teleports.
+            x1, y1, x2, y2 = p['bbox']
+            centre = np.array([0.5 * (x1 + x2), 0.5 * (y1 + y2)])
+            scale = max(1.0, float(y2 - y1))
+            prev_c = self.prev_centre.get(tid)
+            self.prev_centre[tid] = centre
+            if prev_c is not None:
+                step = float(np.hypot(*(centre - prev_c))) / scale
+                if MOVE_MIN_STEP <= step <= MOVE_MAX_STEP:
+                    self.move_streak[tid] += 1
+                    self.dbg_move_peak = max(self.dbg_move_peak, self.move_streak[tid])
+                elif step < MOVE_MIN_STEP:
+                    self.move_streak[tid] = max(0, self.move_streak[tid] - 1)
+                # step > MOVE_MAX_STEP: teleport, leave evidence untouched
 
         def gather_rays():
             aud = {tid: p for tid, p in people.items() if tid not in self.performers}
@@ -418,13 +447,15 @@ class GazeRulesEngine:
                     else:
                         self.facing_streak[tid] = max(0, self.facing_streak[tid] - 1)
 
-        # ---- 1c. promotion: requires BOTH standing AND facing-audience ----
-        # (the audience sits on the floor with legs straight out, so either
-        # cue alone misfires on seated audience members)
+        # ---- 1c. promotion: sustained MOBILITY alone, or standing AND
+        # facing-audience together (the audience sits on the floor with legs
+        # straight out, so posture alone misfires on seated audience members)
         promoted = False
         for tid, p in list(audience.items()):
-            if (self.stand_streak[tid] >= PERFORMER_STAND_FRAMES and
-                    self.facing_streak[tid] >= FACING_FRAMES):
+            mobile = self.move_streak[tid] >= MOVE_FRAMES
+            stand_and_face = (self.stand_streak[tid] >= PERFORMER_STAND_FRAMES and
+                              self.facing_streak[tid] >= FACING_FRAMES)
+            if mobile or stand_and_face:
                 self.performers.add(tid)
                 if p.get('sig') is not None:
                     self.perf_sig[tid] = p['sig']
@@ -555,6 +586,7 @@ class GazeRulesEngine:
                 'coherence': dbg_coherence,
                 'max_facing': self.dbg_face_peak,
                 'max_stand': self.dbg_stand_peak,
+                'max_move': self.dbg_move_peak,
             },
         }
 
@@ -827,6 +859,7 @@ def main():
                   f"| performers {len(engine.performers)} "
                   f"| coh {result['debug']['coherence']:.2f} "
                   f"face {result['debug']['max_facing']} stand {result['debug']['max_stand']} "
+                  f"move {result['debug']['max_move']} "
                   f"| {'LIVE' if result['started'] else 'PRE-SHOW'}")
 
     cap.release()
