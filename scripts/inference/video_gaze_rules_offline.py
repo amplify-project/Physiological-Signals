@@ -47,6 +47,7 @@ import math
 import os
 import time
 from collections import deque, defaultdict
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -144,6 +145,16 @@ PERFORMER_BOX_PAD = 0.20         # focal point within performer bbox padded by t
 # while they are tracked and any later track matching it re-locks instantly.
 APPEAR_MATCH = 0.85              # min histogram correlation to re-claim performer status
 SIG_EMA = 0.10                   # per-frame refresh of a tracked performer's registered signature
+# Ghost coasting: when a performer's track is lost, their identity keeps moving
+# along the last known velocity (same motion-prediction idea BoT-SORT uses
+# internally). A new track appearing near the PREDICTED position re-locks even
+# when the colour signature is unreadable (side-on, shadow, partial occlusion).
+GHOST_FRAMES = 45                # processed frames a ghost coasts before expiring (~15 s @ stride 10)
+GHOST_RADIUS = 1.5               # re-lock gate: new track centre within this many bbox-heights
+                                 # of the ghost's predicted position
+GHOST_VEL_DAMP = 0.90            # per-frame velocity decay (prediction must not run away)
+GHOST_SIG_MIN = 0.5              # if the candidate HAS a signature it must at least loosely
+                                 # match (blocks adopting a nearby seated audience member)
 
 # --- harness ---
 NUM_KEYPOINTS = 543
@@ -360,6 +371,8 @@ class GazeRulesEngine:
         self.perf_registry = []                 # PERMANENT clothes-colour signatures, one per
                                                 # unique performer identity (session lifetime)
         self.perf_reg_idx = {}                  # active performer tid -> registry index
+        self.perf_kin = {}                      # performer tid -> (centre, velocity, bbox_h)
+        self.ghosts = {}                        # registry idx -> [pred_pos, vel, bbox_h, frames_left]
         self.stand_streak = defaultdict(int)    # tid -> consecutive standing frames
         self.facing_streak = defaultdict(int)   # tid -> consecutive facing-audience frames
         self.move_streak = defaultdict(int)     # tid -> sustained-translation evidence
@@ -384,8 +397,13 @@ class GazeRulesEngine:
         self.score.pop(tid, None)
         self.shifted_tids.discard(tid)
         # The registry entry PERSISTS: the person re-claims performer status
-        # under any NEW track id whose clothes signature matches (re-ID below).
-        self.perf_reg_idx.pop(tid, None)
+        # under any NEW track id whose clothes signature matches (re-ID below)
+        # or that appears where the ghost predicts they moved to.
+        idx = self.perf_reg_idx.pop(tid, None)
+        kin = self.perf_kin.pop(tid, None)
+        if idx is not None and kin is not None:
+            centre, vel, h = kin
+            self.ghosts[idx] = [centre.copy(), vel.copy(), h, GHOST_FRAMES]
         self.performers.discard(tid)
 
     def register_performer(self, tid, sig):
@@ -413,30 +431,62 @@ class GazeRulesEngine:
         Returns dict with focal point, per-tid status, gazed performer ids and
         the distraction flag.
         """
-        # ---- 1a. performer re-identification (appearance / clothes colour) ----
+        # ---- 1a. performer re-identification ----
         # Performer identities are registered PERMANENTLY. A performer whose
-        # YOLO track was lost re-appears with a new id; any track matching an
-        # unclaimed registry signature locks straight back on.
+        # YOLO track was lost re-appears with a new id; it locks back on when
+        # EITHER the clothes signature matches an unclaimed registry entry OR
+        # it appears where that identity's ghost predicts (coasted position).
+        for idx in list(self.ghosts):           # advance ghosts along last velocity
+            g = self.ghosts[idx]
+            g[0] += g[1]
+            g[1] *= GHOST_VEL_DAMP
+            g[3] -= 1
+            if g[3] <= 0:
+                del self.ghosts[idx]
         unclaimed = set(range(len(self.perf_registry))) - set(self.perf_reg_idx.values())
         if unclaimed:
             for tid, p in people.items():
-                if tid in self.performers or p.get('sig') is None:
+                if tid in self.performers:
                     continue
+                sig = p.get('sig')
+                x1, y1, x2, y2 = p['bbox']
+                centre = np.array([0.5 * (x1 + x2), 0.5 * (y1 + y2)])
                 best_i, best_c = -1, APPEAR_MATCH
                 for i in unclaimed:
-                    c = cv2.compareHist(p['sig'], self.perf_registry[i], cv2.HISTCMP_CORREL)
-                    if c >= best_c:
-                        best_i, best_c = i, c
+                    # colour path
+                    if sig is not None:
+                        c = cv2.compareHist(sig, self.perf_registry[i], cv2.HISTCMP_CORREL)
+                        if c >= best_c:
+                            best_i, best_c = i, c
+                            continue
+                    # motion path: near the ghost's predicted position, with at
+                    # most a LOOSE colour veto (never adopt a clearly different
+                    # person who happens to sit where the performer passed)
+                    g = self.ghosts.get(i)
+                    if g is not None and float(np.hypot(*(centre - g[0]))) <= GHOST_RADIUS * g[2]:
+                        if sig is None or cv2.compareHist(
+                                sig, self.perf_registry[i], cv2.HISTCMP_CORREL) >= GHOST_SIG_MIN:
+                            best_i, best_c = i, APPEAR_MATCH
                 if best_i >= 0:
                     self.performers.add(tid)
                     self.perf_reg_idx[tid] = best_i
+                    self.ghosts.pop(best_i, None)
                     unclaimed.discard(best_i)
 
         # refresh registered signatures while performers are tracked (slow EMA:
-        # tolerates lighting drift without absorbing brief occlusions)
+        # tolerates lighting drift without absorbing brief occlusions), and
+        # keep per-performer kinematics for ghost coasting on track loss
         for tid in self.performers:
             idx = self.perf_reg_idx.get(tid)
-            sig = people.get(tid, {}).get('sig')
+            p = people.get(tid)
+            if p is None:
+                continue
+            x1, y1, x2, y2 = p['bbox']
+            centre = np.array([0.5 * (x1 + x2), 0.5 * (y1 + y2)])
+            prev = self.perf_kin.get(tid)
+            vel = (centre - prev[0]) if prev is not None else np.zeros(2)
+            self.perf_kin[tid] = (centre, vel, max(1.0, float(y2 - y1)))
+            sig = p.get('sig')
             if idx is not None and sig is not None:
                 ref = self.perf_registry[idx]
                 if cv2.compareHist(sig, ref, cv2.HISTCMP_CORREL) >= APPEAR_MATCH:
@@ -805,6 +855,12 @@ def main():
                     help='annotated output path (default: <video>_gaze_rules.mp4)')
     ap.add_argument('--yolo', default='yolo11n.pt')
     ap.add_argument('--conf', type=float, default=0.15, help='YOLO person confidence')
+    ap.add_argument('--imgsz', type=int, default=1280,
+                    help='YOLO inference size; 640 downscales 1080p wide shots so far-away '
+                         'seated people (and performers) drop out of detection entirely')
+    ap.add_argument('--tracker', default=str(Path(__file__).parent / 'botsort_gaze.yaml'),
+                    help='Ultralytics tracker config (default: strided-video BoT-SORT tune '
+                         'with a long lost-track buffer to curb id inflation)')
     ap.add_argument('--frame-stride', type=int, default=2, help='process every Nth frame')
     ap.add_argument('--start-seconds', type=float, default=0.0)
     ap.add_argument('--max-seconds', type=float, default=0.0, help='0 = whole video')
@@ -884,7 +940,8 @@ def main():
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         # --- YOLO person tracking ---
-        results = yolo.track(frame, persist=True, verbose=False, classes=[0], conf=args.conf)
+        results = yolo.track(frame, persist=True, verbose=False, classes=[0],
+                             conf=args.conf, imgsz=args.imgsz, tracker=args.tracker)
         detections = []
         if results and results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
