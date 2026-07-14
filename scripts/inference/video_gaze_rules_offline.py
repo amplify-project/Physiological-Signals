@@ -22,9 +22,9 @@ Implements the 2D gaze-first engagement rules from ROADMAP.md
     scoring and from the focal-point estimate. A performer holding the crowd
     focal point gets an ORANGE bounding box.
 
-Overlay: per-person gaze lines projected out to the convergence point (clipped
-where they hit another person's bounding box), orange performer boxes,
-green/red audience boxes, crowd banner.
+Overlay: per-person gaze lines projected out to the common focal point so the
+convergence is visible, orange performer boxes, green/red audience boxes,
+crowd banner.
 
 Pipeline (harness mirrors scripts/inference/video_engagement_offline.py):
   YOLO person track -> per-person crop (10% pad) -> MediaPipe Holistic ->
@@ -51,10 +51,11 @@ import numpy as np
 # CONFIG (tunable rule thresholds)
 # =============================================================================
 # --- gaze geometry ---
-VIS_THRESH = 0.3                 # min MediaPipe landmark visibility
-HEAD_MARGIN = 0.10               # nose/ears may exceed the crop by this fraction before
+VIS_THRESH = 0.3                 # min MediaPipe landmark visibility (posture)
+HEAD_VIS_THRESH = 0.6            # stricter bar for head landmarks used for gaze
+HEAD_MARGIN = 0.05               # nose/ears/eyes may exceed the crop by this fraction before
                                  # the gaze is rejected as a bad detection (stray rays)
-HEAD_TOP_FRAC = 0.55             # nose must sit in the top fraction of the crop (head region)
+HEAD_TOP_FRAC = 0.45             # nose must sit in the top fraction of the crop (head region)
 AMBIG_FRAC = 0.15                # |nose-earmid| < this * ear_dist => facing camera/away (no 2D dir)
 FLOOR_GAZE_DY = 0.80             # unit-dir y-component above this => staring at floor
 FLOOR_PITCH_FRAC = 0.80          # nose below ear-line by this * head_size also => floor gaze
@@ -173,20 +174,24 @@ def person_geometry(kp, pbox):
            'floor': False, 'standing': False}
 
     # MediaPipe can return landmarks outside the crop (normalized coords beyond
-    # [0,1]) on poor detections; such "heads" produce stray gaze rays that
-    # emanate from nowhere. Require head landmarks inside the crop (+margin)
-    # and the nose in the upper part of the box.
+    # [0,1]) on poor detections, and in dense crowds a padded crop may contain a
+    # NEIGHBOUR's face, which MediaPipe latches onto - both produce stray gaze
+    # rays. Require head landmarks well-visible, inside the crop (+margin), the
+    # nose in the upper part of the box, and an eye corroborating each ear.
     def head_ok(i):
         nx, ny = kp[i, 0], kp[i, 1]
-        return (-HEAD_MARGIN <= nx <= 1.0 + HEAD_MARGIN and
+        return (kp[i, 2] >= HEAD_VIS_THRESH and
+                -HEAD_MARGIN <= nx <= 1.0 + HEAD_MARGIN and
                 -HEAD_MARGIN <= ny <= 1.0 + HEAD_MARGIN)
 
     # ---- gaze: ear-midpoint -> nose (or single-ear profile fallback) ----
-    if vis(NOSE) >= VIS_THRESH and head_ok(NOSE) and kp[NOSE, 1] <= HEAD_TOP_FRAC:
+    if head_ok(NOSE) and 0.0 <= kp[NOSE, 0] <= 1.0 and kp[NOSE, 1] <= HEAD_TOP_FRAC:
         nose = pt(NOSE)
         out['anchor'] = (float(nose[0]), float(nose[1]))
-        l_ok = vis(L_EAR) >= VIS_THRESH and head_ok(L_EAR)
-        r_ok = vis(R_EAR) >= VIS_THRESH and head_ok(R_EAR)
+        # each ear must be corroborated by the eye on the same side, otherwise
+        # a lone misdetected ear yields a wild gaze direction
+        l_ok = head_ok(L_EAR) and head_ok(L_EYE)
+        r_ok = head_ok(R_EAR) and head_ok(R_EYE)
         ear_mid = ear_dist = None
         if l_ok and r_ok:
             le, re = pt(L_EAR), pt(R_EAR)
@@ -387,27 +392,10 @@ def extract_keypoints(holistic, frame_rgb, bbox):
 # =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
-def ray_box_entry_t(p, d, box):
-    """Distance t >= 0 at which ray (p, d unit) first enters an AABB, or None."""
-    x1, y1, x2, y2 = box
-    t0, t1 = 0.0, float('inf')
-    for axis, (lo, hi) in enumerate(((x1, x2), (y1, y2))):
-        if abs(d[axis]) < 1e-9:
-            if not (lo <= p[axis] <= hi):
-                return None
-        else:
-            ta = (lo - p[axis]) / d[axis]
-            tb = (hi - p[axis]) / d[axis]
-            if ta > tb:
-                ta, tb = tb, ta
-            t0 = max(t0, ta)
-            t1 = min(t1, tb)
-    return t0 if t0 <= t1 else None
-
-
 def draw_gaze_rays(frame, people, focal):
-    """Plain gaze lines (no arrowheads), projected out to the convergence
-    point, clipped earlier if the ray hits another person's bounding box."""
+    """Plain gaze lines (no arrowheads). When a common focal point exists,
+    every ray is projected out to its closest approach to that point so the
+    convergence is visible; otherwise a short stub is drawn."""
     for tid, p in people.items():
         g = p['geom']
         if g['gaze'] is None or g['anchor'] is None:
@@ -419,12 +407,6 @@ def draw_gaze_rays(frame, people, focal):
             t_focal = float(np.dot(np.array(focal) - a, d))
             if t_focal > 0:
                 L = t_focal
-        for otid, op in people.items():
-            if otid == tid:
-                continue
-            t = ray_box_entry_t(a, d, op['bbox'])
-            if t is not None and 1e-6 < t < L:
-                L = t                             # stop at the first person hit
         end = (int(a[0] + d[0] * L), int(a[1] + d[1] * L))
         cv2.line(frame, (int(a[0]), int(a[1])), end, COL_GAZE, 2, cv2.LINE_AA)
 
