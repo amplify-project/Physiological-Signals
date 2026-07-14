@@ -180,16 +180,37 @@ on four segments of the 4th lab video (solo dancer, sax, accordion, full band).
   window, overwhelming standing evidence, or standing+facing-the-audience;
   clothes-colour re-ID recovers them across tracker id switches. Performers
   cast no gaze rays; audience rays clip at performer boxes.
+- **Performer motion tracking** (validated on band + accordion segments):
+  YOLO at `imgsz` 1280 (small far-away performers), tuned BoT-SORT config
+  (`scripts/inference/botsort_gaze.yaml`: 90-frame lost-track buffer, tighter
+  match threshold), ghost coasting through short occlusions, and a permanent
+  performer appearance registry so identity survives track churn.
+
+### Live integration (done — this branch)
+- [x] **Shared module** — rules extracted into `scripts/inference/gaze_rules.py`
+      (engine + geometry + overlay drawing), consumed by both the offline
+      harness and `live_multiperson_binary_v2.py` (dev + Handover copies).
+- [x] **Late fusion, gaze-biased** — gaze is the base score;
+      `fused = 0.7·gaze + 0.3·action`; the action model rescues confident pro
+      cues (`action ≥ 0.75` → floor 0.65) and caps confident anti cues
+      (`action ≤ 0.25` → cap 0.40). PRE-SHOW falls back to pure action score.
+- [x] **Rate scaling** — rules were tuned at ~3 processed fps offline; the
+      engine's frame-count windows and EMA rates scale by `rate_scale=4.0` for
+      the ≥12 fps live loop.
+- [x] **Live overlay** — gaze rays, orange performer boxes (`<<` when the
+      focal point sits on them), `Gaze: PRE-SHOW / LIVE perf:N` + `SHIFT!` HUD.
+- [x] Crowd average: gaze-scored people at full weight (no model warm-up
+      needed), performers excluded; MediaPipe switched to
+      `static_image_mode=True` (tracking mode leaked landmarks across
+      different people's crops → stray rays).
+- [x] **Registered adults only** — with face-ID active, only enrolled
+      (EmotiBit-wearing) adults are gaze-scored and only their rays vote for
+      the focal point; bystanders/infants carry null geometry. Performer
+      promotion still works for unregistered people via bbox mobility.
+- [x] Handover bundle updated (`gaze_rules.py`, `botsort_gaze.yaml`,
+      README_HANDOVER) — batch files unchanged.
 
 ### Remaining gaze work
-- [ ] Update README with the gaze rules above.
-- [ ] **Integrate with the actions model as-is** (late fusion, gaze-biased):
-      gaze = attention (base score); actions rescue an off-focal person on
-      confident pro cues (dancing/clapping/singing — e.g. nodding along while
-      looking away) and override gaze on confident anti cues (phone).
-- [ ] Restrict gaze scoring to **registered adults** (EmotiBit wearers) via the
-      existing face-ID binding; never score infants.
-- [ ] Port from offline smoke tests to the **live 2D video** pipeline.
 - [ ] Record each **performer's engagement contribution to file** (attribute
       audience gaze to whichever performer holds the focal point).
 - [ ] Prepare for packed real-concert audiences: leg/posture cues will be

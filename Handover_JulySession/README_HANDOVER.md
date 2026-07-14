@@ -18,6 +18,8 @@ handover_ar_v1/
 ├── requirements.txt                 ← All Python deps, fully pinned
 │
 ├── live_multiperson_binary_v2.py    ← Main engagement inference + GUI
+├── gaze_rules.py                    ← Gaze-first rules engine (focal point, performer detection)
+├── botsort_gaze.yaml                ← Tuned BoT-SORT tracker config (stable IDs in crowds)
 ├── face_identifier.py               ← Face registration module
 ├── multiemotibit_UDP_SD_RFv2.py     ← EmotiBit SD metrics → Valence/Arousal → Redis (multi-device)
 ├── redis_subscriber_all_devices.py  ← CLI diagnostic: prints all Redis channels
@@ -91,7 +93,10 @@ This will:
 The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera view with a sidebar:
 
 - **Bounding boxes** are labelled `P1`, `P2`, … — small recyclable display IDs that stay stable for the operator. The raw tracker ID is still recorded in the saved data for offline analysis.
-- **Engagement score** is shown as a coloured overlay on each person's bounding box (green = engaged, red = disengaged).
+- **Engagement score** is shown as a coloured overlay on each person's bounding box (green = engaged, red = disengaged). The score is a **fusion of two signals**: the gaze rules (base) and the action-transformer model (rescue/override) — see the *Gaze-first engagement scoring* section below.
+- **Performers** are drawn with an **orange** box labelled `PERFORMER` and are excluded from the crowd score. The box thickens (with a `<<` marker) when the crowd's shared gaze point sits on that performer.
+- **Gaze rays** — thin lines from each audience member's head toward where they are looking, projected to the crowd's shared focal point. Performers never get a ray, and rays are clipped at performer boxes.
+- The **HUD** shows the gaze engine state: `Gaze: PRE-SHOW` (no shared focal point yet — pure action-model scoring) or `Gaze: LIVE perf:N` (focal point locked, N performers detected). `SHIFT!` flags a synchronized crowd gaze shift (e.g. a door opening).
 - A small **cyan dot** in the top-right of a bounding box means that person received fresh MediaPipe extraction this frame (the rest reuse their last score). When the system is throttling under crowd load the HUD shows e.g. `MP: 1/3 rr2`.
 - **Sidebar** shows one row per enrolled person with their EmotiBit serial. Each row has:
   - **Header readouts** — three small colour-coded values right-aligned next to the serial: `HR ±z.zz`, `EDA ±z.zz`, `TEMP ±z.zz`. Values are per-wearer session z-scores (deviation from this wearer's own running mean, in their own SD units). When `|z| ≥ 2` the readout switches to bold with a faint coloured pill behind it.
@@ -129,7 +134,36 @@ When `2_START_EMOTIBIT.bat` starts (runs `multiemotibit_UDP_SD_RFv2.py`):
 
 ---
 
-## 📡 Redis Channels — What Gets Published
+## � Gaze-first engagement scoring (Gaze_Rules)
+
+The engagement score is no longer the raw action-transformer output. A rules-based **gaze engine** (`gaze_rules.py`) provides the base score, fused with the model:
+
+**How the gaze engine works** (all from the same MediaPipe keypoints the model already consumes — no extra compute):
+
+1. **Gaze rays** — a 2D gaze direction per person from face/shoulder landmarks, quality-gated (visibility, head size).
+2. **Crowd focal point** — least-squares intersection of the rays. When a quorum of the audience (≥ 50%) agrees within a tolerance cone, the focal point locks and the show is considered **started**. Until then the pipeline stays in `PRE-SHOW` and uses the pure action-model score.
+3. **Per-person score** — a cone score around the focal direction, smoothed with an asymmetric EMA: dips are slow (audience presumed engaged, divergence usually transient), recovery is fast. Sustained off-focal gaze decays faster. Unreadable gaze (face straight at/away from camera) drifts slowly toward neutral rather than freezing.
+4. **Synchronized shift detection** — if most of the crowd swings its gaze at once (a door opens, a phone flash), the score dip is suppressed and `SHIFT!` is flagged instead of penalizing everyone.
+5. **Performer detection** — sticky promotion of people who move around the space, stand for long periods, or stand while the seated crowd faces them. Performers keep an appearance signature so they are re-recognized after track loss (ghost coasting + colour histogram matching) and are **never scored** into the crowd average.
+
+**Fusion with the action model** (constants at the top of `live_multiperson_binary_v2.py`):
+
+```
+fused = 0.7 * gaze + 0.3 * action
+if action ≥ 0.75 and fused < 0.65 → fused = 0.65   # confident pro cue rescues
+if action ≤ 0.25              → fused = min(fused, 0.40)  # confident anti cue caps
+```
+
+- Gaze scores are available within a couple of frames (no 4 s model warm-up), so people entering the frame are scored almost immediately.
+- **Registered adults only** — with face-ID active, only enrolled (EmotiBit-wearing) adults are gaze-scored and only their rays vote for the focal point; bystanders and infants are never scored. Performers are still detected among unregistered people via movement.
+- Before the show starts (no shared focal point) scoring falls back to the pure action model.
+- Tracking uses the bundled **`botsort_gaze.yaml`** (long lost-track buffer, tighter match threshold) so IDs survive occlusion in crowds.
+
+All thresholds are documented in `gaze_rules.py` and were tuned on the 4th Family Lab video (dancer / sax / accordion / full-band segments).
+
+---
+
+## �📡 Redis Channels — What Gets Published
 
 All AR data flows over Redis pub/sub on `localhost:6379`.
 

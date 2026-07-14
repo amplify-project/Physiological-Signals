@@ -97,6 +97,14 @@ from applog import setup_logging, install_excepthook  # noqa: E402
 import logging as _logging
 log = _logging.getLogger('engagement')
 
+# Gaze-first rules layer (shared module, sits beside this script; same file
+# as Handover_JulySession/gaze_rules.py). Provides the per-person gaze-ray ->
+# crowd-focal-point engagement score and sticky performer detection that the
+# action-transformer output is FUSED with (gaze = base, actions = rescue /
+# override). See gaze_rules.py for the rule set and tunable thresholds.
+from gaze_rules import (GazeRulesEngine, person_geometry, null_geometry,  # noqa: E402
+                        appearance_sig, draw_gaze_rays, COL_PERFORMER)
+
 # Optional: 360° support
 try:
     import py360convert
@@ -267,6 +275,23 @@ else:
 SESSIONS_DIR = Path.cwd() / 'data' / 'sessions'
 
 CONFIDENCE_THRESHOLD = 0.5          # Engagement threshold for binary decision
+
+# --- Gaze + actions late fusion (Gaze_Rules integration) ---
+# The gaze rules produce the BASE attention score (available within a couple
+# of frames, no model warm-up). The action-transformer output is blended in
+# and can RESCUE a low gaze score on a confident pro-engagement cue (e.g.
+# nodding along while looking away) or CAP the score on a confident anti cue
+# (e.g. phone use the gaze ray misses). Before the show starts (no common
+# focal point) the pipeline falls back to the pure action-model score.
+GAZE_WEIGHT = 0.7                   # gaze share of the blended score
+ACTION_RESCUE_PROB = 0.75           # model this confident in 'engaged' ...
+ACTION_RESCUE_FLOOR = 0.65          # ... floors the fused score here
+ACTION_OVERRIDE_PROB = 0.25         # model this confident in 'disengaged' ...
+ACTION_OVERRIDE_CAP = 0.40          # ... caps the fused score here
+# Gaze rule thresholds are tuned at ~3 processed fps (offline stride-10
+# validation); the live loop targets TARGET_FPS_FLOOR=12, so frame-count
+# windows inside the engine are scaled by 4 to keep wall-clock behaviour.
+GAZE_RATE_SCALE = 4.0
 
 # FPS-Adaptive Sequence Length Configuration
 # Training used 300 frames @ 30 FPS = 10 seconds of action context
@@ -824,12 +849,15 @@ class MultiPersonEngagementSystem:
         _silence_native_stderr()  # MediaPipe C++ init spams fd 2; restored after first frame
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
-            static_image_mode=False,
+            # static_image_mode=True: process() runs on DIFFERENT people's
+            # crops back-to-back; tracking mode carries landmark state from
+            # the previous call (a DIFFERENT person), producing leaked
+            # landmarks and stray gaze rays. No measurable speed cost.
+            static_image_mode=True,
             model_complexity=1,
             enable_segmentation=False,
             refine_face_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.5
         )
         
         # 4. Load Engagement Model
@@ -898,6 +926,17 @@ class MultiPersonEngagementSystem:
         self._rr_offset = 0
         self.last_selected_count = 0
         self.last_total_count = 0
+
+        # Gaze rules engine (Gaze_Rules integration): crowd focal point,
+        # per-person gaze scores, sticky performer registry. last_gaze_result
+        # is read by the main loop for the overlay (rays, performer boxes,
+        # PRE-SHOW / LIVE HUD state).
+        self.gaze_engine = GazeRulesEngine(rate_scale=GAZE_RATE_SCALE)
+        self.last_gaze_result = None
+        # Tuned BoT-SORT config (long lost-track buffer, curbs id inflation)
+        # when bundled beside the script; ultralytics default otherwise.
+        _tracker_cfg = SCRIPT_DIR / 'botsort_gaze.yaml'
+        self.tracker_cfg = str(_tracker_cfg) if _tracker_cfg.exists() else 'botsort.yaml'
         
         # Per-view YOLO trackers for 360° mode (avoids cross-view ID confusion)
         self._view_yolos = {}
@@ -1146,6 +1185,7 @@ class MultiPersonEngagementSystem:
             self.person_scores.pop(tid, None)
             self.person_last_seen.pop(tid, None)
             self._release_display_id(tid)
+            self.gaze_engine.evict(int(tid))
         if len(self.person_buffers) > MAX_TRACKED_IDS:
             ordered = sorted(self.person_last_seen.items(), key=lambda kv: kv[1])
             n_drop = len(self.person_buffers) - MAX_TRACKED_IDS
@@ -1156,6 +1196,7 @@ class MultiPersonEngagementSystem:
                 self.person_scores.pop(tid, None)
                 self.person_last_seen.pop(tid, None)
                 self._release_display_id(tid)
+                self.gaze_engine.evict(int(tid))
 
     # --- Display-label remap -------------------------------------------------
     def display_label(self, track_id):
@@ -1283,9 +1324,11 @@ class MultiPersonEngagementSystem:
         
         # 1. YOLO Tracking — pass BGR frame (YOLO expects BGR, converts internally)
         # persist=True is crucial for ID tracking across frames
-        results = self.yolo.track(frame, persist=True, verbose=False, classes=[0], conf=0.15)
+        results = self.yolo.track(frame, persist=True, verbose=False, classes=[0],
+                                  conf=0.15, tracker=self.tracker_cfg)
         
         current_frame_data = [] # List of (bbox, track_id, score)
+        gaze_people = {}        # tid -> {'geom','bbox','sig'} for the gaze rules engine
         
         if results and results[0].boxes and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -1316,6 +1359,9 @@ class MultiPersonEngagementSystem:
                 # Bystander when registered-only: keep a fresh bbox for face ID /
                 # enrolment but run no MediaPipe, no inference, no buffer.
                 if self.registered_only and tid_int not in self.registered_ids:
+                    gaze_people[tid_int] = {'geom': null_geometry((x1, y1, x2, y2)),
+                                            'bbox': (x1, y1, x2, y2),
+                                            'sig': appearance_sig(frame, (x1, y1, x2, y2))}
                     current_frame_data.append({
                         'bbox': (x1, y1, x2, y2),
                         'padded_bbox': (x1, y1, x2, y2),
@@ -1333,6 +1379,9 @@ class MultiPersonEngagementSystem:
                     self._record_mp_time((time.perf_counter() - mp_t0) * 1000.0)
                     features_flat = features.flatten()
                     self._append_features(track_id, features_flat)
+
+                    # Gaze geometry from the SAME keypoints the model consumes
+                    gaze_geom = person_geometry(features, padded_bbox)
 
                     # 3. Inference (gated on wall-clock span, not frame count; resample
                     #    to MODEL_INPUT_FRAMES so the model always sees its trained shape)
@@ -1356,6 +1405,10 @@ class MultiPersonEngagementSystem:
                     self._ensure_buffer(track_id)
                     features = None
                     padded_bbox = (x1, y1, x2, y2)
+                    gaze_geom = null_geometry((x1, y1, x2, y2))
+
+                gaze_people[tid_int] = {'geom': gaze_geom, 'bbox': (x1, y1, x2, y2),
+                                        'sig': appearance_sig(frame, (x1, y1, x2, y2))}
 
                 current_frame_data.append({
                     'bbox': (x1, y1, x2, y2),
@@ -1364,31 +1417,64 @@ class MultiPersonEngagementSystem:
                     'score': self.person_scores[track_id],
                     'buffer_fill': min(self._buffer_time_span(track_id) / TARGET_DURATION_SECONDS, 1.0),
                     'keypoints': features,
+                    'gaze_geom': gaze_geom,
                 })
         
-        # 4. Calculate Crowd Average (confidence-weighted)
-        if self.person_scores:
-            # Include all people whose buffer spans MIN_INFERENCE_SECONDS, weighted by buffer fill.
-            # When registered_only is set, restrict to track_ids matched to an enrolled
-            # (registered) person — the EmotiBit-wearing parents — so the crowd score
-            # reflects only registered attendees, not bystanders.
-            weighted_sum = 0.0
-            weight_total = 0.0
-            for d in current_frame_data:
-                bf = d.get('buffer_fill', 0.0)
-                if not self._buffer_ready(d['id']):
-                    continue
-                if self.registered_only and int(d['id']) not in self.registered_ids:
-                    continue
-                weighted_sum += d['score'] * bf
-                weight_total += bf
-            
-            if weight_total > 0:
-                crowd_average = weighted_sum / weight_total
+        # 3b. Gaze rules engine: crowd focal point, per-person gaze scores,
+        # performer promotion / re-ID. Then FUSE with the action-model score:
+        # gaze is the base, the model rescues confident pro cues and caps
+        # confident anti cues. Performers are flagged and never scored.
+        gaze_result = self.gaze_engine.update(gaze_people, self._frame_counter)
+        self.last_gaze_result = gaze_result
+        for d in current_frame_data:
+            tid = int(d['id'])
+            if tid in self.gaze_engine.performers:
+                d['performer'] = True
+                d['gazed_performer'] = tid in gaze_result['gazed_performers']
+                continue
+            # Only REGISTERED adults (face-ID-matched EmotiBit wearers) are
+            # gaze-scored. Bystanders/infants carry null geometry (no rays,
+            # no fusion); performers are handled above. In --no-face-id /
+            # 360° mode registered_only is off and everyone is scored.
+            if self.registered_only and tid not in self.registered_ids:
+                continue
+            stat = gaze_result['status'].get(tid)
+            gaze_s = stat['score'] if stat else None
+            if gaze_s is None:
+                continue                    # PRE-SHOW / warming: pure model score
+            d['gaze_reason'] = stat['reason']
+            d['gaze_scored'] = True
+            if self._buffer_ready(d['id']):
+                action_s = d['score']
+                fused = GAZE_WEIGHT * gaze_s + (1.0 - GAZE_WEIGHT) * action_s
+                if action_s >= ACTION_RESCUE_PROB and fused < ACTION_RESCUE_FLOOR:
+                    fused = ACTION_RESCUE_FLOOR     # confident pro cue rescues off-focal gaze
+                elif action_s <= ACTION_OVERRIDE_PROB:
+                    fused = min(fused, ACTION_OVERRIDE_CAP)  # confident anti cue caps
+                d['score'] = fused
             else:
-                crowd_average = 0.0
-        else:
-            crowd_average = 0.0
+                d['score'] = gaze_s                 # gaze-only until the model warms up
+
+        # 4. Calculate Crowd Average (confidence-weighted)
+        # Gaze-scored people count with full weight (the gaze score needs no
+        # model warm-up); action-only people are weighted by buffer fill as
+        # before. Performers are excluded from the crowd score by design.
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for d in current_frame_data:
+            if d.get('performer'):
+                continue
+            if self.registered_only and int(d['id']) not in self.registered_ids:
+                continue
+            if d.get('gaze_scored'):
+                w = 1.0
+            elif self._buffer_ready(d['id']):
+                w = d.get('buffer_fill', 0.0)
+            else:
+                continue
+            weighted_sum += d['score'] * w
+            weight_total += w
+        crowd_average = weighted_sum / weight_total if weight_total > 0 else 0.0
 
         self._update_context_seconds()
             
@@ -2597,6 +2683,12 @@ def main():
         # --no-face-id or 360° mode (no per-face matching) falls back to
         # whole-crowd aggregation.
         if face_id and not is_360:
+            # No enrollments (startup, or 'c' pressed) → any cached matches are
+            # stale; without this purge a previously-enrolled track would stay
+            # "registered" forever, because the matcher above only runs while
+            # has_enrollments is true and so can never evict the cache entry.
+            if not face_id.has_enrollments and face_id_cache:
+                face_id_cache.clear()
             system.registered_only = True
             system.registered_ids = {int(tid) for tid in face_id_cache}
         else:
@@ -2605,12 +2697,34 @@ def main():
         
         # Draw Individual Boxes (2D mode only — 360° draws in mosaic above)
         if not is_360:
+            # Gaze overlay: audience gaze rays projected to the crowd focal
+            # point, clipped at performer boxes (a ray never passes through
+            # the performer). Drawn under the person boxes.
+            _gres = system.last_gaze_result
+            if _gres is not None:
+                _perf_boxes = [p['bbox'] for p in people_data if p.get('performer')]
+                _ray_people = {int(p['id']): {'geom': p['gaze_geom']}
+                               for p in people_data if p.get('gaze_geom') is not None}
+                draw_gaze_rays(display_frame, _ray_people, _gres['focal'],
+                               _perf_boxes, system.gaze_engine.performers)
             for person in people_data:
                 x1, y1, x2, y2 = person['bbox']
                 score = person['score']
                 pid = person['id']
                 bf = person.get('buffer_fill', 1.0)
                 identified = person.get('identified_as')
+                # Performers: orange box, never scored, drawn even when
+                # registered-only hides bystanders (the operator must see who
+                # the crowd is being scored against).
+                if person.get('performer'):
+                    thick = 4 if person.get('gazed_performer') else 2
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), COL_PERFORMER, thick)
+                    perf_label = f"{system.display_label(pid)} PERFORMER"
+                    if person.get('gazed_performer'):
+                        perf_label += " <<"
+                    cv2.putText(display_frame, perf_label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_PERFORMER, 2)
+                    continue
                 # Registered-only: don't draw bystanders. Only enrolled parents
                 # are tracked, scored and shown; everyone else is ignored.
                 if system.registered_only and not identified:
@@ -2619,6 +2733,13 @@ def main():
                 # (vs reusing cached score). Helps visualise the round-robin
                 # so the throttle ratio in the HUD is not just a static number.
                 fresh_mp = person.get('keypoints') is not None
+                
+                # Gaze status tag (same convention as the offline harness):
+                # only the anti-cues are surfaced - [shift] = synchronized
+                # crowd distraction (dip suppressed), [off-focal] = this
+                # person's gaze is off the focal point / performer.
+                g_reason = person.get('gaze_reason', '')
+                gaze_tag = f" [{g_reason}]" if g_reason in ('shift', 'off-focal') else ""
                 
                 # Determine if this person should be highlighted
                 # Magenta box only when a specific EmotiBit is selected for this person
@@ -2631,7 +2752,7 @@ def main():
                     # Magenta box + name for focused participant
                     color = IDENTIFIED_COLOR
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 3)
-                    name_label = f"{identified} {score:.0%}"
+                    name_label = f"{identified} {score:.0%}{gaze_tag}"
                     cv2.putText(display_frame, name_label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 else:
@@ -2643,7 +2764,7 @@ def main():
                     # YOLO track id which inflates rapidly in dense crowds.
                     id_str = identified if identified else system.display_label(pid)
                     if bf < 0.9:
-                        label = f"{id_str} {score:.0%} conf:{bf:.0%}"
+                        label = f"{id_str} {score:.0%}{gaze_tag} conf:{bf:.0%}"
                         cv2.putText(display_frame, label, (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         # Confidence fill bar under bounding box
@@ -2653,7 +2774,7 @@ def main():
                         cv2.rectangle(display_frame, (x1, bar_y_top), (x2, bar_y_bot), (50, 50, 50), -1)
                         cv2.rectangle(display_frame, (x1, bar_y_top), (x1 + int(bar_w_px * bf), bar_y_bot), (255, 200, 0), -1)
                     else:
-                        cv2.putText(display_frame, f"{id_str} {score:.0%}", (x1, y1 - 10),
+                        cv2.putText(display_frame, f"{id_str} {score:.0%}{gaze_tag}", (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 # Fresh-MP marker: small filled dot top-right of bbox when this
                 # person was MediaPipe-refreshed this frame. Visualises the
@@ -2711,7 +2832,16 @@ def main():
         if system.last_total_count > 0 and system.last_selected_count < system.last_total_count:
             throttle_str = (f" | MP: {system.last_selected_count}/{system.last_total_count}"
                             f" rr{system._rr_offset}")
-        fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s{throttle_str}"
+        gaze_str = ""
+        if not is_360 and system.last_gaze_result is not None:
+            _gr = system.last_gaze_result
+            _n_perf = len([p for p in people_data if p.get('performer')])
+            gaze_str = f" | Gaze: {'LIVE' if _gr['started'] else 'PRE-SHOW'}"
+            if _n_perf:
+                gaze_str += f" perf:{_n_perf}"
+            if _gr['distraction']:
+                gaze_str += " SHIFT!"
+        fps_text = f"{platform_str} | FPS: {live_fps:.1f} | People: {people_count} | Context: {context_seconds:.1f}s{throttle_str}{gaze_str}"
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
         cv2.putText(display_frame, fps_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
@@ -2915,6 +3045,7 @@ def main():
         # C = Clear all enrollments
         elif key == ord('c') and face_id:
             face_id.clear_enrollments()
+            face_id_cache.clear()   # drop stale track→name matches immediately
             focus_target = 'all'
             registration_flash_msg = "All enrollments cleared"
             registration_flash_until = time.time() + 2.0

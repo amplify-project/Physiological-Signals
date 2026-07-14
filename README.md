@@ -297,6 +297,67 @@ Every pipeline entry-point writes a rotating log file so post-mortem debugging i
 - Progressive confidence scoring — first estimates from ~1s, full confidence at ~10s
 - Per-person confidence indicator and fill bar during buffer ramp-up
 
+### 👀 Gaze-First Engagement Scoring (Gaze_Rules)
+The per-person engagement score is a **fusion** of a rules-based gaze engine
+([scripts/inference/gaze_rules.py](scripts/inference/gaze_rules.py)) and the
+action-transformer model. The gaze engine works entirely from the MediaPipe
+keypoints the model already consumes — no extra per-frame compute.
+
+- **Gaze rays** — a 2D gaze direction per person from face/shoulder landmarks,
+  quality-gated on landmark visibility and head size.
+- **Crowd focal point** — least-squares intersection of the audience's rays.
+  When a quorum (≥ 50%) agrees within a tolerance cone the focal point locks
+  and the show is considered **started**; until then the pipeline runs in
+  `PRE-SHOW` mode on the pure action-model score.
+- **Per-person gaze score** — cone score around the focal direction with an
+  asymmetric EMA: dips are slow (the audience is presumed engaged; divergence
+  is usually transient), recovery is fast, and sustained off-focal gaze decays
+  faster. Unreadable gaze (face straight at/away from the camera) drifts
+  slowly toward neutral instead of freezing. Movement is never penalised.
+- **Synchronized shift detection** — when most of the crowd swings its gaze at
+  once (a door opens, a flash goes off) the collective dip is suppressed and a
+  `SHIFT!` flag is raised instead of penalising everyone.
+- **Performer detection** — sticky promotion via mobility (roaming the space),
+  prolonged standing, or standing while the seated crowd faces them.
+  Performers are drawn in orange, never scored into the crowd average, keep a
+  permanent colour-histogram appearance signature for re-identification after
+  track loss, and their tracks are ghost-coasted through short occlusions.
+- **Fusion** — gaze is the base score; the action model rescues confident pro
+  cues and caps confident anti cues:
+  `fused = 0.7·gaze + 0.3·action`, floored at 0.65 when `action ≥ 0.75`,
+  capped at 0.40 when `action ≤ 0.25`. Gaze scores are live within a couple of
+  frames, so newcomers are scored without the ~4 s model warm-up.
+- **Registered adults only** — with face-ID active, only enrolled
+  (EmotiBit-wearing) adults are gaze-scored, and only their rays vote for the
+  crowd focal point; bystanders and infants are never scored. Performer
+  detection still works for unregistered people (bbox mobility). With
+  `--no-face-id` or in 360° mode, everyone is scored.
+- **Stable IDs in crowds** — tuned BoT-SORT config
+  ([scripts/inference/botsort_gaze.yaml](scripts/inference/botsort_gaze.yaml)):
+  90-frame lost-track buffer, tighter match threshold, YOLO at `imgsz` 1280
+  offline for small far-away performers.
+- **Offline tuning harness** —
+  [scripts/inference/video_gaze_rules_offline.py](scripts/inference/video_gaze_rules_offline.py)
+  renders the full rules overlay (rays, focal point, performer boxes,
+  per-person scores) on recorded footage; thresholds were tuned on the 4th
+  Family Lab video (dancer / sax / accordion / full-band segments).
+
+**Known caveats:**
+
+- **Fewer than 3 gaze rays (e.g. 2 registered adults)** — a ray-based focal
+  point needs ≥ 3 rays (two 2D rays always intersect *somewhere*, so a 2-ray
+  focal is degenerate noise). Small audiences are instead scored against the
+  **performer's bounding box** as the gaze target: once a performer is
+  promoted the show counts as started (`Gaze: LIVE perf:1`) and "off-focal"
+  means looking away from the performer. Shift detection scales down too —
+  with 2 people, *both* must swing their gaze together to register a `SHIFT!`.
+- **Non-moving seated musician** — performer promotion relies on mobility,
+  prolonged standing, or standing-while-faced. A musician who stays *seated
+  and stationary* (e.g. at a piano) is never promoted, so with < 3 rays there
+  is no gaze target at all: scoring falls back to the pure action-model score
+  until the performer moves or stands. This is a deliberate conservative
+  fallback — no focal point is invented from insufficient geometry.
+
 ---
 
 ## 🧠 Physiological Signal Processing (EmotiBit)
