@@ -62,8 +62,12 @@ HEAD_MARGIN = 0.05               # nose/ears/eyes may exceed the crop by this fr
                                  # the gaze is rejected as a bad detection (stray rays)
 HEAD_TOP_FRAC = 0.45             # nose must sit in the top fraction of the crop (head region)
 AMBIG_FRAC = 0.15                # |nose-earmid| < this * ear_dist => facing camera/away (no 2D dir)
-STEEP_DOWN_DY = 0.95             # unit-dir y-component above this => near-vertical ray; such rays
-                                 # are only excluded from focal-point voting, NOT penalised
+STEEP_DOWN_DY = 0.95             # |unit-dir y| above this => near-vertical ray (up or down); such
+                                 # rays are only excluded from focal-point voting, NOT penalised
+PITCH_OFF_DY = 0.80              # ray this vertical (up OR down) = extreme head pitch; it only
+PITCH_TARGET_DY = 0.55           # counts if the target direction is also at least this steep,
+                                 # else scored off-focal (the 2D cone is too forgiving for
+                                 # up/down tilts aimed near a standing performer)
 
 # --- focal point ---
 MIN_RAYS = 3                     # absolute floor of valid audience rays for a focal point
@@ -97,6 +101,15 @@ SHIFT_DEG = 30.0                 # per-person direction change counting as a "sh
 SHIFT_MIN_PEOPLE = 3             # at least this many people ...
 SHIFT_MIN_FRAC = 0.4             # ... and this fraction of valid audience must shift together
 SHIFT_COOLDOWN = 20              # processed frames the distraction event lasts
+SHIFT_NEW_POINT_HS = 3.0         # the shifted rays must RE-CONVERGE on a common point at least
+                                 # this many mean head-sizes from the current focal (a shared
+                                 # distraction, e.g. a child falls); otherwise the individuals
+                                 # are merely 'off-focal', not a synchronized shift
+
+# --- gaze at another audience member (chatting / people-watching) ---
+AUD_HIT_MIN_HS = 1.5             # an off-target ray entering another audience bbox counts as
+                                 # 'at-audience' (disengaged) only beyond this many head-sizes
+                                 # (immediate neighbours' boxes overlap the gazer's own head)
 
 # --- performer detection (sticky) ---
 # The audience is seated on the floor and does NOT translate through the
@@ -220,6 +233,25 @@ def least_squares_focal(points, dirs):
     return x, idx
 
 
+def ray_box_entry(a, d, box):
+    """Slab-method ray/AABB intersection. Returns entry distance t >= 0 along
+    the ray a + t*d, or None if the ray misses the box."""
+    x1, y1, x2, y2 = box
+    t0, t1 = 0.0, float('inf')
+    for i, (lo, hi) in enumerate(((x1, x2), (y1, y2))):
+        if abs(d[i]) < 1e-9:
+            if not (lo <= a[i] <= hi):
+                return None
+        else:
+            ta, tb = (lo - a[i]) / d[i], (hi - a[i]) / d[i]
+            if ta > tb:
+                ta, tb = tb, ta
+            t0, t1 = max(t0, ta), min(t1, tb)
+    if t1 < t0 or t1 < 0:
+        return None
+    return max(t0, 0.0)
+
+
 # =============================================================================
 # PER-PERSON GAZE / POSTURE EXTRACTION
 # =============================================================================
@@ -292,8 +324,8 @@ def person_geometry(kp, pbox):
             d, n = unit(nose - ear_mid)
             if n >= AMBIG_FRAC * max(ear_dist, 1.0):
                 out['gaze'] = (float(d[0]), float(d[1]))
-                # near-vertical rays are excluded from focal voting only
-                out['floor'] = d[1] > STEEP_DOWN_DY
+                # near-vertical rays (up or down) are excluded from focal voting only
+                out['floor'] = abs(d[1]) > STEEP_DOWN_DY
 
     # ---- posture: standing vs seated ----
     need_core = [L_SHOULDER, R_SHOULDER, L_HIP, R_HIP, L_KNEE, R_KNEE]
@@ -500,6 +532,10 @@ class GazeRulesEngine:
             self.focal_valid = False          # PRE-SHOW / lost convergence
 
         # ---- 3. synchronized gaze-shift detection ----
+        # A "shift" is reserved for a genuine SHARED distraction: several
+        # people swing their gaze AND the new rays re-converge on a common
+        # point away from the current focal (e.g. a child falls and many
+        # heads turn there). Lone wanderers are just 'off-focal'.
         shifted_now = set()
         n_valid = 0
         for tid, p in audience.items():
@@ -513,10 +549,26 @@ class GazeRulesEngine:
                 shifted_now.add(tid)
         if (len(shifted_now) >= SHIFT_MIN_PEOPLE and n_valid > 0 and
                 len(shifted_now) / n_valid >= SHIFT_MIN_FRAC):
-            # NOTE v1: we don't yet verify the NEW directions re-converge on a
-            # common off-stage point; any mass shift counts as a distraction.
-            self.shift_until = proc_idx + SHIFT_COOLDOWN
-            self.shifted_tids = set(shifted_now)
+            s_pts, s_dirs, s_hs = [], [], []
+            for tid in shifted_now:
+                gm = audience[tid]['geom']
+                if gm['anchor'] is None:
+                    continue
+                s_pts.append(np.array(gm['anchor'], dtype=float))
+                s_dirs.append(np.array(gm['gaze'], dtype=float))
+                s_hs.append(gm['head_size'])
+            new_pt, s_contrib = (None, [])
+            if len(s_pts) >= SHIFT_MIN_PEOPLE:
+                new_pt, s_contrib = least_squares_focal(s_pts, s_dirs)
+            if new_pt is not None and len(s_contrib) >= SHIFT_MIN_PEOPLE:
+                devs = [ang_between(s_dirs[i], unit(new_pt - s_pts[i])[0])
+                        for i in s_contrib]
+                far_from_focal = (self.focal is None or
+                                  float(np.hypot(*(new_pt - self.focal))) >
+                                  SHIFT_NEW_POINT_HS * float(np.mean(s_hs)))
+                if float(np.mean(devs)) <= MAX_MEAN_DEV_DEG and far_from_focal:
+                    self.shift_until = proc_idx + SHIFT_COOLDOWN
+                    self.shifted_tids = set(shifted_now)
         distraction = proc_idx <= self.shift_until
 
         # ---- 4. per-person rules -> instantaneous engaged/neutral/disengaged ----
@@ -529,7 +581,7 @@ class GazeRulesEngine:
             if self.focal_valid:
                 to_focal, dist = unit(self.focal - a)
                 if dist > 1.0:
-                    best = (ang_between(d, to_focal), 'focal')
+                    best = (ang_between(d, to_focal), 'focal', to_focal)
             for ptid in self.performers:
                 if ptid not in people:
                     continue
@@ -540,8 +592,8 @@ class GazeRulesEngine:
                     continue
                 dev = ang_between(d, to_perf)
                 if best is None or dev < best[0]:
-                    best = (dev, 'performer')
-            return best if best is not None else (None, '')
+                    best = (dev, 'performer', to_perf)
+            return best if best is not None else (None, '', None)
 
         status = {}
         for tid, p in audience.items():
@@ -556,10 +608,29 @@ class GazeRulesEngine:
                 if self.focal_valid and float(np.hypot(*(self.focal - a))) < 2.0 * g['head_size']:
                     inst, reason = 1.0, 'at-focal'   # person effectively AT the focal point
                 else:
-                    dev, src = best_target_dev(a, d)
+                    dev, src, tdir = best_target_dev(a, d)
                     if dev is not None:
-                        inst = cone_score(dev)
-                        reason = f'on-{src}' if inst >= 0.5 else 'off-focal'
+                        # extreme head pitch: a near-vertical ray only counts
+                        # toward a target that is itself in a steep direction -
+                        # in 2D an up/down-tilted head can otherwise land inside
+                        # the cone of a standing performer
+                        if abs(d[1]) >= PITCH_OFF_DY and abs(tdir[1]) < PITCH_TARGET_DY:
+                            inst, reason = 0.0, 'off-focal'
+                        else:
+                            inst = cone_score(dev)
+                            reason = f'on-{src}' if inst >= 0.5 else 'off-focal'
+                    # gaze fixated on ANOTHER audience member (chatting,
+                    # people-watching) = disengaged; only checked when a stage
+                    # target exists and the ray is already off it (pre-show
+                    # people-watching stays neutral)
+                    if inst is not None and inst < 0.5:
+                        for otid, op in audience.items():
+                            if otid == tid:
+                                continue
+                            t_hit = ray_box_entry(a, d, op['bbox'])
+                            if t_hit is not None and t_hit >= AUD_HIT_MIN_HS * g['head_size']:
+                                inst, reason = 0.0, 'at-audience'
+                                break
             # movement is never penalised: no motion term anywhere.
             # asymmetric smoothing: dips are slow, recovery is fast - the
             # audience is presumed engaged; divergence is usually transient.
@@ -570,7 +641,8 @@ class GazeRulesEngine:
                 if inst >= prev:
                     alpha = SCORE_EMA_UP
                 else:
-                    alpha = SCORE_EMA_DOWN_OFF if reason == 'off-focal' else SCORE_EMA_DOWN
+                    alpha = (SCORE_EMA_DOWN_OFF if reason in ('off-focal', 'at-audience')
+                             else SCORE_EMA_DOWN)
                 self.score[tid] = alpha * inst + (1 - alpha) * prev
             status[tid] = {'score': self.score.get(tid), 'reason': reason,
                            'contributed': tid in [ray_tids[i] for i in contributors]}
@@ -681,7 +753,7 @@ def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
             color = COL_LOW
         thick = 2
         label = f"ID{tid} {s*100:.0f}%"
-        if stat['reason'] in ('shift', 'off-focal'):
+        if stat['reason'] in ('shift', 'off-focal', 'at-audience'):
             label += f" [{stat['reason']}]"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)

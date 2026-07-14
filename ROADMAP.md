@@ -149,43 +149,72 @@ videos: one filmed from the rear and one from the front** of the audience, to
 measure how sensitive accuracy is to camera angle (and to sanity-check the
 `staring`/gaze behaviour under each viewpoint).
 
-## Gaze-first retrain (observations from "4th lab video.mp4")
+## Gaze-first engagement (rules layer implemented — `Gaze_Rules` branch)
 
 Validation of the current model on `Family Lab Videos/4th lab video.mp4`
-suggests the tiny/basic model should be retrained to be **primarily about gaze
-rather than actions**. Key scene structure observed:
+showed engagement for this audience is **primarily about gaze rather than
+actions**. A pure geometry+rules gaze layer (no learned model) is now
+implemented in `scripts/inference/video_gaze_rules_offline.py` and validated
+on four segments of the 4th lab video (solo dancer, sax, accordion, full band).
 
-- **Audience adults are typically seated**; musicians and dancers are typically
-  standing / walking / mobile.
-- **The mean of the audience gaze converges on a single point** — the active
-  performer. This shared focal point is the core engagement signal.
+### Implemented rules (v1, summary)
+- Gaze = straight 2D vector from the face front (ear-midpoint → nose, with a
+  guarded single-ear profile fallback); scored as a cone (full credit ≤40°,
+  zero ≥75°) against the **crowd focal point** (least-squares ray convergence
+  with quorum) and any performer's box.
+- **Presume engaged** (seed 1.0); asymmetric smoothing — dips slow, recovery
+  fast. Movement is never penalised. **Staring at the performer/focal point is
+  pro-engagement** (sustained fixation = 1.0).
+- **Gaze fixated on another audience member = disengaged** (`at-audience`,
+  fast decay). Only applies once a stage target exists — pre-show
+  people-watching is neutral.
+- **Synchronized shift** is reserved for a genuine shared distraction:
+  ≥3 people (and ≥40% of valid rays) swing >30° **and their new rays
+  re-converge on a common point away from the focal** (e.g. a child falls).
+  Individual wanderers are just `off-focal`.
+- Extreme up/down head pitch scores `off-focal` unless the target itself lies
+  in a steep direction. (Floor-gaze is otherwise NOT penalised — parents watch
+  crawling children; near-vertical rays are merely excluded from focal voting.)
+- No focal point → **PRE-SHOW** (scoring suppressed).
+- **Performers** (sticky, orange box): promoted by net mobility over a time
+  window, overwhelming standing evidence, or standing+facing-the-audience;
+  clothes-colour re-ID recovers them across tracker id switches. Performers
+  cast no gaze rays; audience rays clip at performer boxes.
 
-### Core gaze mechanics
-- [ ] Model gaze as a **straight vector out from the front of the face** (no eye tracking needed initially).
-- [ ] Compute per-person gaze vectors each frame and estimate the **common focal point** (e.g. least-squares intersection / density peak of vector crossings).
-- [ ] **Departures from the common focal point = distraction = disengagement** for that individual.
-- [ ] **Staring at own feet / down at the floor = disengaged.**
-- [ ] **Sudden synchronized deviation** of multiple gazes to a new rapid common direction = an off-stage event (e.g. a child fell) — a distraction, so **disengaged from the concert** (even though gazes still agree).
-- [ ] **No common gaze focal point at all → the concert likely hasn't started yet** (pre-show state; suppress scoring or mark session as not-started).
-- [ ] **Audience movement is NOT penalised** as disengagement if the person's gaze stays on the crowd-average focal point — people shift position to get a better view.
+### Remaining gaze work
+- [ ] Update README with the gaze rules above.
+- [ ] **Integrate with the actions model as-is** (late fusion, gaze-biased):
+      gaze = attention (base score); actions rescue an off-focal person on
+      confident pro cues (dancing/clapping/singing — e.g. nodding along while
+      looking away) and override gaze on confident anti cues (phone).
+- [ ] Restrict gaze scoring to **registered adults** (EmotiBit wearers) via the
+      existing face-ID binding; never score infants.
+- [ ] Port from offline smoke tests to the **live 2D video** pipeline.
+- [ ] Record each **performer's engagement contribution to file** (attribute
+      audience gaze to whichever performer holds the focal point).
+- [ ] Prepare for packed real-concert audiences: leg/posture cues will be
+      occluded (consider a stage-region prior for performers), track-id churn
+      grows (stronger re-ID embedding), crop contamination worsens.
+- [ ] (Stretch) YOLO **instrument ID** (sax/guitar/accordion) to distinguish musicians.
 
-### Performer identification & attribution
-- [ ] **Standing adults are identified as performers** (audience adults are seated).
-- [ ] Performer status is **sticky**: once detected standing as a performer, they remain a performer even if they later sit.
-- [ ] **Performers currently being gazed at get an orange bounding box** in the overlay.
-- [ ] Record each **performer's engagement contribution to file** — especially when multiple performers are standing at once (they usually take turns), attribute audience gaze/engagement to whichever performer holds the focal point.
-- [ ] (Stretch) Use YOLO to **identify the instrument being played** (saxophone, guitar, accordion — each musician plays exactly one), to help distinguish/track individual musicians.
-
-### Overlay
-- [ ] Draw the per-person **gaze vectors** on the overlay.
-- [ ] Mark the estimated common focal point.
-- [ ] Orange bounding box on the performer(s) being gazed at (above).
+### Actions model tidy-up (needed before/with fusion)
+The 86-class Kinetics subset behind `action_transformer_young_families_v0`
+needs a substantial cleanup — several classes actively contradict concert
+reality for this audience:
+- [ ] **Remove or re-map to engagement:** `staring` (attentive stillness toward
+      the performer is the ideal audience state — gaze layer now handles
+      direction), `drumming fingers`, `tapping pen` (beat-keeping),
+      `shaking head` (can be moving to music), `headbanging` semantics check.
+- [ ] **Add (download + retrain):** nodding/moving to the beat, `snapping
+      fingers`, `smiling`, `carrying baby`, `scratching head` (touch-face
+      proxy), swaying/rocking with music, foot tapping.
+- [ ] Re-extract features and retrain after the label surgery; re-validate on
+      the family footage.
 
 ### Fallback if gaze-focal-point doesn't improve accuracy — parent–child linking
 - [ ] Use YOLO to identify **infants as roughly 1/3 the size of adults**.
 - [ ] The **adult sitting closest to a child is likely its parent**; an **adult touching a child is almost certainly its parent**.
 - [ ] With parent–child links established: **adult gaze on their own child = definitively acceptable** (not disengagement).
-- [ ] **Adult fixation on another audience adult = disengaged.**
 
 ### Staged model plan
 1. **v1 — gaze-based model:** retrain the tiny model around gaze-vector /
