@@ -13,6 +13,7 @@
 opencv-contrib-python==4.10.0.84
 lap>=0.5.12
 mediapipe==0.10.21
+protobuf==4.25.9   # MUST stay <5: mediapipe graphs fail to parse with protobuf 5.x
 ultralytics==8.3.229
 ultralytics-thop==2.0.18
 

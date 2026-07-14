@@ -6,7 +6,9 @@ Implements the 2D gaze-first engagement rules from ROADMAP.md
 
   * Per-person 2D gaze vector = straight vector out from the front of the face
     (ear-midpoint -> nose in image space; single-ear profile fallback).
-  * Common focal point = least-squares intersection of audience gaze rays.
+  * Common focal point = least-squares intersection of audience gaze rays,
+    valid only when a MAJORITY (> QUORUM_FRAC) of the seated audience members
+    with a measurable gaze ray converge on it (absolute floor MIN_RAYS).
   * Engagement rules (presume engaged, subtract on anti-cues):
       - gaze departs from the common focal point            -> disengaged
       - staring at feet / down at the floor                 -> disengaged
@@ -20,8 +22,9 @@ Implements the 2D gaze-first engagement rules from ROADMAP.md
     scoring and from the focal-point estimate. A performer holding the crowd
     focal point gets an ORANGE bounding box.
 
-Overlay: per-person gaze rays, the estimated focal point, orange performer
-boxes, green/red audience boxes, crowd banner.
+Overlay: per-person gaze lines projected out to the convergence point (clipped
+where they hit another person's bounding box), orange performer boxes,
+green/red audience boxes, crowd banner.
 
 Pipeline (harness mirrors scripts/inference/video_engagement_offline.py):
   YOLO person track -> per-person crop (10% pad) -> MediaPipe Holistic ->
@@ -54,7 +57,9 @@ FLOOR_GAZE_DY = 0.80             # unit-dir y-component above this => staring at
 FLOOR_PITCH_FRAC = 0.80          # nose below ear-line by this * head_size also => floor gaze
 
 # --- focal point ---
-MIN_RAYS = 3                     # need this many valid audience rays to estimate a focal point
+MIN_RAYS = 3                     # absolute floor of valid audience rays for a focal point
+QUORUM_FRAC = 0.5                # focal point needs > this fraction of the seated audience
+                                 # (members with a measurable gaze ray) to converge on it
 MAX_MEAN_DEV_DEG = 30.0          # mean ray->focal angular deviation above this => "no focal point"
 FOCAL_EMA = 0.25                 # smoothing of the focal point position
 
@@ -94,7 +99,6 @@ COL_DISENGAGED = (0, 0, 230)
 COL_WARMING = (160, 160, 160)
 COL_PERFORMER = (0, 140, 255)        # orange
 COL_GAZE = (255, 220, 0)             # cyan-ish gaze rays
-COL_FOCAL = (0, 255, 255)            # yellow focal marker
 
 
 # =============================================================================
@@ -256,15 +260,16 @@ class GazeRulesEngine:
                 ray_tids.append(tid)
 
         raw_focal, contributors = (None, [])
+        quorum = max(MIN_RAYS, int(math.ceil(QUORUM_FRAC * len(pts)))) if pts else MIN_RAYS
         if len(pts) >= MIN_RAYS:
             raw_focal, contributors = least_squares_focal(pts, dirs)
-            if raw_focal is not None and len(contributors) >= MIN_RAYS:
+            if raw_focal is not None and len(contributors) >= quorum:
                 devs = [ang_between(dirs[i], unit(raw_focal - pts[i])[0])
                         for i in contributors]
                 if float(np.mean(devs)) > MAX_MEAN_DEV_DEG:
                     raw_focal = None          # rays don't converge
             else:
-                raw_focal = None
+                raw_focal = None              # below majority quorum
 
         if raw_focal is not None:
             self.focal = (raw_focal if self.focal is None
@@ -369,6 +374,48 @@ def extract_keypoints(holistic, frame_rgb, bbox):
 # =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
+def ray_box_entry_t(p, d, box):
+    """Distance t >= 0 at which ray (p, d unit) first enters an AABB, or None."""
+    x1, y1, x2, y2 = box
+    t0, t1 = 0.0, float('inf')
+    for axis, (lo, hi) in enumerate(((x1, x2), (y1, y2))):
+        if abs(d[axis]) < 1e-9:
+            if not (lo <= p[axis] <= hi):
+                return None
+        else:
+            ta = (lo - p[axis]) / d[axis]
+            tb = (hi - p[axis]) / d[axis]
+            if ta > tb:
+                ta, tb = tb, ta
+            t0 = max(t0, ta)
+            t1 = min(t1, tb)
+    return t0 if t0 <= t1 else None
+
+
+def draw_gaze_rays(frame, people, focal):
+    """Plain gaze lines (no arrowheads), projected out to the convergence
+    point, clipped earlier if the ray hits another person's bounding box."""
+    for tid, p in people.items():
+        g = p['geom']
+        if g['gaze'] is None or g['anchor'] is None:
+            continue
+        a = np.array(g['anchor'], dtype=float)
+        d = np.array(g['gaze'], dtype=float)
+        L = 2.2 * g['head_size']                  # fallback: short stub
+        if focal is not None:
+            t_focal = float(np.dot(np.array(focal) - a, d))
+            if t_focal > 0:
+                L = t_focal
+        for otid, op in people.items():
+            if otid == tid:
+                continue
+            t = ray_box_entry_t(a, d, op['bbox'])
+            if t is not None and 1e-6 < t < L:
+                L = t                             # stop at the first person hit
+        end = (int(a[0] + d[0] * L), int(a[1] + d[1] * L))
+        cv2.line(frame, (int(a[0]), int(a[1])), end, COL_GAZE, 2, cv2.LINE_AA)
+
+
 def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
     x1, y1, x2, y2 = bbox
     if is_performer:
@@ -392,22 +439,8 @@ def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
     cv2.putText(frame, label, (x1 + 2, y1 - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # gaze ray (audience and performers alike; informative for both)
-    if geom['gaze'] is not None and geom['anchor'] is not None:
-        ax, ay = geom['anchor']
-        L = 2.2 * geom['head_size']
-        tip = (int(ax + geom['gaze'][0] * L), int(ay + geom['gaze'][1] * L))
-        cv2.arrowedLine(frame, (int(ax), int(ay)), tip, COL_GAZE, 2,
-                        line_type=cv2.LINE_AA, tipLength=0.25)
-
 
 def draw_global(frame, result, n_scored, src_w):
-    # focal point
-    if result['focal'] is not None:
-        fx, fy = int(result['focal'][0]), int(result['focal'][1])
-        cv2.circle(frame, (fx, fy), 14, COL_FOCAL, 2, cv2.LINE_AA)
-        cv2.drawMarker(frame, (fx, fy), COL_FOCAL, cv2.MARKER_CROSS, 22, 2)
-
     banner_h = 46
     cv2.rectangle(frame, (0, 0), (src_w, banner_h), (30, 30, 30), -1)
     if not result['started']:
@@ -538,6 +571,7 @@ def main():
 
         # --- overlay ---
         n_scored = sum(1 for s in result['status'].values() if s['score'] is not None)
+        draw_gaze_rays(frame, people, result['focal'])
         for tid, p in people.items():
             draw_person(frame, tid, p['bbox'], p['geom'],
                         tid in engine.performers,
