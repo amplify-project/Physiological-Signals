@@ -10,17 +10,19 @@ Implements the 2D gaze-first engagement rules from ROADMAP.md
     valid only when a MAJORITY (> QUORUM_FRAC) of the seated audience members
     with a measurable gaze ray converge on it (absolute floor MIN_RAYS).
   * Engagement rules (presume engaged, subtract on anti-cues):
-      - gaze departs from the common focal point            -> disengaged
-      - staring at feet / down at the floor                 -> disengaged
+      - gaze departs from the common focal point            -> graded cone
+        falloff (slow dip, fast recovery - divergence is usually transient)
       - sudden synchronized gaze shift of several people    -> distraction,
         shifted people disengaged for a cooldown
       - no common focal point                               -> concert not
         started yet (PRE-SHOW; nobody is scored)
       - body movement is NEVER penalised while gaze stays on the focal point
-  * Standing adults become PERFORMERS (sticky: once a performer, always a
-    performer, even after sitting). Performers are excluded from audience
-    scoring and from the focal-point estimate. A performer holding the crowd
-    focal point gets an ORANGE bounding box.
+  * PERFORMER promotion (sticky: once a performer, always a performer, even
+    after sitting/bending) via two cues: (1) standing adults (audience is
+    seated), (2) facing the audience - a gaze direction contrary to the
+    audience's mean gaze direction. Performers are excluded from audience
+    scoring and from the focal-point estimate (they need no gaze ray). A
+    performer holding the crowd focal point gets an ORANGE bounding box.
 
 Overlay: per-person gaze lines projected out to the common focal point so the
 convergence is visible, orange performer boxes, green/red audience boxes,
@@ -57,13 +59,14 @@ HEAD_MARGIN = 0.05               # nose/ears/eyes may exceed the crop by this fr
                                  # the gaze is rejected as a bad detection (stray rays)
 HEAD_TOP_FRAC = 0.45             # nose must sit in the top fraction of the crop (head region)
 AMBIG_FRAC = 0.15                # |nose-earmid| < this * ear_dist => facing camera/away (no 2D dir)
-FLOOR_GAZE_DY = 0.80             # unit-dir y-component above this => staring at floor
-FLOOR_PITCH_FRAC = 0.80          # nose below ear-line by this * head_size also => floor gaze
+STEEP_DOWN_DY = 0.95             # unit-dir y-component above this => near-vertical ray; such rays
+                                 # are only excluded from focal-point voting, NOT penalised
 
 # --- focal point ---
 MIN_RAYS = 3                     # absolute floor of valid audience rays for a focal point
-QUORUM_FRAC = 0.35               # focal point needs > this fraction of the seated audience
+QUORUM_FRAC = 0.5                # focal point needs > this fraction of the seated audience
                                  # (members with a measurable gaze ray) to converge on it
+                                 # (overridable with --quorum)
 MAX_MEAN_DEV_DEG = 45.0          # mean ray->focal angular deviation above this => "no focal point"
 FOCAL_EMA = 0.25                 # smoothing of the focal point position
 FOCAL_HOLD_FRAMES = 45           # keep the last valid focal point alive this many processed
@@ -74,7 +77,10 @@ FOCAL_HOLD_FRAMES = 45           # keep the last valid focal point alive this ma
 # the target, linear falloff to zero at THETA_ZERO_DEG.
 THETA_OK_DEG = 40.0              # inside this cone half-angle => fully engaged
 THETA_ZERO_DEG = 75.0            # beyond this => fully off-target
-SCORE_EMA = 0.15                 # smoothing of the displayed 0..1 score
+# Asymmetric smoothing: engagement is the default state. Divergence from the
+# focal point dents the score slowly; re-alignment recovers it quickly.
+SCORE_EMA_DOWN = 0.08            # alpha when the instantaneous cue is WORSE than the score
+SCORE_EMA_UP = 0.40              # alpha when the instantaneous cue is BETTER (fast recovery)
 SCORE_SEED = 1.0                 # presume ENGAGED by default (young-families stance)
 ENGAGED_THRESH = 0.5
 
@@ -85,12 +91,18 @@ SHIFT_MIN_PEOPLE = 3             # at least this many people ...
 SHIFT_MIN_FRAC = 0.4             # ... and this fraction of valid audience must shift together
 SHIFT_COOLDOWN = 20              # processed frames the distraction event lasts
 
-# --- performer detection (standing adults; sticky) ---
+# --- performer detection (sticky) ---
+# Cue 1: standing (audience adults are seated).
 LEG_TORSO_RATIO = 1.15           # (hip->ankle) > ratio * (shoulder->hip) => legs extended
 KNEE_DROP_FRAC = 0.55            # (hip->knee) > frac * torso => not folded (seated knees ~ hip level)
 THIGH_STAND_FRAC = 0.75          # ankle-free fallback (long pants/occlusion): knee this far
                                  # below the hip (in torso units) => standing
-PERFORMER_STAND_FRAMES = 10      # consecutive standing frames before promotion (sticky)
+PERFORMER_STAND_FRAMES = 3       # standing evidence (leaky: hit +1, miss -1) before promotion
+# Cue 2: facing the audience. A performer faces TOWARD the seated audience, so
+# their gaze direction is roughly opposite the audience's mean gaze direction.
+FACING_DOT = -0.5                # gaze . audience_mean_dir below this (>120 deg apart) => facing them
+FACING_FRAMES = 3                # facing evidence (leaky: hit +1, contrary obs -1) before promotion
+FACING_COHERENCE = 0.5           # audience mean-dir resultant length required for the cue to apply
 PERFORMER_BOX_PAD = 0.20         # focal point within performer bbox padded by this => "gazed at"
 
 # --- harness ---
@@ -194,7 +206,7 @@ def person_geometry(kp, pbox):
       anchor    (x, y) frame px of the nose (gaze origin), or None
       gaze      unit 2D direction in frame px, or None (ambiguous / no face)
       head_size head scale in frame px (for drawing / pitch checks)
-      floor     True if staring down at the floor
+      floor     True if the ray is near-vertical (excluded from focal voting only)
       standing  True if legs extended below torso (standing adult)
     """
     x1, y1, x2, y2 = pbox
@@ -234,16 +246,24 @@ def person_geometry(kp, pbox):
             ear_mid = 0.5 * (le + re)
             ear_dist = float(np.hypot(*(le - re)))
         elif l_ok or r_ok:
-            ear_mid = pt(L_EAR if l_ok else R_EAR)
-            ear_dist = 0.5 * out['head_size']     # profile: scale from bbox
+            ear = pt(L_EAR if l_ok else R_EAR)
+            eye = pt(L_EYE if l_ok else R_EYE)
+            # profile sanity: the eye must lie AHEAD of the ear, on the way to
+            # the nose - otherwise the "nose" is a misdetection (e.g. back of
+            # head) and the ray would fire off from the ear in a wild direction
+            v_en = nose - ear
+            v_ey = eye - ear
+            if (float(np.dot(v_en, v_ey)) > 0 and
+                    float(np.hypot(*v_ey)) < float(np.hypot(*v_en))):
+                ear_mid = ear
+                ear_dist = 0.5 * out['head_size']     # profile: scale from bbox
         if ear_mid is not None:
             out['head_size'] = max(ear_dist, 1.0)
             d, n = unit(nose - ear_mid)
             if n >= AMBIG_FRAC * max(ear_dist, 1.0):
                 out['gaze'] = (float(d[0]), float(d[1]))
-                # floor gaze: steep downward ray, or nose well below ear line
-                pitch_drop = (nose[1] - ear_mid[1]) / max(ear_dist, 1.0)
-                out['floor'] = d[1] > FLOOR_GAZE_DY or pitch_drop > FLOOR_PITCH_FRAC
+                # near-vertical rays are excluded from focal voting only
+                out['floor'] = d[1] > STEEP_DOWN_DY
 
     # ---- posture: standing vs seated ----
     need_core = [L_SHOULDER, R_SHOULDER, L_HIP, R_HIP, L_KNEE, R_KNEE]
@@ -275,6 +295,7 @@ class GazeRulesEngine:
     def __init__(self):
         self.performers = set()                 # sticky performer track ids
         self.stand_streak = defaultdict(int)    # tid -> consecutive standing frames
+        self.facing_streak = defaultdict(int)   # tid -> consecutive facing-audience frames
         self.dir_hist = defaultdict(lambda: deque(maxlen=SHIFT_WINDOW + 1))
         self.score = {}                         # tid -> EMA engagement 0..1
         self.focal = None                       # smoothed focal point (np.array)
@@ -282,9 +303,12 @@ class GazeRulesEngine:
         self.focal_hold_until = -1              # keep focal alive through brief quorum loss
         self.shift_until = -1                   # distraction cooldown deadline
         self.shifted_tids = set()
+        self.dbg_face_peak = 0                  # max facing streak ever seen
+        self.dbg_stand_peak = 0                 # max standing streak ever seen
 
     def evict(self, tid):
         self.stand_streak.pop(tid, None)
+        self.facing_streak.pop(tid, None)
         self.dir_hist.pop(tid, None)
         self.score.pop(tid, None)
         self.shifted_tids.discard(tid)
@@ -299,25 +323,57 @@ class GazeRulesEngine:
         Returns dict with focal point, per-tid status, gazed performer ids and
         the distraction flag.
         """
-        # ---- 1. performer promotion (standing adults; sticky) ----
+        # ---- 1. performer promotion (sticky): standing OR facing the audience ----
+        # Leaky evidence accumulators: MediaPipe detections flicker frame to
+        # frame, so a single miss must not wipe out accumulated evidence.
         for tid, p in people.items():
             if p['geom']['standing']:
                 self.stand_streak[tid] += 1
+                self.dbg_stand_peak = max(self.dbg_stand_peak, self.stand_streak[tid])
                 if self.stand_streak[tid] >= PERFORMER_STAND_FRAMES:
                     self.performers.add(tid)
             else:
-                self.stand_streak[tid] = 0
+                self.stand_streak[tid] = max(0, self.stand_streak[tid] - 1)
 
-        audience = {tid: p for tid, p in people.items() if tid not in self.performers}
+        def gather_rays():
+            aud = {tid: p for tid, p in people.items() if tid not in self.performers}
+            pts, dirs, tids = [], [], []
+            for tid, p in aud.items():
+                g = p['geom']
+                if g['gaze'] is not None and g['anchor'] is not None and not g['floor']:
+                    pts.append(np.array(g['anchor']))
+                    dirs.append(np.array(g['gaze']))
+                    tids.append(tid)
+            return aud, pts, dirs, tids
+
+        audience, pts, dirs, ray_tids = gather_rays()
+
+        # facing-audience cue: performers face TOWARD the audience, so their
+        # gaze runs contrary to the audience's mean gaze direction
+        dbg_coherence = 0.0
+        if len(dirs) >= MIN_RAYS:
+            mean_vec = np.mean(np.stack(dirs), axis=0)
+            coherence = float(np.hypot(*mean_vec))
+            dbg_coherence = coherence
+            if coherence > FACING_COHERENCE:
+                mean_dir = mean_vec / coherence
+                promoted = False
+                for tid, p in list(audience.items()):
+                    g = p['geom']['gaze']
+                    if g is None:
+                        continue
+                    if float(np.dot(np.array(g), mean_dir)) < FACING_DOT:
+                        self.facing_streak[tid] += 1
+                        self.dbg_face_peak = max(self.dbg_face_peak, self.facing_streak[tid])
+                        if self.facing_streak[tid] >= FACING_FRAMES:
+                            self.performers.add(tid)
+                            promoted = True
+                    else:
+                        self.facing_streak[tid] = max(0, self.facing_streak[tid] - 1)
+                if promoted:
+                    audience, pts, dirs, ray_tids = gather_rays()
 
         # ---- 2. common focal point from audience gaze rays ----
-        pts, dirs, ray_tids = [], [], []
-        for tid, p in audience.items():
-            g = p['geom']
-            if g['gaze'] is not None and g['anchor'] is not None and not g['floor']:
-                pts.append(np.array(g['anchor']))
-                dirs.append(np.array(g['gaze']))
-                ray_tids.append(tid)
 
         raw_focal, contributors = (None, [])
         quorum = max(MIN_RAYS, int(math.ceil(QUORUM_FRAC * len(pts)))) if pts else MIN_RAYS
@@ -390,9 +446,7 @@ class GazeRulesEngine:
             g = p['geom']
             inst = None                        # None = neutral, don't move score
             reason = ''
-            if g['floor']:
-                inst, reason = 0.0, 'floor'
-            elif distraction and tid in self.shifted_tids:
+            if distraction and tid in self.shifted_tids:
                 inst, reason = 0.0, 'shift'
             elif g['gaze'] is not None and g['anchor'] is not None:
                 a = np.array(g['anchor'], dtype=float)
@@ -405,9 +459,12 @@ class GazeRulesEngine:
                         inst = cone_score(dev)
                         reason = f'on-{src}' if inst >= 0.5 else 'off-focal'
             # movement is never penalised: no motion term anywhere.
+            # asymmetric smoothing: dips are slow, recovery is fast - the
+            # audience is presumed engaged; divergence is usually transient.
             if inst is not None:
                 prev = self.score.get(tid, SCORE_SEED)   # presume engaged
-                self.score[tid] = SCORE_EMA * inst + (1 - SCORE_EMA) * prev
+                alpha = SCORE_EMA_UP if inst >= prev else SCORE_EMA_DOWN
+                self.score[tid] = alpha * inst + (1 - alpha) * prev
             status[tid] = {'score': self.score.get(tid), 'reason': reason,
                            'contributed': tid in [ray_tids[i] for i in contributors]}
 
@@ -430,6 +487,11 @@ class GazeRulesEngine:
             'distraction': distraction,
             'status': status,
             'gazed_performers': gazed,
+            'debug': {
+                'coherence': dbg_coherence,
+                'max_facing': self.dbg_face_peak,
+                'max_stand': self.dbg_stand_peak,
+            },
         }
 
 
@@ -501,7 +563,7 @@ def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
         color = COL_ENGAGED if engaged else COL_DISENGAGED
         thick = 2
         label = f"ID{tid} {'ENG' if engaged else 'DIS'} {s*100:.0f}%"
-        if stat['reason'] in ('floor', 'shift', 'off-focal'):
+        if stat['reason'] in ('shift', 'off-focal'):
             label += f" [{stat['reason']}]"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -535,6 +597,7 @@ def draw_global(frame, result, n_scored, src_w):
 # MAIN
 # =============================================================================
 def main():
+    global QUORUM_FRAC
     ap = argparse.ArgumentParser(description="Offline gaze-rules engagement overlay")
     ap.add_argument('--video', required=True, help='input video path')
     ap.add_argument('--output', default=None,
@@ -547,8 +610,14 @@ def main():
     ap.add_argument('--max-persons', type=int, default=25, help='cap MediaPipe passes per frame')
     ap.add_argument('--show', action='store_true', help='live pop-up window')
     ap.add_argument('--window-scale', type=float, default=0.6)
+    ap.add_argument('--quorum', type=float, default=None,
+                    help=f'override QUORUM_FRAC (default {QUORUM_FRAC}): fraction of audience '
+                         'gaze rays that must converge for a valid focal point')
     ap.add_argument('--no-save', action='store_true', help='do not write an output file')
     args = ap.parse_args()
+
+    if args.quorum is not None:
+        QUORUM_FRAC = args.quorum
 
     video = args.video
     if not os.path.isfile(video):
@@ -560,8 +629,12 @@ def main():
     print(f"Loading YOLO: {args.yolo}")
     yolo = YOLO(args.yolo)
     holistic = mp.solutions.holistic.Holistic(
-        static_image_mode=False, model_complexity=1,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        # static_image_mode=True: we call process() on DIFFERENT people's crops
+        # back-to-back (and skip frames between rounds). Tracking mode
+        # (static_image_mode=False) carries landmark state from the previous
+        # call - i.e. from a DIFFERENT person - producing stray gaze rays.
+        static_image_mode=True, model_complexity=1,
+        min_detection_confidence=0.5,
     )
 
     cap = cv2.VideoCapture(video)
@@ -678,6 +751,8 @@ def main():
             print(f"  processed {proc_idx} (raw {raw_idx}/{total_frames}) "
                   f"| {proc_idx/elapsed:.1f} proc-fps | people {len(people)} "
                   f"| performers {len(engine.performers)} "
+                  f"| coh {result['debug']['coherence']:.2f} "
+                  f"face {result['debug']['max_facing']} stand {result['debug']['max_stand']} "
                   f"| {'LIVE' if result['started'] else 'PRE-SHOW'}")
 
     cap.release()
