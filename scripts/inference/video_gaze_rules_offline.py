@@ -106,10 +106,10 @@ SHIFT_NEW_POINT_HS = 3.0         # the shifted rays must RE-CONVERGE on a common
                                  # distraction, e.g. a child falls); otherwise the individuals
                                  # are merely 'off-focal', not a synchronized shift
 
-# --- gaze at another audience member (chatting / people-watching) ---
-AUD_HIT_MIN_HS = 1.5             # an off-target ray entering another audience bbox counts as
-                                 # 'at-audience' (disengaged) only beyond this many head-sizes
-                                 # (immediate neighbours' boxes overlap the gazer's own head)
+# --- no measurable gaze for a prolonged period ---
+NO_CUE_DRIFT = 0.02              # with no gaze ray (face-on/away to camera = ambiguous in 2D)
+NO_CUE_TARGET = 0.5              # the score drifts slowly toward neutral instead of freezing
+                                 # at 100% (only while the show is on)
 
 # --- performer detection (sticky) ---
 # The audience is seated on the floor and does NOT translate through the
@@ -139,10 +139,11 @@ FACING_DOT = -0.5                # gaze . audience_mean_dir below this (>120 deg
 FACING_FRAMES = 3                # facing evidence (leaky: hit +1, contrary obs -1) before promotion
 FACING_COHERENCE = 0.5           # audience mean-dir resultant length required for the cue to apply
 PERFORMER_BOX_PAD = 0.20         # focal point within performer bbox padded by this => "gazed at"
-# Appearance registration: performers are re-identified across YOLO track-id
-# switches by a torso colour histogram (clothes colour) taken at promotion.
+# Appearance registration: performers are PERMANENTLY registered by a torso
+# colour histogram (clothes colour) at promotion; the signature is refreshed
+# while they are tracked and any later track matching it re-locks instantly.
 APPEAR_MATCH = 0.85              # min histogram correlation to re-claim performer status
-APPEAR_MAX_LOST = 8              # remember at most this many lost performer signatures
+SIG_EMA = 0.10                   # per-frame refresh of a tracked performer's registered signature
 
 # --- harness ---
 NUM_KEYPOINTS = 543
@@ -231,25 +232,6 @@ def least_squares_focal(points, dirs):
             return x, infront
         idx = infront
     return x, idx
-
-
-def ray_box_entry(a, d, box):
-    """Slab-method ray/AABB intersection. Returns entry distance t >= 0 along
-    the ray a + t*d, or None if the ray misses the box."""
-    x1, y1, x2, y2 = box
-    t0, t1 = 0.0, float('inf')
-    for i, (lo, hi) in enumerate(((x1, x2), (y1, y2))):
-        if abs(d[i]) < 1e-9:
-            if not (lo <= a[i] <= hi):
-                return None
-        else:
-            ta, tb = (lo - a[i]) / d[i], (hi - a[i]) / d[i]
-            if ta > tb:
-                ta, tb = tb, ta
-            t0, t1 = max(t0, ta), min(t1, tb)
-    if t1 < t0 or t1 < 0:
-        return None
-    return max(t0, 0.0)
 
 
 # =============================================================================
@@ -375,8 +357,9 @@ class GazeRulesEngine:
 
     def __init__(self):
         self.performers = set()                 # sticky performer track ids
-        self.perf_sig = {}                      # tid -> appearance signature (clothes colour)
-        self.lost_sigs = deque(maxlen=APPEAR_MAX_LOST)  # signatures of lost performers
+        self.perf_registry = []                 # PERMANENT clothes-colour signatures, one per
+                                                # unique performer identity (session lifetime)
+        self.perf_reg_idx = {}                  # active performer tid -> registry index
         self.stand_streak = defaultdict(int)    # tid -> consecutive standing frames
         self.facing_streak = defaultdict(int)   # tid -> consecutive facing-audience frames
         self.move_streak = defaultdict(int)     # tid -> sustained-translation evidence
@@ -400,13 +383,29 @@ class GazeRulesEngine:
         self.dir_hist.pop(tid, None)
         self.score.pop(tid, None)
         self.shifted_tids.discard(tid)
-        # A lost performer's appearance signature is remembered so the person
-        # can re-claim performer status under a NEW track id (see re-ID below).
-        if tid in self.performers:
-            sig = self.perf_sig.pop(tid, None)
-            if sig is not None:
-                self.lost_sigs.append(sig)
+        # The registry entry PERSISTS: the person re-claims performer status
+        # under any NEW track id whose clothes signature matches (re-ID below).
+        self.perf_reg_idx.pop(tid, None)
         self.performers.discard(tid)
+
+    def register_performer(self, tid, sig):
+        """Promote tid; bind it to a matching registry identity or a new one."""
+        self.performers.add(tid)
+        if sig is None or tid in self.perf_reg_idx:
+            return
+        claimed = set(self.perf_reg_idx.values())
+        best_i, best_c = -1, APPEAR_MATCH
+        for i, ref in enumerate(self.perf_registry):
+            if i in claimed:
+                continue
+            c = cv2.compareHist(sig, ref, cv2.HISTCMP_CORREL)
+            if c >= best_c:
+                best_i, best_c = i, c
+        if best_i >= 0:
+            self.perf_reg_idx[tid] = best_i
+        else:
+            self.perf_registry.append(sig.copy())
+            self.perf_reg_idx[tid] = len(self.perf_registry) - 1
 
     def update(self, people, proc_idx):
         """people: {tid: {'geom': ..., 'bbox': (x1,y1,x2,y2)}}.
@@ -415,18 +414,34 @@ class GazeRulesEngine:
         the distraction flag.
         """
         # ---- 1a. performer re-identification (appearance / clothes colour) ----
-        # A performer whose YOLO track was lost re-appears with a new id; match
-        # the new person's torso signature against remembered performer sigs.
-        if self.lost_sigs:
+        # Performer identities are registered PERMANENTLY. A performer whose
+        # YOLO track was lost re-appears with a new id; any track matching an
+        # unclaimed registry signature locks straight back on.
+        unclaimed = set(range(len(self.perf_registry))) - set(self.perf_reg_idx.values())
+        if unclaimed:
             for tid, p in people.items():
                 if tid in self.performers or p.get('sig') is None:
                     continue
-                for i, sig in enumerate(self.lost_sigs):
-                    if cv2.compareHist(p['sig'], sig, cv2.HISTCMP_CORREL) >= APPEAR_MATCH:
-                        self.performers.add(tid)
-                        self.perf_sig[tid] = p['sig']
-                        del self.lost_sigs[i]   # remove by index: numpy arrays
-                        break                   # break == comparison in remove()
+                best_i, best_c = -1, APPEAR_MATCH
+                for i in unclaimed:
+                    c = cv2.compareHist(p['sig'], self.perf_registry[i], cv2.HISTCMP_CORREL)
+                    if c >= best_c:
+                        best_i, best_c = i, c
+                if best_i >= 0:
+                    self.performers.add(tid)
+                    self.perf_reg_idx[tid] = best_i
+                    unclaimed.discard(best_i)
+
+        # refresh registered signatures while performers are tracked (slow EMA:
+        # tolerates lighting drift without absorbing brief occlusions)
+        for tid in self.performers:
+            idx = self.perf_reg_idx.get(tid)
+            sig = people.get(tid, {}).get('sig')
+            if idx is not None and sig is not None:
+                ref = self.perf_registry[idx]
+                if cv2.compareHist(sig, ref, cv2.HISTCMP_CORREL) >= APPEAR_MATCH:
+                    cv2.addWeighted(sig, SIG_EMA, ref, 1.0 - SIG_EMA, 0.0, dst=ref)
+                    cv2.normalize(ref, ref)
 
         # ---- 1b. performer evidence (leaky accumulators) ----
         # MediaPipe detections flicker frame to frame, so a single miss must
@@ -500,9 +515,7 @@ class GazeRulesEngine:
             stand_and_face = (self.stand_streak[tid] >= PERFORMER_STAND_FRAMES and
                               self.facing_streak[tid] >= FACING_FRAMES)
             if mobile or strong_stand or stand_and_face:
-                self.performers.add(tid)
-                if p.get('sig') is not None:
-                    self.perf_sig[tid] = p['sig']
+                self.register_performer(tid, p.get('sig'))
                 promoted = True
         if promoted:
             audience, pts, dirs, ray_tids = gather_rays()
@@ -619,18 +632,12 @@ class GazeRulesEngine:
                         else:
                             inst = cone_score(dev)
                             reason = f'on-{src}' if inst >= 0.5 else 'off-focal'
-                    # gaze fixated on ANOTHER audience member (chatting,
-                    # people-watching) = disengaged; only checked when a stage
-                    # target exists and the ray is already off it (pre-show
-                    # people-watching stays neutral)
-                    if inst is not None and inst < 0.5:
-                        for otid, op in audience.items():
-                            if otid == tid:
-                                continue
-                            t_hit = ray_box_entry(a, d, op['bbox'])
-                            if t_hit is not None and t_hit >= AUD_HIT_MIN_HS * g['head_size']:
-                                inst, reason = 0.0, 'at-audience'
-                                break
+            # No measurable gaze (face-on/away to the camera is ambiguous in
+            # 2D): drift slowly toward neutral instead of freezing the score -
+            # a prolonged unreadable stare must not hold 100%.
+            if inst is None and self.focal_valid:
+                prev = self.score.get(tid, SCORE_SEED)
+                self.score[tid] = NO_CUE_DRIFT * NO_CUE_TARGET + (1 - NO_CUE_DRIFT) * prev
             # movement is never penalised: no motion term anywhere.
             # asymmetric smoothing: dips are slow, recovery is fast - the
             # audience is presumed engaged; divergence is usually transient.
@@ -641,8 +648,7 @@ class GazeRulesEngine:
                 if inst >= prev:
                     alpha = SCORE_EMA_UP
                 else:
-                    alpha = (SCORE_EMA_DOWN_OFF if reason in ('off-focal', 'at-audience')
-                             else SCORE_EMA_DOWN)
+                    alpha = SCORE_EMA_DOWN_OFF if reason == 'off-focal' else SCORE_EMA_DOWN
                 self.score[tid] = alpha * inst + (1 - alpha) * prev
             status[tid] = {'score': self.score.get(tid), 'reason': reason,
                            'contributed': tid in [ray_tids[i] for i in contributors]}
@@ -753,7 +759,7 @@ def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
             color = COL_LOW
         thick = 2
         label = f"ID{tid} {s*100:.0f}%"
-        if stat['reason'] in ('shift', 'off-focal', 'at-audience'):
+        if stat['reason'] in ('shift', 'off-focal'):
             label += f" [{stat['reason']}]"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
