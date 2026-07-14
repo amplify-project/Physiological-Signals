@@ -52,6 +52,9 @@ import numpy as np
 # =============================================================================
 # --- gaze geometry ---
 VIS_THRESH = 0.3                 # min MediaPipe landmark visibility
+HEAD_MARGIN = 0.10               # nose/ears may exceed the crop by this fraction before
+                                 # the gaze is rejected as a bad detection (stray rays)
+HEAD_TOP_FRAC = 0.55             # nose must sit in the top fraction of the crop (head region)
 AMBIG_FRAC = 0.15                # |nose-earmid| < this * ear_dist => facing camera/away (no 2D dir)
 FLOOR_GAZE_DY = 0.80             # unit-dir y-component above this => staring at floor
 FLOOR_PITCH_FRAC = 0.80          # nose below ear-line by this * head_size also => floor gaze
@@ -169,11 +172,21 @@ def person_geometry(kp, pbox):
     out = {'anchor': None, 'gaze': None, 'head_size': 0.25 * cw,
            'floor': False, 'standing': False}
 
+    # MediaPipe can return landmarks outside the crop (normalized coords beyond
+    # [0,1]) on poor detections; such "heads" produce stray gaze rays that
+    # emanate from nowhere. Require head landmarks inside the crop (+margin)
+    # and the nose in the upper part of the box.
+    def head_ok(i):
+        nx, ny = kp[i, 0], kp[i, 1]
+        return (-HEAD_MARGIN <= nx <= 1.0 + HEAD_MARGIN and
+                -HEAD_MARGIN <= ny <= 1.0 + HEAD_MARGIN)
+
     # ---- gaze: ear-midpoint -> nose (or single-ear profile fallback) ----
-    if vis(NOSE) >= VIS_THRESH:
+    if vis(NOSE) >= VIS_THRESH and head_ok(NOSE) and kp[NOSE, 1] <= HEAD_TOP_FRAC:
         nose = pt(NOSE)
         out['anchor'] = (float(nose[0]), float(nose[1]))
-        l_ok, r_ok = vis(L_EAR) >= VIS_THRESH, vis(R_EAR) >= VIS_THRESH
+        l_ok = vis(L_EAR) >= VIS_THRESH and head_ok(L_EAR)
+        r_ok = vis(R_EAR) >= VIS_THRESH and head_ok(R_EAR)
         ear_mid = ear_dist = None
         if l_ok and r_ok:
             le, re = pt(L_EAR), pt(R_EAR)
