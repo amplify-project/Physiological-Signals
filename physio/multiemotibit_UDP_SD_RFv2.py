@@ -2,10 +2,18 @@
 # -*- coding: utf-8 -*-
 # REAL-TIME EMOTIBIT: FILTERED EDA + HR PLOT + HR PUBLISH TO REDIS
 # Direct UDP - no EmotiBit Oscilloscope / LSL dependency
+#
+# Features:
+# - Multi-device support via UDP discovery
+# - Per-wearer baseline tracking (Welford online variance)
+# - Runtime reconnect capability
+# - Redis pub/sub for live GUI + Redis Streams for time-sync
+# - Compatible with redis_sync_consumer.py for audio-physio alignment
 # ===============================================================
 
 import atexit
 import csv
+import queue
 import time, threading, json
 from datetime import datetime
 from collections import defaultdict
@@ -48,11 +56,17 @@ REDIS_PORT = 6379
 REDIS_DB = 0
 
 CHANNEL_PHYSIO = "device:{src}:physio_metrics"
+CHANNEL_RAW_SENSORS = "device:{src}:raw_sensors"  # Accelerometer, gyroscope, magnetometer, temperature, battery, PPG
 CHANNEL_VAL = "device:{src}:valence_cont"
 CHANNEL_ARO = "device:{src}:arousal_cont"
 CHANNEL_RESET = "device:{src}:reset_baseline"  # GUI publishes here to reset a wearer's baseline
 CHANNEL_RECONNECT = "emotibit:reconnect"        # GUI/operator publishes here to re-run device discovery at runtime
 CHANNEL_RECONNECT_STATUS = "emotibit:reconnect_status"  # publisher reports the outcome back to the GUI
+
+# Redis Streams settings: cap stream length so memory doesn't grow unbounded
+# over long sessions (approximate trimming is cheap). This enables time-based
+# synchronization with audio_redis_publisher.py via redis_sync_consumer.py.
+STREAM_MAXLEN = 20000
 
 # ---- Per-wearer session-z baseline / artefact-rejection settings ----
 # Plausibility gates: samples outside these ranges never enter RF / SD / Welford buffers.
@@ -71,6 +85,12 @@ PLAUSIBLE_DIE_TEMP_C   = (22.0, 36.0)
 PLAUSIBLE_TEMP_C   = (30.0, 38.0)  # legacy alias, used only by manual-T0 path
 PLAUSIBLE_EDA_US   = (0.01, 100.0)
 PLAUSIBLE_SCR_FREQ = (0.0, 20.0)
+# EmotiBit emits a ~9999-10000 sentinel/placeholder for SCRAmplitude before a
+# real reading is computable (observed in the first few seconds of a new
+# wearer's calibration, alongside the "eda_z missing post-calibration" state).
+# Real values in this dataset run 0-25; gate it like every other channel so
+# the placeholder never reaches the raw buffer as a numeric value.
+PLAUSIBLE_SCR_AMPLITUDE = (0.0, 25.0)
 IBI_MEDIAN_KERNEL  = 3        # median pre-filter on per-beat IBI
 # Warm-up before z-scores are published. A z-score needs a mean AND a standard
 # deviation, so the hard floor is BASELINE_MIN_SAMPLES (below) -- you cannot
@@ -159,6 +179,29 @@ def filter_eda(arr):
 def filter_hr(arr):
     arr = medfilt(arr, kernel_size=5)
     return lowpass_filter(arr, cutoff=0.5, fs=EMIT_RATE_HZ)
+
+# ----------------------------- REDIS STREAMS HELPER -----------------------------
+def _safe_xadd(redis_client, stream_name, payload):
+    """Persist a flat dict to a Redis Stream (redis-py requires every field
+    value to be a str/int/float/bytes - None isn't allowed, bools/dicts/lists must be converted)."""
+    fields = {}
+    for k, v in payload.items():
+        if v is None:
+            continue
+        # Redis xadd only accepts primitives - convert complex types
+        if isinstance(v, bool):
+            fields[k] = int(v)  # True → 1, False → 0
+        elif isinstance(v, (dict, list)):
+            fields[k] = json.dumps(v)  # Serialize complex types to JSON string
+        elif isinstance(v, (str, int, float, bytes)):
+            fields[k] = v
+        else:
+            # Fallback: convert unknown types to string
+            fields[k] = str(v)
+    try:
+        redis_client.xadd(stream_name, fields, maxlen=STREAM_MAXLEN, approximate=True)
+    except Exception as e:
+        log.warning(f"xadd to {stream_name} failed: {e}")
 
 # ----------------------------- BASELINE STATE -----------------------------
 class WelfordState:
@@ -263,7 +306,7 @@ class DataLogger:
             "hr_z", "eda_z", "ibi_z", "temperature_roc_z", "scr_frequency_z",
             "hr_event_hard", "eda_event_hard", "ibi_event_hard",
             "quality_hr", "quality_eda", "quality_ibi",
-            "quality_temperature_roc", "quality_scr_frequency",
+            "quality_temperature_roc", "quality_scr_frequency", "quality_scr_amplitude",
             "swap_detected",
             "processing_time_ms"
             # Note: end_to_end_latency_ms removed - unreliable without proper clock sync
@@ -318,6 +361,86 @@ class DataLogger:
                 self._file.close()
                 self._closed = True
 
+# ----------------------------- RAW MOTION LOGGER -----------------------------
+class RawMotionLogger:
+    """Logs every raw accelerometer/gyroscope/magnetometer sample at full rate,
+    independent of process_window()'s 1 Hz cadence (which only ever persists the
+    single latest sample per second - fine for HR/EDA, which are meant to be
+    smoothed, but it silently drops ~24 of every 25 motion samples).
+
+    update() runs on the single UDP thread shared by every connected EmotiBit
+    (see udp_thread()), so log() must never block on disk I/O - with 8 devices
+    live, any per-call file open/write/close (the earlier approach) stalls that
+    one thread for all of them and has crashed the sensor stream before. log()
+    only enqueues; a dedicated per-device thread drains the queue and does the
+    actual write against a handle opened once for the session (mirrors
+    DataLogger), fsync'd on a timer instead of every row.
+    """
+    FLUSH_INTERVAL = 1.0
+    QUEUE_WARN_SIZE = 20000  # backlog large enough to mean the writer can't keep up
+
+    def __init__(self, source_id, output_dir="emotibit_recordings"):
+        self.source_id = source_id
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.filename = output_path / f"raw_motion_{source_id}_{timestamp}.csv"
+
+        self._file = open(self.filename, 'w', newline='')
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(["timestamp", "device", "signal", "value"])
+        self._file.flush()
+        self._last_flush = time.time()
+        self._closed = False
+
+        self._queue = queue.Queue()
+        self._last_backlog_warn = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._writer_loop, daemon=True,
+            name=f"raw-motion-writer-{source_id}",
+        )
+        self._thread.start()
+
+        print(f"  Raw motion logger initialized for {source_id} -> {self.filename}")
+
+    def log(self, timestamp, signal, value):
+        """Non-blocking enqueue - safe to call from the shared UDP receive thread."""
+        self._queue.put_nowait((timestamp, signal, value))
+        qsize = self._queue.qsize()
+        if qsize > self.QUEUE_WARN_SIZE:
+            now = time.time()
+            if now - self._last_backlog_warn > 10.0:
+                log.warning(
+                    "%s raw motion writer backlog at %d items - disk write falling behind",
+                    self.source_id, qsize,
+                )
+                self._last_backlog_warn = now
+
+    def _writer_loop(self):
+        while not self._stop.is_set() or not self._queue.empty():
+            try:
+                ts, signal, value = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._writer.writerow([ts, self.source_id, signal, value])
+
+            now = time.time()
+            if now - self._last_flush >= self.FLUSH_INTERVAL:
+                self._file.flush()
+                os.fsync(self._file.fileno())
+                self._last_flush = now
+
+    def close(self):
+        """Signal the writer thread to drain and stop, then close the handle."""
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        if not self._closed:
+            self._file.flush()
+            os.fsync(self._file.fileno())
+            self._file.close()
+            self._closed = True
+
 # ----------------------------- DEVICE AGGREGATOR -----------------------------
 class DeviceAggregator:
     def __init__(self, source_id, clf_val, clf_aro, redis_client, all_signal_types=None):
@@ -349,6 +472,7 @@ class DeviceAggregator:
         self.hr_values = []  # Heart Rate
         self.ibi_values = []  # Inter-Beat Interval
         self.data_logger = DataLogger(source_id, signal_types=self.all_signals)
+        self.raw_motion_logger = RawMotionLogger(source_id)
         # Print throttling to reduce terminal overhead
         self.start_time = time.time()
         self.last_print_time = 0
@@ -378,7 +502,7 @@ class DeviceAggregator:
         # Quality flag per published channel
         self.channel_quality = {
             'hr': 'ok', 'eda': 'ok', 'ibi': 'ok',
-            'temperature_roc': 'ok', 'scr_frequency': 'ok',
+            'temperature_roc': 'ok', 'scr_frequency': 'ok', 'scr_amplitude': 'ok',
         }
 
     def reset_baseline(self, reason="manual"):
@@ -417,8 +541,10 @@ class DeviceAggregator:
             max_samples = int(WINDOW_SECONDS * EMIT_RATE_HZ)
             now_wall = time.time()
 
-            # Always log raw to CSV buffer
-            if col in self.all_signal_values:
+            # Always log raw to CSV buffer. SCRAmplitude is the one exception:
+            # it's gated below so a placeholder sentinel can be swapped for NaN
+            # before it ever lands in the buffer this reads from.
+            if col in self.all_signal_values and col != "SCRAmplitude":
                 self.all_signal_values[col].append(v)
                 self.all_signal_values[col] = self.all_signal_values[col][-max_samples:]
 
@@ -431,6 +557,7 @@ class DeviceAggregator:
                 self.last_data_time['temperature'] = now_wall
             elif col.startswith("Accelerometer") or col.startswith("Gyroscope") or col.startswith("Magnetometer"):
                 self.last_data_time['accelerometer'] = now_wall
+                self.raw_motion_logger.log(now_wall, col, v)
 
             # Plausibility gates before RF / SD / Welford buffers
             if col == "HeartRate":
@@ -538,6 +665,16 @@ class DeviceAggregator:
                 self.channel_quality['scr_frequency'] = 'ok'
                 self.scr_freq_values.append(v)
                 self.scr_freq_values = self.scr_freq_values[-max_samples:]
+            elif col == "SCRAmplitude":
+                if not _plausible(v, PLAUSIBLE_SCR_AMPLITUDE):
+                    self.channel_quality['scr_amplitude'] = 'low'
+                    v = float('nan')  # sentinel/placeholder -> NaN, never a
+                                       # fabricated numeric reading
+                else:
+                    self.channel_quality['scr_amplitude'] = 'ok'
+                if "SCRAmplitude" in self.all_signal_values:
+                    self.all_signal_values["SCRAmplitude"].append(v)
+                    self.all_signal_values["SCRAmplitude"] = self.all_signal_values["SCRAmplitude"][-max_samples:]
 
     def _compute_baseline_extras(self):
         """Update Welford running stats with current 1Hz representatives,
@@ -807,6 +944,9 @@ class DeviceAggregator:
             signal_dict["quality_ibi"] = q.get('ibi', '')
             signal_dict["quality_temperature_roc"] = q.get('temperature_roc', '')
             signal_dict["quality_scr_frequency"] = q.get('scr_frequency', '')
+            # Not part of the freshness-gated z-score quality dict (no Welford/z
+            # exists for amplitude) - sourced straight from the plausibility gate.
+            signal_dict["quality_scr_amplitude"] = self.channel_quality.get('scr_amplitude', '')
             signal_dict["swap_detected"] = bool(extras['swap_detected'])
             signal_dict["off_wrist"] = bool(extras.get('off_wrist', False))
 
@@ -865,8 +1005,11 @@ class DeviceAggregator:
 
             # Note: Performance metrics (processing_time_ms, sample counts) are only saved to CSV, not published to Redis
             
-            # Publish consolidated metrics
+            # Publish consolidated metrics (pub/sub for live GUI)
             self.redis.publish(CHANNEL_PHYSIO.format(src=self.source_id), json.dumps(physio_metrics))
+
+            # Also persist to Redis Stream for timestamp-based synchronization with audio
+            _safe_xadd(self.redis, CHANNEL_PHYSIO.format(src=self.source_id), physio_metrics)
 
             # Post-calibration sanity check: if the GUI-facing EDA channels are still empty
             # after the warm-up window expired, the spline will render as "Physio: no signal".
@@ -900,11 +1043,31 @@ class DeviceAggregator:
                         )
                         self._missing_metric_last_warn['edl_sd'] = now_ts
 
-            # --- Redis publish: continuous val/arousal ---
-            self.redis.publish(CHANNEL_VAL.format(src=self.source_id),
-                               json.dumps({"device": self.source_id, "valence": float(val_cont), "timestamp": ts}))
-            self.redis.publish(CHANNEL_ARO.format(src=self.source_id),
-                               json.dumps({"device": self.source_id, "arousal": float(aro_cont), "timestamp": ts}))
+            # --- Redis publish: continuous val/arousal (pub/sub + streams) ---
+            val_payload = {"device": self.source_id, "valence": float(val_cont), "timestamp": ts}
+            aro_payload = {"device": self.source_id, "arousal": float(aro_cont), "timestamp": ts}
+
+            self.redis.publish(CHANNEL_VAL.format(src=self.source_id), json.dumps(val_payload))
+            self.redis.publish(CHANNEL_ARO.format(src=self.source_id), json.dumps(aro_payload))
+
+            # Persist valence/arousal to streams for sync with audio
+            _safe_xadd(self.redis, CHANNEL_VAL.format(src=self.source_id), val_payload)
+            _safe_xadd(self.redis, CHANNEL_ARO.format(src=self.source_id), aro_payload)
+
+            # --- Publish raw sensor data (accelerometer, gyroscope, etc.) ---
+            # Get latest values from all_signal_values buffer for motion/orientation/context analysis
+            raw_sensors = {"device": self.source_id, "timestamp": ts}
+            sensor_keys = ['AccelerometerX', 'AccelerometerY', 'AccelerometerZ',
+                          'GyroscopeX', 'GyroscopeY', 'GyroscopeZ',
+                          'MagnetometerX', 'MagnetometerY', 'MagnetometerZ',
+                          'PPGGreen', 'PPGInfrared', 'PPGRed',
+                          'Thermopile', 'Temperature0', 'Temperature1',
+                          'BatteryVoltage', 'BatteryPercent',
+                          'Humidity', 'SpO2']
+            for key in sensor_keys:
+                if key in self.all_signal_values and len(self.all_signal_values[key]) > 0:
+                    raw_sensors[key] = float(self.all_signal_values[key][-1])  # Latest value
+            _safe_xadd(self.redis, CHANNEL_RAW_SENSORS.format(src=self.source_id), raw_sensors)
 
             # Print status with SD metrics and performance (throttled to reduce overhead)
             current_time = time.time()
@@ -1221,29 +1384,33 @@ def main():
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
 
     # ---- NETWORK SOCKETS ----
-    ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    if hasattr(socket, 'SO_REUSEPORT'):
+    # NOTE: no SO_REUSEADDR on the UDP sockets. UDP has no TIME_WAIT so it is
+    # never needed for restarts — but with it set, a second publisher instance
+    # binds the same ports silently and Windows delivers each packet to only
+    # ONE of the sockets, so a forgotten stale instance steals all EmotiBit
+    # traffic and discovery appears dead with no error. Better to fail loudly.
+    def _bind_or_die(sock, port, label):
         try:
-            ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            sock.bind(("", port))
         except OSError:
-            pass
-    ctrl_sock.bind(("", EMOTIBIT_CONTROL_PORT))
+            print(f"L Port {port} ({label}) is already in use.")
+            print("   Another EmotiBit publisher is probably still running.")
+            print("   Close it (check Task Manager for python.exe) and retry:")
+            print(f"     Get-NetUDPEndpoint -LocalPort {port} | "
+                  "Select-Object OwningProcess")
+            sys.exit(1)
+
+    ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    _bind_or_die(ctrl_sock, EMOTIBIT_CONTROL_PORT, "EmotiBit control")
     ctrl_sock.settimeout(1.0)
 
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, 'SO_REUSEPORT'):
-        try:
-            data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            pass
     try:
         data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
     except OSError:
         pass
-    data_sock.bind(("", EMOTIBIT_DATA_PORT))
+    _bind_or_die(data_sock, EMOTIBIT_DATA_PORT, "EmotiBit data")
     data_sock.settimeout(1.0)
     if platform.system() == 'Windows':
         import ctypes, ctypes.wintypes
@@ -1347,6 +1514,28 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Closing the console window on Windows kills the process WITHOUT running
+    # atexit, so the DC packet never reached the devices and they stayed
+    # paired to a dead session (deaf to the next discovery until their own
+    # timeout / power-cycle). A console control handler catches window close /
+    # logoff / shutdown and sends DC first.
+    if platform.system() == 'Windows':
+        import ctypes
+        import ctypes.wintypes
+
+        def _win_console_handler(ctrl_type):
+            # CTRL_CLOSE_EVENT=2, CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6
+            if ctrl_type in (2, 5, 6):
+                _emergency_disconnect()
+                time.sleep(0.2)  # let the DC packets leave the NIC
+            return False  # continue with default termination
+
+        _HANDLER_ROUTINE = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+        global _win_ctrl_handler_ref  # keep alive for process lifetime
+        _win_ctrl_handler_ref = _HANDLER_ROUTINE(_win_console_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_win_ctrl_handler_ref, 1)
 
     # All possible signal types for logging
     signal_types = {name: True for name in TYPE_TAG_MAP.values()}
@@ -1588,6 +1777,10 @@ def main():
         for agg in list(agg_list):
             try:
                 agg.data_logger.close()
+            except Exception:
+                pass
+            try:
+                agg.raw_motion_logger.close()
             except Exception:
                 pass
 

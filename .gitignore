@@ -109,3 +109,6 @@ handover_ar/
 # Face ID weights are downloaded by SETUP.bat on first install (>100 MB,
 # exceeds GitHub's blob limit) — not committed with the handover bundle.
 Handover_JulySession/model/20180402-114759-vggface2.pt
+
+# Redis persistence snapshots (runtime data)
+dump.rdb

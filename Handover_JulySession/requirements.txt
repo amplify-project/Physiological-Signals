@@ -13,7 +13,6 @@
 opencv-contrib-python==4.10.0.84
 lap>=0.5.12
 mediapipe==0.10.21
-protobuf==4.25.9   # MUST stay <5: mediapipe graphs fail to parse with protobuf 5.x
 ultralytics==8.3.229
 ultralytics-thop==2.0.18
 
@@ -35,11 +34,17 @@ python-dateutil==2.9.0.post0
 # --- Redis ---
 redis==7.0.1
 
+# --- Audio Detection (Real-Time Music + Singing) ---
+sounddevice==0.5.1
+soundfile==0.13.1  # For WAV file recording
+onnxruntime==1.20.1
+matplotlib==3.10.0  # For audio detection plot feature (optional)
+
 # --- Visualisation ---
-# matplotlib intentionally removed: the live EmotiBit plot was previously
-# drawn here, but the engagement GUI now renders all physio signals from
-# Redis. Keeping pillow because it is pulled in transitively by torchvision
-# / facenet-pytorch and pinning it avoids resolver churn.
+# matplotlib now required for audio detection plotting.
+# The live EmotiBit plot was previously drawn here, but the engagement GUI
+# now renders all physio signals from Redis. Also used by audio detection
+# for session review plots (optional feature, not required for runtime).
 pillow==10.2.0
 
 # --- Utilities ---

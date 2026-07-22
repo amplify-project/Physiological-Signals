@@ -1515,9 +1515,14 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
 
     # Build unified row list: enrolled devices first (with radio button),
     # then any other connected-but-unassigned devices (plotted, no radio).
+    # Only devices that have actually published data THIS session get a row:
+    # face enrollments persist across sessions (.face_enrollments/), so an
+    # enrolled-but-absent EmotiBit would otherwise draw a blank plot.
     enrolled_set = set(enrolled_names)
+    connected_set = set(connected_serials)
+    enrolled_connected = [s for s in enrolled_names if s in connected_set]
     unassigned = [s for s in connected_serials if s not in enrolled_set]
-    rows = ([(s, True) for s in enrolled_names]
+    rows = ([(s, True) for s in enrolled_connected]
             + [(s, False) for s in unassigned])
     n = len(rows)
 

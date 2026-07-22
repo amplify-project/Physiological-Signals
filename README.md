@@ -2,6 +2,12 @@
 
 Real-time audience engagement estimation for live performances using pose-based machine learning and EmotiBit physiological signal processing.
 
+> **Release V3.0 — July Family Lab (2026-07):**
+> - **Real-time audio classification** (music / singing / pause) with CSV + WAV recording and automatic microphone selection — new `audio/` component.
+> - **Full-rate accelerometer/IMU capture** — raw motion samples are no longer decimated to 1 Hz; every accel/gyro/mag sample is logged to `raw_motion_<serial>_<ts>.csv` and latest raw sensor values stream to Redis (`device:{serial}:raw_sensors`), with Redis Streams mirrors for audio–physio time alignment.
+> - **Registered-adults-only engagement** — crowd score and gaze focal-point voting are restricted to face-ID-registered (EmotiBit-wearing) adults; bystanders and infants are never scored or drawn.
+> - Reliability fixes: EmotiBit port-conflict detection, disconnect-on-window-close, firewall automation, sidebar shows only devices connected this session.
+
 ---
 
 ## Current Working Repository
@@ -12,6 +18,7 @@ Work should proceed from Sowmya's `amplify-project/Physiological-Signals` remote
 
 - Computer-vision engagement inference, multi-person tracking, face registration, 360-video support, logging, analysis, and training utilities are now in the project-level `scripts/`, `src/`, `models/`, and `docs/` folders.
 - Sowmya's newer EmotiBit physiological pipeline is now the project-level Physio implementation in `physio/multiemotibit_UDP_SD_RFv2.py`.
+- Will's real-time audio classification (music + singing detection) is now the project-level implementation in `audio/` (script, config, YamNet ONNX + singing-head models).
 - The multiperson GUI consumes the new physiological standard-deviation stream (`eda_sd` and `hr_sd`) from `device:{serial}:physio_metrics`.
 - `Handover_JulySession/` remains as the up-to-date handover package and reference copy for the demo-ready workflow.
 
@@ -371,6 +378,9 @@ keypoints the model already consumes — no extra per-frame compute.
 - Publishes SD metrics to Redis on `device:{serial}:physio_metrics`, including explicit `eda_sd` and `hr_sd` fields for the multiperson GUI
 - Publishes affect outputs to Redis on `device:{serial}:valence_cont` and `device:{serial}:arousal_cont`
 - Logs all raw signals, SD metrics, predictions, and processing time to CSV in `emotibit_recordings/`
+- **Full-rate raw motion logging** — the 1 Hz processing window only ever kept the latest sample per second, silently dropping ~24 of every 25 motion samples. A dedicated `RawMotionLogger` (queue + per-device writer thread, never blocking the shared UDP receive thread) now records **every** accelerometer/gyroscope/magnetometer sample to `raw_motion_<serial>_<ts>.csv`
+- **Redis Streams for time-sync** — `physio_metrics`, `valence_cont` and `arousal_cont` are mirrored into capped Redis Streams, plus a `device:{serial}:raw_sensors` stream (accel/gyro/mag, PPG, temperature, battery, SpO2), enabling timestamp-based alignment with the audio recordings
+- **SCRAmplitude sentinel gating** — EmotiBit's ~9999 placeholder values are converted to NaN via a plausibility gate (0–25 µS) with a `quality_scr_amplitude` flag, so placeholders never enter the data as numeric readings
 
 ### Per-wearer session z-scores
 
@@ -393,6 +403,20 @@ The original magnitude `*_sd` fields stay in the `physio_metrics` payload for ba
 - Click a row to focus that participant (magenta bounding box on their video feed)
 - Press **R** to open a picklist of detected-but-unassigned EmotiBit serials; select with arrow keys or number keys, confirm with Enter
 - Enrolled participants always shown with their EmotiBit serial as bounding box label regardless of radio button state
+
+---
+
+## 🎵 Real-Time Audio Detection (Music + Singing)
+
+Standalone audio classifier that logs concert audio state alongside the EmotiBit data (see [audio/README.md](audio/README.md) for full details):
+
+- `audio/audio_monitor_csv.py` — YamNet (ONNX) music detection + MLP singing head on YamNet embeddings; states `PAUSE | MUSIC | SINGING`
+- Outputs a detection CSV (~0.48 s hop) and a continuously auto-saved WAV to `emotibit_recordings/`, timestamped for alignment with the physio CSVs
+- Thresholds and model paths in `audio/audio_config.py`; models in `audio/models/` (`yamnet_model.onnx`, `sing_detection_head.pt`)
+- **Automatic microphone selection** (`--auto-device`) — probes each physical input device for ~1 s and picks the one with the strongest RMS signal (the audio analogue of the camera non-black-frame auto-select); the launcher uses this by default, pass a device ID to override
+- Runs entirely on **CPU** (ONNX Runtime CPU provider + tiny MLP) — no GPU required
+- Launcher for the demo bundle: `Handover_JulySession/4_START_AUDIO_REALTIME.bat`; from the repo root run `python audio/audio_monitor_csv.py --list-devices` then `python audio/audio_monitor_csv.py --quiet`
+- Test helper: `physio/simulate_emotibits.py` publishes synthetic EmotiBit Redis streams for GUI testing without hardware
 
 ---
 

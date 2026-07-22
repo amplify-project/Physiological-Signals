@@ -66,3 +66,10 @@ python-dotenv>=1.0.0
 # Redis (for engagement score streaming)
 # -----------------------------------------------------------------------------
 redis>=5.0.0
+
+# -----------------------------------------------------------------------------
+# Audio Detection (real-time music + singing, audio/audio_monitor_csv.py)
+# -----------------------------------------------------------------------------
+sounddevice>=0.5.1
+soundfile>=0.13.1           # WAV file recording
+onnxruntime>=1.20.1         # YamNet ONNX inference
