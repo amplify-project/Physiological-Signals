@@ -385,6 +385,8 @@ class GazeRulesEngine:
         self.focal_ema = FOCAL_EMA / s
 
         self.performers = set()                 # sticky performer track ids
+        self.excluded_ids = set()               # registered audience: NEVER promotable
+                                                # (set each frame by the live pipeline)
         self.perf_registry = []                 # PERMANENT clothes-colour signatures, one per
                                                 # unique performer identity (session lifetime)
         self.perf_reg_idx = {}                  # active performer tid -> registry index
@@ -431,7 +433,7 @@ class GazeRulesEngine:
         claimed = set(self.perf_reg_idx.values())
         best_i, best_c = -1, APPEAR_MATCH
         for i, ref in enumerate(self.perf_registry):
-            if i in claimed:
+            if i in claimed or ref is None:
                 continue
             c = cv2.compareHist(sig, ref, cv2.HISTCMP_CORREL)
             if c >= best_c:
@@ -448,6 +450,23 @@ class GazeRulesEngine:
         Returns dict with focal point, per-tid status, gazed performer ids and
         the distraction flag.
         """
+        # ---- 1a0. registered-audience exemption ----
+        # Registered (face-identified) people are audience by definition and
+        # can never be performers — walking through the room (arrival, a
+        # distance test) otherwise trips the mobility promotion, which is
+        # sticky and silently removes them from scoring. Demote retroactively
+        # and retire the registry signature so it cannot re-claim any track.
+        for tid in [t for t in self.performers if t in self.excluded_ids]:
+            idx = self.perf_reg_idx.pop(tid, None)
+            if idx is not None:
+                self.perf_registry[idx] = None
+                self.ghosts.pop(idx, None)
+            self.perf_kin.pop(tid, None)
+            self.performers.discard(tid)
+            self.stand_streak.pop(tid, None)
+            self.facing_streak.pop(tid, None)
+            self.move_streak.pop(tid, None)
+
         # ---- 1a. performer re-identification ----
         # Performer identities are registered PERMANENTLY. A performer whose
         # YOLO track was lost re-appears with a new id; it locks back on when
@@ -460,10 +479,12 @@ class GazeRulesEngine:
             g[3] -= 1
             if g[3] <= 0:
                 del self.ghosts[idx]
-        unclaimed = set(range(len(self.perf_registry))) - set(self.perf_reg_idx.values())
+        unclaimed = ({i for i in range(len(self.perf_registry))
+                      if self.perf_registry[i] is not None}
+                     - set(self.perf_reg_idx.values()))
         if unclaimed:
             for tid, p in people.items():
-                if tid in self.performers:
+                if tid in self.performers or tid in self.excluded_ids:
                     continue
                 sig = p.get('sig')
                 x1, y1, x2, y2 = p['bbox']
@@ -504,7 +525,7 @@ class GazeRulesEngine:
             vel = (centre - prev[0]) if prev is not None else np.zeros(2)
             self.perf_kin[tid] = (centre, vel, max(1.0, float(y2 - y1)))
             sig = p.get('sig')
-            if idx is not None and sig is not None:
+            if idx is not None and sig is not None and self.perf_registry[idx] is not None:
                 ref = self.perf_registry[idx]
                 if cv2.compareHist(sig, ref, cv2.HISTCMP_CORREL) >= APPEAR_MATCH:
                     cv2.addWeighted(sig, SIG_EMA, ref, 1.0 - SIG_EMA, 0.0, dst=ref)
@@ -579,6 +600,8 @@ class GazeRulesEngine:
         # weak posture evidence alone misfires on seated audience members)
         promoted = False
         for tid, p in list(audience.items()):
+            if tid in self.excluded_ids:
+                continue
             mobile = self.move_streak[tid] >= self.move_frames
             strong_stand = self.stand_streak[tid] >= self.stand_strong
             stand_and_face = (self.stand_streak[tid] >= self.stand_frames and

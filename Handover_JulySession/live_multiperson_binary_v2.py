@@ -1445,6 +1445,9 @@ class MultiPersonEngagementSystem:
         # performer promotion / re-ID. Then FUSE with the action-model score:
         # gaze is the base, the model rescues confident pro cues and caps
         # confident anti cues. Performers are flagged and never scored.
+        # Registered people are exempt from performer promotion (audience by
+        # definition — walking must not silently unscore them).
+        self.gaze_engine.excluded_ids = self.registered_ids if self.registered_only else set()
         gaze_result = self.gaze_engine.update(gaze_people, self._frame_counter)
         self.last_gaze_result = gaze_result
         for d in current_frame_data:
@@ -2070,6 +2073,7 @@ def main():
     # Caches last-used camera index for instant startup on repeat runs
     # =========================================================================
     CAMERA_CACHE_FILE = Path(__file__).parent / '.last_camera'
+    MSMF_CACHE_FILE = Path(__file__).parent / '.last_camera_msmf'
     cap = None
     video_source_name = ""
     
@@ -2175,10 +2179,21 @@ def main():
             cap.release()
             # DSHOW and MSMF enumerate devices differently (the C930e is
             # DSHOW index 4 but MSMF index 0 on this rig), so scan MSMF
-            # indices rather than trusting the DSHOW index. Wrong-device
-            # grabs are rejected: virtual cams can't deliver 1920 wide and
-            # black/static streams fail the content check.
-            msmf_candidates = [index] + [i for i in range(6) if i != index]
+            # indices rather than trusting the DSHOW index. Failed MSMF
+            # opens time out slowly, so the last known-good index (cached)
+            # is tried first. Wrong-device grabs are rejected: virtual cams
+            # can't deliver 1920 wide and black/static streams fail the
+            # content check.
+            cached_msmf = None
+            if MSMF_CACHE_FILE.exists():
+                try:
+                    cached_msmf = int(MSMF_CACHE_FILE.read_text().strip())
+                except (ValueError, OSError):
+                    cached_msmf = None
+            msmf_candidates = []
+            for i in ([cached_msmf] if cached_msmf is not None else []) + [index] + list(range(6)):
+                if i not in msmf_candidates:
+                    msmf_candidates.append(i)
             for midx in msmf_candidates:
                 new = cv2.VideoCapture(midx, cv2.CAP_MSMF)
                 if not new.isOpened():
@@ -2198,6 +2213,10 @@ def main():
                                   f"{nw}x{nh}@~{new_fps:.0f}fps (MSMF idx {midx}, MJPG)")
                             log.info(f"capture: boosted {w}x{h}@{cur_fps:.1f} -> "
                                      f"{nw}x{nh}@{new_fps:.1f} via MSMF idx {midx}")
+                            try:
+                                MSMF_CACHE_FILE.write_text(str(midx))
+                            except OSError:
+                                pass
                             return new
                 new.release()
             print(f"⚠️  1080p30 renegotiation FAILED — reverting to default camera mode. "
