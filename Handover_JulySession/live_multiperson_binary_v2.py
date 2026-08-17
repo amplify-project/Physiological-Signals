@@ -1826,6 +1826,9 @@ def main():
                              'to pick it instead of the built-in laptop camera.')
     parser.add_argument('--video', type=str, default=None,
                         help='Path to video file (overrides --camera)')
+    parser.add_argument('--start-time', type=str, default=None,
+                        help='Seek video files to this position before processing '
+                             '(SS, MM:SS or HH:MM:SS). Ignored for live cameras.')
     parser.add_argument('--redis-host', type=str, default=DEFAULT_REDIS_HOST,
                         help=f'Redis server host/IP address (default: {DEFAULT_REDIS_HOST})')
     parser.add_argument('--redis-port', type=int, default=DEFAULT_REDIS_PORT,
@@ -2543,9 +2546,20 @@ def main():
     else:
         print(f"📷 Video Format: Standard Perspective ({first_frame.shape[1]}x{first_frame.shape[0]})")
     
-    # Reset video to beginning (for video files)
+    # Reset video to beginning / requested start position (for video files)
+    video_start_ms = 0.0
+    if args.video and args.start_time:
+        parts = [float(p) for p in args.start_time.split(':')]
+        secs = 0.0
+        for p in parts:
+            secs = secs * 60 + p
+        video_start_ms = secs * 1000.0
+        print(f"⏩ Starting video at {args.start_time} ({secs:.0f}s)")
     if args.video:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if video_start_ms > 0:
+            cap.set(cv2.CAP_PROP_POS_MSEC, video_start_ms)
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     # =========================================================================
     # FPS CALIBRATION PHASE
@@ -2657,7 +2671,10 @@ def main():
         if not ret:
             if args.video:
                 # Loop video file — reset capture and tracker state
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if video_start_ms > 0:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, video_start_ms)
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 if prefetcher:
                     prefetcher.restart()
                 system.person_buffers.clear()
