@@ -62,7 +62,7 @@ This will:
 1. Create a `.venv` virtual environment
 2. Install PyTorch (CUDA 12.4 for NVIDIA GPU)
 3. Install all remaining dependencies at pinned, verified versions
-4. Download the Face ID weights into `model/20180402-114759-vggface2.pt`
+4. Download the face models into `model/`: YuNet + SFace ONNX (long-range face ID) and the legacy FaceNet weights (`20180402-114759-vggface2.pt`, fallback only)
 
 > If you don't have an NVIDIA GPU, open `SETUP.bat` in Notepad first and swap the PyTorch install line (instructions are inside the file).
 
@@ -92,9 +92,9 @@ This will:
 
 The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera view with a sidebar:
 
-- **Bounding boxes** are labelled `P1`, `P2`, … — small recyclable display IDs that stay stable for the operator. The raw tracker ID is still recorded in the saved data for offline analysis.
-- **Engagement score** is shown as a coloured overlay on each person's bounding box (green = engaged, red = disengaged). The score is a **fusion of two signals**: the gaze rules (base) and the action-transformer model (rescue/override) — see the *Gaze-first engagement scoring* section below.
-- **Performers** are drawn with an **orange** box labelled `PERFORMER` and are excluded from the crowd score. The box thickens (with a `<<` marker) when the crowd's shared gaze point sits on that performer.
+- **Bounding boxes** are drawn for **registered (enrolled) people only**. The radio-selected focus person gets a **magenta** box; every other registered person is colour-coded by engagement score (red → orange → green). Bystanders are tracked internally (so they can be enrolled) but never drawn or scored. Labels show the name, score, and `f:NNpx` — the native face width in pixels from the last face-ID pass (the distance-test readout).
+- **Engagement score** is a **fusion of two signals**: the gaze rules (base) and the action-transformer model (rescue/override) — see the *Gaze-first engagement scoring* section below.
+- **Performers** are detected and used internally by the gaze engine (focal point, ray clipping) but get **no overlay box** by design.
 - **Gaze rays** — thin lines from each audience member's head toward where they are looking, projected to the crowd's shared focal point. Performers never get a ray, and rays are clipped at performer boxes.
 - The **HUD** shows the gaze engine state: `Gaze: PRE-SHOW` (no shared focal point yet — pure action-model scoring) or `Gaze: LIVE perf:N` (focal point locked, N performers detected). `SHIFT!` flags a synchronized crowd gaze shift (e.g. a door opening).
 - A small **cyan dot** in the top-right of a bounding box means that person received fresh MediaPipe extraction this frame (the rest reuse their last score). When the system is throttling under crowd load the HUD shows e.g. `MP: 1/3 rr2`.
@@ -104,7 +104,8 @@ The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera vie
   - **Calibration** — for the first ~2 s after a wearer is assigned the panel shows `calibrating Ns` while the Welford baseline reaches its minimum sample floor; no splines are drawn yet. Plotting then begins almost immediately and the baseline keeps **expanding** (converging over ~60 s, then frozen at a 60 s cap) so early z-scores refine as more samples arrive.
   - **OFF-WRIST** — when sensor contact is lost the panel dims and a faint red `OFF-WRIST` watermark appears within ~2 s. Splines gap out naturally rather than freezing on the last good value. Re-attach the device and the splines resume immediately; a sustained ≥ 2 s off-wrist gap forces a fresh baseline on re-fit (so a new wearer is never plotted against the previous wearer's mean / SD).
 - **Radio buttons** on the sidebar select which detected person to treat as the "focus target".
-- Press **`R`** to open a picklist of detected-but-unassigned EmotiBit serials; arrow keys / number keys to select, **Enter** to confirm, **Esc** to cancel.
+- Press **`R`** to enroll a face: pick an EmotiBit serial from the picklist (arrow/number keys, **Enter** to confirm). If no EmotiBits are streaming, generic `Participant-1…5` names are offered instead. Then a guided **3-pose capture** starts: face **FRONT**, press **SPACE**; turn part-way **LEFT** (~45°, both eyes still visible), **SPACE**; part-way **RIGHT**, **SPACE**. **Esc** cancels at any point. Enroll at **~1–1.5 m** from the camera.
+- Press **`C`** to clear all enrollments, **`F`** to cycle the focus target.
 - Press **`q`** or **Esc** to quit gracefully.
 
 ### CLI flags for `live_multiperson_binary_v2.py`
@@ -160,6 +161,43 @@ if action ≤ 0.25              → fused = min(fused, 0.40)  # confident anti c
 - Tracking uses the bundled **`botsort_gaze.yaml`** (long lost-track buffer, tighter match threshold) so IDs survive occlusion in crowds.
 
 All thresholds are documented in `gaze_rules.py` and were tuned on the 4th Family Lab video (dancer / sax / accordion / full-band segments).
+
+---
+
+## 🎯 Long-range face identification — the 7 m audience-distance feature (Audience_Distance)
+
+The project requires **face detection at 6–7 m**. The physics: a face is ~15 cm wide, so on a 1080p webcam with ~80° FOV a face at 7 m is only **~24 px** wide — far below what the old face stack could use. The pipeline was rebuilt around that constraint.
+
+### Models used
+
+| Stage | Model | Why |
+|-------|-------|-----|
+| Face **detection** | **YuNet** (`model/face_detection_yunet_2023mar.onnx`, OpenCV DNN) | WIDER-FACE-trained tiny-face detector; finds faces down to ~10 px and returns 5 landmarks for alignment. Replaces MTCNN (which loses faces below ~30 px). |
+| Face **recognition** | **SFace** (`model/face_recognition_sface_2021dec.onnx`, OpenCV DNN) | Embeds the landmark-aligned 112×112 crop into a 128-d vector; cosine similarity against the enrolled gallery. Replaces FaceNet/InceptionResnetV1. |
+| Fallback | MTCNN + FaceNet (facenet-pytorch) | Used automatically only if the ONNX models are missing (`SETUP.bat` step 6b downloads them). |
+
+Both new models run as plain OpenCV DNN — no new Python dependencies, ~5 ms per face on CPU. The backend lives in `face_identifier.py` (`ONNXFaceIdentifier`, selected by `create_face_identifier()`).
+
+### Changes made
+
+1. **1080p30 capture negotiation** — Logitech cams default to 640×480, and Windows backends lock their format once streaming (DSHOW additionally caps uncompressed 1080p at ~1 fps). On startup the camera is reopened via **MSMF with MJPG requested before the first read**, scanning MSMF indices (DSHOW and MSMF number devices differently) and accepting only a verified ≥1920-wide live stream at ≥10 fps. Console prints `Capture boosted … 1920x1080@~30fps` or an explicit FAILED warning. Resolution is the distance budget: a 7 m face is ~24 px at 1080p but ~10 px at 480p.
+2. **Head-crop matching with free zoom** — face ID runs on the upscaled top-third of each tracked person's box rather than the full frame (keeps neighbours out, multiplies effective resolution). At close range (<1 m the bbox fills the frame and the face sits mid-box) it automatically retries on the full person box.
+3. **Multi-angle enrollment** — the 3-pose (front/left/right) SPACE-guided capture stores 6 gallery embeddings per person: each pose plus a **simulated low-resolution copy** (face shrunk to 24 px and back), so distant blurry probes match a same-domain gallery entry. Re-enroll whenever capture resolution changes — a stale gallery halves similarity.
+4. **Distance-graded matching** — `identify_crop()` reports the native face width (`face_px`). Faces ≥ 40 px match at cosine ≥ 0.34; smaller faces must clear 0.45 (tiny faces blur-converge — measured impostor similarity 0.41 at 24 px). Far assignments additionally need 2 consistent frames.
+5. **Sticky identity** — once a track is named, a face that shrinks, turns away, or dips below threshold is treated as *no evidence*, never eviction — tracking carries the identity out to 7 m and beyond. Eviction requires 6 consecutive **strong** contradictions (a clear ≥40 px face with similarity < 0.25 — plainly a different person), and re-attach after a genuine loss takes a few seconds once the face turns camera-ward again. One live track per name (highest similarity wins).
+6. **MediaPipe at distance** — holistic's detectors fail on small distant crops (engagement collapsed to 0 beyond ~2–3 m). Person crops are now upscaled to ≥384 px height (max 4×) before landmark extraction; landmarks are crop-relative so downstream gaze/model geometry is unchanged.
+7. **Diagnostics** — every run self-documents: the app log records the capture negotiation and every identity assign / evict / unmatched event with similarity and face size; the session JSONL gains per-person `face_px`. Box labels show `f:NNpx` live.
+
+### Measured results (Logitech C930e, 1080p, kitchen tape test)
+
+- Face **detection**: solid at ~7 m, worked even at 640×480 (~10 px faces).
+- Fresh-gallery **recognition**: similarity 0.76–0.99 near, identity held unbroken through face-size dips to 88 px and a full walk-away/return; one genuine eviction (sim 0.15, face obscured) self-healed in 3.5 s.
+- **Engagement keypoints**: buffer stays full at range after the upscale fix.
+- Known remaining item: the **action model's score decays with distance/walking** (0.95 @ 0.7 m → 0.28 @ 1.8 m with a full buffer) — model bias, addressed by the planned retraining, not by this pipeline. The 10 s context window also means the score lags ~10 s after returning close.
+
+### Camera guidance for the real venue
+
+A 1080p/80° webcam yields ~24 px faces at 7 m: reliable *detection* + tracked identity, but fresh *recognition* only to ~4–5 m. For recognition at 7 m a face needs ~100 px → a **4K camera at ≤45° FOV or a PTZ with ≥5× optical zoom** (e.g. Logitech Rally / PTZ Pro 2 class). For a U-shaped audience, plan on a wide camera for the near arms plus a zoom camera for the far arm; enrollment at ~1 m + sticky tracking covers the gap in the meantime.
 
 ---
 
@@ -277,7 +315,7 @@ If data saving has to stop because the disk or memory is full, the live engageme
 | No EmotiBit devices found | Check device is powered on and on the **same Wi-Fi** network; run the .bat as Administrator (it will auto-add firewall rules) |
 | Engagement window black / no camera | Check camera index — pass `--camera 1` (or 2) as an argument to `3_START_ENGAGEMENT.bat` |
 | `No real cameras detected (… virtual cameras skipped)` even though a real webcam is attached | The camera scanner now warms the sensor up before its live-vs-virtual test, so this should be resolved. If a slow-starting camera is still mis-flagged, bypass the filter by passing `--camera 0` (or its index) directly. |
-| `FaceIdentifier init failed` | Re-run `SETUP.bat` so it installs the Face ID weights, or place `model/20180402-114759-vggface2.pt` in the project manually |
+| `FaceIdentifier init failed` | Re-run `SETUP.bat` so it downloads the face models (`model/face_detection_yunet_2023mar.onnx`, `model/face_recognition_sface_2021dec.onnx`); the legacy fallback also needs `model/20180402-114759-vggface2.pt` |
 | `Model not found` | Make sure `model/best_model.pth`, `yolo26n.pt`, `rf_valence_full_v2.pkl`, `rf_arousal_full_v2.pkl` are all present in the folder |
 | `WeightsUnpickler error: Unsupported operand …` when loading `best_model.pth` | The repo's `best_model.pth` was overwritten with a full training checkpoint instead of a slim `state_dict`. Run `git lfs pull` to refresh, or re-export it with `python scripts/utils/reexport_checkpoint.py <bundle.pth> -o models/.../best_model.pth`. **Do not** patch the code to pass `weights_only=False` — see the Model Checkpoint section in the project root `README.md`. |
 | `best_model.pth` resolves to a path outside the repo (e.g. `C:\Users\<name>\AMPLIFY\models\...`) | You're on a pre-`5590200` commit. `git pull` on `GUI_Bug_Fix` to get the path-detection fix. |
@@ -319,7 +357,7 @@ This system is **in scope** of Regulation (EU) 2024/1689 (the **AI Act**) and th
 GDPR, because it combines three heavily regulated capabilities:
 
 - **Emotion recognition** — engagement/affect inferred from face + pose video (`live_multiperson_binary_v2.py`).
-- **Biometric identification** — face matching / enrolment (`face_identifier.py`, VGGFace2 embeddings).
+- **Biometric identification** — face matching / enrolment (`face_identifier.py`, SFace embeddings; legacy VGGFace2 fallback).
 - **Physiological inference** — EmotiBit EDA/HR → valence/arousal (`multiemotibit_UDP_SD_RFv2.py`).
 
 Face embeddings and physiological readings are **special-category personal data**.

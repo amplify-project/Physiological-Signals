@@ -84,7 +84,7 @@ import signal
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
-from face_identifier import FaceIdentifier, IDENTIFIED_COLOR
+from face_identifier import create_face_identifier, head_crop, IDENTIFIED_COLOR
 
 # Shared async logger (writes to data/logs/engagement/<ts>.log).
 # In the handover folder applog.py sits beside this script.
@@ -344,6 +344,14 @@ MIN_PERSONS_PER_FRAME = 1           # Always extract at least one person per fra
 #   under the cap. Protects against pathological ID inflation in crowds.
 STALE_TRACK_TIMEOUT_FRAMES = 60      # ~2 s @ 30 fps
 MAX_TRACKED_IDS = 64                  # generous upper bound for live audiences
+
+# --- Long-range MediaPipe (Audience_Distance) ---
+# Holistic's person/face detectors fail on small distant crops (all-zero
+# keypoints -> engagement collapses to 0 beyond ~2-3m). Upscaling the crop
+# before MediaPipe restores detection; landmarks are crop-relative so
+# downstream geometry is unaffected.
+MP_MIN_CROP_H = 384                  # upscale person crops shorter than this
+MP_UPSCALE_MAX = 4.0                 # cap the blow-up of very distant crops
 
 # 360° Video Configuration
 NUM_360_VIEWS = 4                   # Number of perspective views to extract from 360° video
@@ -640,6 +648,10 @@ class EngagementLogger:
             if person.get('identified_as'):
                 record['identified_as'] = person['identified_as']
                 record['face_similarity'] = round(person.get('face_similarity', 0.0), 3)
+            
+            # Native face width in px — the distance-test ground truth
+            if person.get('face_px') is not None:
+                record['face_px'] = round(person['face_px'], 1)
             
             if self.save_engagement and not self.disk_full:
                 try:
@@ -1086,6 +1098,11 @@ class MultiPersonEngagementSystem:
             return np.zeros((543, 3)), padded_bbox
         
         person_crop = frame_rgb[y1:y2, x1:x2]
+        ch, cw = person_crop.shape[:2]
+        if ch < MP_MIN_CROP_H:
+            s = min(MP_UPSCALE_MAX, MP_MIN_CROP_H / ch)
+            person_crop = cv2.resize(person_crop, (max(1, int(cw * s)), int(ch * s)),
+                                     interpolation=cv2.INTER_CUBIC)
         results = holistic.process(person_crop)
         
         keypoints = np.zeros((543, 3))
@@ -1153,6 +1170,11 @@ class MultiPersonEngagementSystem:
             return np.zeros((543, 3)), padded_bbox
             
         person_crop = frame_rgb[y1:y2, x1:x2]
+        ch, cw = person_crop.shape[:2]
+        if ch < MP_MIN_CROP_H:
+            s = min(MP_UPSCALE_MAX, MP_MIN_CROP_H / ch)
+            person_crop = cv2.resize(person_crop, (max(1, int(cw * s)), int(ch * s)),
+                                     interpolation=cv2.INTER_CUBIC)
         
         # MediaPipe inference
         results = self.holistic.process(person_crop)
@@ -1862,7 +1884,7 @@ def main():
     face_id = None
     if not args.no_face_id:
         try:
-            face_id = FaceIdentifier(device=actual_device)
+            face_id = create_face_identifier(actual_device)
         except Exception as e:
             print(f"⚠️  FaceIdentifier init failed: {e}  — running without face ID")
             face_id = None
@@ -1875,10 +1897,36 @@ def main():
     reconnect_flash_until = 0.0
     reconnect_flash_msg = ''
     
-    # Face ID throttle: run MTCNN matching every N frames, carry forward results
+    # Face ID throttle: run face matching every N frames, carry forward results
     FACE_ID_INTERVAL = 10  # frames between face matching runs
     face_id_counter = 0
-    face_id_cache = {}  # {track_id: {'name': str, 'similarity': float}}
+    face_id_cache = {}  # {track_id: {'name': str, 'similarity': float, 'miss': int}}
+
+    # --- Long-range identity policy (Audience_Distance) ---
+    # Recognition SNR collapses with face size, so trust is distance-gated:
+    # FACE_MIN_MATCH_PX: below this native face width embeddings are noise —
+    #   never assign or evict identity, just coast on the sticky cache.
+    # FACE_TRUST_PX: at/above this width a single frame is trustworthy
+    #   (assign after 1 vote, contradictions count toward eviction);
+    #   between MIN and TRUST require FACE_VOTES_FAR consistent frames.
+    # FACE_EVICT_MISSES: consecutive *strong* contradictions (clear face,
+    #   similarity below FACE_MISS_SIM — i.e. plainly a different person)
+    #   before a cached identity is dropped. Sub-threshold-but-close sims
+    #   (turned head, looking down) are uncertainty, not contradiction, and
+    #   never evict; nor does a face that shrinks or disappears — that is
+    #   exactly the 7m case where tracking must carry the identity.
+    FACE_MIN_MATCH_PX = 16
+    FACE_TRUST_PX = 40
+    FACE_VOTES_FAR = 2
+    FACE_EVICT_MISSES = 6
+    FACE_MISS_SIM = 0.25
+    face_id_pending = {}  # {track_id: {'name': str, 'count': int}}
+
+    # 3-pose enrollment session (guided FRONT/LEFT/RIGHT captures at ~1m).
+    # Each pose is captured MANUALLY with SPACE so the subject has time to
+    # turn their head; Esc cancels. None when idle.
+    enroll_session = None
+    ENROLL_POSES = ['front', 'left', 'right']
     
     # Focus mode: which identified person(s) get magenta highlight
     # Values: 'all' | 'none' | '<emotibit serial>'
@@ -2093,6 +2141,76 @@ def main():
         # Non-Windows: default backend
         return cv2.VideoCapture(index)
 
+    def _ensure_high_res_capture(cap, index, target_w=1920, target_h=1080):
+        """Renegotiate the live camera to 1080p30.
+
+        A 7m face is ~24px at 1080p and ~10px at 480p — capture resolution is
+        the distance budget. Windows needs a clean reopen with MJPG requested
+        BEFORE the first read: both DSHOW and MSMF lock their format once
+        streaming, and uncompressed YUY2 at 1080p is USB-capped to ~1-5fps.
+        Right after the camera-selector previews release the device the driver
+        can refuse the mode, so each backend gets a settle-and-retry.
+        360° (equirect) cameras keep their native mode."""
+        ret, probe = cap.read()
+        if not ret or probe is None:
+            return cap
+        h, w = probe.shape[:2]
+        if 1.9 <= w / h <= 2.1:
+            return cap  # 360° camera — leave the native equirect stream alone
+
+        def _measure_fps(c, secs=0.7):
+            t0 = time.time()
+            n = 0
+            while time.time() - t0 < secs:
+                n += 1 if c.read()[0] else 0
+            return n / secs
+
+        cur_fps = _measure_fps(cap)
+        if w >= target_w and cur_fps >= 15:
+            print(f"📷 Capture: {w}x{h} @ ~{cur_fps:.0f}fps (native)")
+            log.info(f"capture: {w}x{h} @ {cur_fps:.1f}fps native")
+            return cap
+
+        if platform.system() == 'Windows':
+            cap.release()
+            # DSHOW and MSMF enumerate devices differently (the C930e is
+            # DSHOW index 4 but MSMF index 0 on this rig), so scan MSMF
+            # indices rather than trusting the DSHOW index. Wrong-device
+            # grabs are rejected: virtual cams can't deliver 1920 wide and
+            # black/static streams fail the content check.
+            msmf_candidates = [index] + [i for i in range(6) if i != index]
+            for midx in msmf_candidates:
+                new = cv2.VideoCapture(midx, cv2.CAP_MSMF)
+                if not new.isOpened():
+                    new.release()
+                    continue
+                new.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                new.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
+                new.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+                new.set(cv2.CAP_PROP_FPS, 30)
+                ret2, probe2 = new.read()
+                if ret2 and probe2 is not None and probe2.shape[1] >= target_w:
+                    if np.mean(probe2) > 5 and np.std(probe2) > 10:
+                        new_fps = _measure_fps(new)
+                        if new_fps >= 10:
+                            nh, nw = probe2.shape[:2]
+                            print(f"📷 Capture boosted: {w}x{h}@~{cur_fps:.0f}fps → "
+                                  f"{nw}x{nh}@~{new_fps:.0f}fps (MSMF idx {midx}, MJPG)")
+                            log.info(f"capture: boosted {w}x{h}@{cur_fps:.1f} -> "
+                                     f"{nw}x{nh}@{new_fps:.1f} via MSMF idx {midx}")
+                            return new
+                new.release()
+            print(f"⚠️  1080p30 renegotiation FAILED — reverting to default camera mode. "
+                  f"Face range will be reduced (~2.4x).")
+            log.warning(f"capture: 1080p renegotiation failed, default mode kept (was {w}x{h})")
+            return _open_camera(index)
+
+        # Non-Windows: in-place request is honoured by V4L2/AVFoundation
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+        return cap
+
     def select_camera_interactively(detected_cameras, default_camera, force=False):
         """
         Show a live tiled preview of all detected cameras and let the user
@@ -2214,6 +2332,7 @@ def main():
             print(f"❌ Error: Could not open video file {args.video}")
             return
         video_source_name = args.video
+        _cam_index = None
         print(f"📁 Opened video file: {args.video}")
     elif args.camera is not None:
         # Manual camera index specified - skip auto-detection
@@ -2221,6 +2340,7 @@ def main():
         if not cap.isOpened():
             print(f"❌ Error: Could not open camera {args.camera}")
             return
+        _cam_index = args.camera
         print(f"📷 Using camera index {args.camera} (manual)")
     else:
         # Auto-detect cameras (cross-platform compatible)
@@ -2371,11 +2491,14 @@ def main():
         if not cap.isOpened():
             print(f"❌ Error: Could not open camera {selected['index']}")
             return
+        _cam_index = selected['index']
         video_source_name = f"Camera {selected['index']}"
 
     # =========================================================================
     # VIDEO FORMAT DETECTION (2D vs 360°)
     # =========================================================================
+    if not args.video and _cam_index is not None:
+        cap = _ensure_high_res_capture(cap, _cam_index)
     ret, first_frame = cap.read()
     if not ret:
         print("❌ Error: Could not read first frame")
@@ -2653,7 +2776,10 @@ def main():
         
         # =================================================================
         # FACE IDENTIFICATION — match tracked people against enrolled faces
-        # Throttled: run MTCNN every FACE_ID_INTERVAL frames, cache results
+        # Long-range policy: detect inside the upscaled HEAD crop of each
+        # person box (free zoom), gate trust by native face size, and keep
+        # identity sticky — a face that shrinks below matchable size at 7m
+        # coasts on the track instead of being evicted.
         # =================================================================
         if face_id and face_id.has_enrollments and not is_360:
             face_id_counter += 1
@@ -2662,23 +2788,125 @@ def main():
             for person in people_data:
                 tid = person['id']
                 if run_face_id:
-                    x1, y1, x2, y2 = person['bbox']
-                    fh, fw = frame.shape[:2]
-                    cx1, cy1 = max(0, x1), max(0, y1)
-                    cx2, cy2 = min(fw, x2), min(fh, y2)
-                    if cx2 > cx1 and cy2 > cy1:
-                        person_crop = frame[cy1:cy2, cx1:cx2]
-                        match = face_id.identify_crop(person_crop)
-                        if match:
-                            face_id_cache[tid] = match
-                        else:
-                            face_id_cache.pop(tid, None)
+                    hc = head_crop(frame, person['bbox'])
+                    res = face_id.identify_crop(hc) if hc is not None else None
+                    if res is None:
+                        # Close-range framing: when the person bbox clamps to
+                        # the frame edges the face sits mid-bbox, outside the
+                        # top-fraction head crop — retry on the full box
+                        x1, y1, x2, y2 = person['bbox']
+                        fh, fw = frame.shape[:2]
+                        cx1, cy1 = max(0, x1), max(0, y1)
+                        cx2, cy2 = min(fw, x2), min(fh, y2)
+                        if cx2 > cx1 and cy2 > cy1:
+                            res = face_id.identify_crop(frame[cy1:cy2, cx1:cx2])
+                    cached = face_id_cache.get(tid)
+                    if isinstance(res, dict):
+                        face_px = res.get('face_px')
+                        if face_px is not None:
+                            person['face_px'] = face_px
+                        name = res.get('name')
+                        trusted = face_px is not None and face_px >= FACE_TRUST_PX
+                        matchable = face_px is None or face_px >= FACE_MIN_MATCH_PX
+                        if name and matchable:
+                            if cached and cached['name'] == name:
+                                cached['similarity'] = res['similarity']
+                                cached['miss'] = 0
+                                face_id_pending.pop(tid, None)
+                            else:
+                                # New/changed identity: near faces assign on one
+                                # vote, far faces need FACE_VOTES_FAR in a row
+                                need = 1 if trusted else FACE_VOTES_FAR
+                                pend = face_id_pending.get(tid)
+                                if pend and pend['name'] == name:
+                                    pend['count'] += 1
+                                else:
+                                    pend = {'name': name, 'count': 1}
+                                    face_id_pending[tid] = pend
+                                if pend['count'] >= need:
+                                    face_id_cache[tid] = {'name': name,
+                                                          'similarity': res['similarity'],
+                                                          'miss': 0}
+                                    face_id_pending.pop(tid, None)
+                                    log.info(f"face-id: track {tid} = {name} "
+                                             f"(sim={res['similarity']:.3f}, face={face_px:.0f}px)")
+                        elif cached and trusted and res['similarity'] < FACE_MISS_SIM:
+                            # A clear, close face that is plainly someone else —
+                            # only these strong contradictions count toward eviction
+                            cached['miss'] = cached.get('miss', 0) + 1
+                            if cached['miss'] >= FACE_EVICT_MISSES:
+                                log.info(f"face-id: track {tid} evicted "
+                                         f"(was {cached['name']}, {cached['miss']} misses, "
+                                         f"sim={res['similarity']:.3f})")
+                                face_id_cache.pop(tid, None)
+                                face_id_pending.pop(tid, None)
+                        elif name is None and trusted and not cached:
+                            # Unenrolled-looking near face: log occasionally so
+                            # threshold problems are visible in the run log
+                            if (face_id_counter // FACE_ID_INTERVAL) % 10 == 0:
+                                log.info(f"face-id: track {tid} unmatched "
+                                         f"(best sim={res['similarity']:.3f}, face={face_px:.0f}px)")
+                        # else: tiny/uncertain face — sticky, no penalty
+                    elif res is not None:
+                        # Legacy MTCNN backend: plain match dict or None
+                        face_id_cache[tid] = {'name': res['name'],
+                                              'similarity': res['similarity'],
+                                              'miss': 0}
+                    # res None = no face visible (turned away / below detector
+                    # floor): identity coasts on the track, never evicted here
                 
                 # Apply cached result
                 cached = face_id_cache.get(tid)
                 if cached:
                     person['identified_as'] = cached['name']
                     person['face_similarity'] = cached['similarity']
+
+            # One live track per name: duplicate claims keep the highest
+            # similarity (prevents a far false-positive stealing a serial)
+            if run_face_id:
+                live_tids = {p['id'] for p in people_data}
+                by_name = {}
+                for tid, entry in face_id_cache.items():
+                    if tid in live_tids:
+                        by_name.setdefault(entry['name'], []).append((tid, entry))
+                for name, claims in by_name.items():
+                    if len(claims) > 1:
+                        claims.sort(key=lambda te: te[1]['similarity'], reverse=True)
+                        for tid, _ in claims[1:]:
+                            face_id_cache.pop(tid, None)
+                            for person in people_data:
+                                if person['id'] == tid:
+                                    person.pop('identified_as', None)
+                                    person.pop('face_similarity', None)
+
+        # =================================================================
+        # 3-POSE ENROLLMENT SESSION — guided FRONT/LEFT/RIGHT captures
+        # (multi-angle gallery is what preserves recognition when heads
+        # turn at distance; enroll at ~1m, SPACE captures each pose)
+        # =================================================================
+        if enroll_session and face_id and not is_360:
+            es = enroll_session
+            target = next((p for p in people_data if p['id'] == es['tid']), None)
+            if target is None and people_data:
+                target = max(people_data,
+                             key=lambda p: (p['bbox'][2]-p['bbox'][0]) * (p['bbox'][3]-p['bbox'][1]))
+                es['tid'] = target['id']
+            es['target_bbox'] = target['bbox'] if target is not None else None
+            pose = ENROLL_POSES[es['idx']]
+            if target is None:
+                banner = f"Enroll {es['serial']}: step into frame  (Esc=cancel)"
+            else:
+                banner = (f"Enroll {es['serial']} - face {pose.upper()} and press SPACE "
+                          f"({es['idx']+1}/3, Esc=cancel)")
+            (btw, _bth), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            bx = max(10, (display_frame.shape[1] - btw) // 2)
+            cv2.putText(display_frame, banner, (bx, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+            cv2.putText(display_frame, banner, (bx, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, IDENTIFIED_COLOR, 2)
+            if target is not None:
+                tx1, ty1, tx2, ty2 = target['bbox']
+                cv2.rectangle(display_frame, (tx1, ty1), (tx2, ty2), IDENTIFIED_COLOR, 2)
 
         # Crowd engagement counts only registered (enrolled) attendees — the
         # EmotiBit-wearing parents. Registered-only stays on whenever face ID is
@@ -2693,6 +2921,7 @@ def main():
             # has_enrollments is true and so can never evict the cache entry.
             if not face_id.has_enrollments and face_id_cache:
                 face_id_cache.clear()
+                face_id_pending.clear()
             system.registered_only = True
             system.registered_ids = {int(tid) for tid in face_id_cache}
         else:
@@ -2717,17 +2946,10 @@ def main():
                 pid = person['id']
                 bf = person.get('buffer_fill', 1.0)
                 identified = person.get('identified_as')
-                # Performers: orange box, never scored, drawn even when
-                # registered-only hides bystanders (the operator must see who
-                # the crowd is being scored against).
+                # Performers are tracked internally for gaze rules (focal
+                # point, ray clipping) but get NO overlay by design — only
+                # registered audience members are drawn.
                 if person.get('performer'):
-                    thick = 4 if person.get('gazed_performer') else 2
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), COL_PERFORMER, thick)
-                    perf_label = f"{system.display_label(pid)} PERFORMER"
-                    if person.get('gazed_performer'):
-                        perf_label += " <<"
-                    cv2.putText(display_frame, perf_label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_PERFORMER, 2)
                     continue
                 # Registered-only: don't draw bystanders. Only enrolled parents
                 # are tracked, scored and shown; everyone else is ignored.
@@ -2745,6 +2967,11 @@ def main():
                 g_reason = person.get('gaze_reason', '')
                 gaze_tag = f" [{g_reason}]" if g_reason in ('shift', 'off-focal') else ""
                 
+                # Native face width (px) from the last face-ID pass — the
+                # measuring-tape debug readout for the 7m distance work
+                _fpx = person.get('face_px')
+                face_tag = f" f{_fpx:.0f}px" if _fpx else ""
+                
                 # Determine if this person should be highlighted
                 # Magenta box only when a specific EmotiBit is selected for this person
                 show_highlight = (
@@ -2756,7 +2983,7 @@ def main():
                     # Magenta box + name for focused participant
                     color = IDENTIFIED_COLOR
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 3)
-                    name_label = f"{identified} {score:.0%}{gaze_tag}"
+                    name_label = f"{identified} {score:.0%}{gaze_tag}{face_tag}"
                     cv2.putText(display_frame, name_label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 else:
@@ -2768,7 +2995,7 @@ def main():
                     # YOLO track id which inflates rapidly in dense crowds.
                     id_str = identified if identified else system.display_label(pid)
                     if bf < 0.9:
-                        label = f"{id_str} {score:.0%}{gaze_tag} conf:{bf:.0%}"
+                        label = f"{id_str} {score:.0%}{gaze_tag}{face_tag} conf:{bf:.0%}"
                         cv2.putText(display_frame, label, (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         # Confidence fill bar under bounding box
@@ -2778,7 +3005,7 @@ def main():
                         cv2.rectangle(display_frame, (x1, bar_y_top), (x2, bar_y_bot), (50, 50, 50), -1)
                         cv2.rectangle(display_frame, (x1, bar_y_top), (x1 + int(bar_w_px * bf), bar_y_bot), (255, 200, 0), -1)
                     else:
-                        cv2.putText(display_frame, f"{id_str} {score:.0%}{gaze_tag}", (x1, y1 - 10),
+                        cv2.putText(display_frame, f"{id_str} {score:.0%}{gaze_tag}{face_tag}", (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 # Fresh-MP marker: small filled dot top-right of bbox when this
                 # person was MediaPipe-refreshed this frame. Visualises the
@@ -2942,13 +3169,16 @@ def main():
 
             chosen_serial = None
             if not available:
-                # No EmotiBits detected yet — fall back to a no-op flash
                 if detected_serials:
+                    # All real EmotiBits assigned — nothing to offer
                     registration_flash_msg = "All detected EmotiBits already assigned"
+                    registration_flash_until = time.time() + 2.5
                 else:
-                    registration_flash_msg = "No EmotiBit detected — start physio publisher"
-                registration_flash_until = time.time() + 2.5
-            else:
+                    # No EmotiBits running (e.g. distance testing without
+                    # physio) — offer generic names so face ID still works
+                    available = [n for n in (f"Participant-{i}" for i in range(1, 6))
+                                 if n not in already_enrolled]
+            if available:
                 sel_idx = 0
                 input_cancelled = False
                 while True:
@@ -3011,19 +3241,10 @@ def main():
                     candidates = unidentified if unidentified else people_data
                     best = max(candidates,
                                key=lambda p: (p['bbox'][2]-p['bbox'][0]) * (p['bbox'][3]-p['bbox'][1]))
-                    x1, y1, x2, y2 = best['bbox']
-                    fh, fw = frame.shape[:2]
-                    cx1, cy1 = max(0, x1), max(0, y1)
-                    cx2, cy2 = min(fw, x2), min(fh, y2)
-                    if cx2 > cx1 and cy2 > cy1:
-                        crop = frame[cy1:cy2, cx1:cx2]
-                        ok = face_id.register_from_crop(crop, name=chosen_serial)
-                        if ok:
-                            face_id_cache[best['id']] = {'name': chosen_serial, 'similarity': 1.0}
-                            registration_flash_msg = f"Enrolled: {chosen_serial}  (ID:{best['id']})"
-                        else:
-                            registration_flash_msg = "Registration FAILED — no face detected"
-                        registration_flash_until = time.time() + 2.0
+                    # Kick off the guided 3-pose capture; SPACE captures each
+                    # pose in the main loop (subject stays ~1m away)
+                    enroll_session = {'serial': chosen_serial, 'tid': best['id'],
+                                      'idx': 0, 'target_bbox': None}
                 else:
                     registration_flash_msg = "No person tracked — step into frame"
                     registration_flash_until = time.time() + 2.0
@@ -3050,9 +3271,56 @@ def main():
         elif key == ord('c') and face_id:
             face_id.clear_enrollments()
             face_id_cache.clear()   # drop stale track→name matches immediately
+            face_id_pending.clear()
+            enroll_session = None
             focus_target = 'all'
             registration_flash_msg = "All enrollments cleared"
             registration_flash_until = time.time() + 2.0
+        
+        # Esc = cancel an in-progress enrollment session
+        elif key == 27 and enroll_session:
+            enroll_session = None
+            registration_flash_msg = "Enrollment cancelled"
+            registration_flash_until = time.time() + 1.5
+        
+        # SPACE = capture current enrollment pose
+        elif key == 32 and enroll_session and face_id and not is_360:
+            es = enroll_session
+            bbox = es.get('target_bbox')
+            if bbox is None:
+                registration_flash_msg = "No person tracked — step into frame"
+                registration_flash_until = time.time() + 1.5
+            else:
+                pose = ENROLL_POSES[es['idx']]
+                hc = head_crop(frame, bbox)
+                ok = False
+                for crop in (hc,
+                             frame[max(0, bbox[1]):min(frame.shape[0], bbox[3]),
+                                   max(0, bbox[0]):min(frame.shape[1], bbox[2])]):
+                    if crop is None or crop.size == 0:
+                        continue
+                    try:
+                        ok = face_id.register_from_crop(crop, name=es['serial'], angle=pose)
+                    except TypeError:
+                        ok = face_id.register_from_crop(crop, name=es['serial'])  # legacy backend
+                    if ok:
+                        break
+                if ok:
+                    es['idx'] += 1
+                    if es['idx'] >= len(ENROLL_POSES):
+                        face_id_cache[es['tid']] = {'name': es['serial'],
+                                                    'similarity': 1.0, 'miss': 0}
+                        face_id_pending.pop(es['tid'], None)
+                        registration_flash_msg = f"Enrolled: {es['serial']} (3 poses, ID:{es['tid']})"
+                        registration_flash_until = time.time() + 2.5
+                        log.info(f"face-id: enrolled {es['serial']} (3 poses, track {es['tid']})")
+                        enroll_session = None
+                    else:
+                        registration_flash_msg = f"Captured {pose.upper()} — now face {ENROLL_POSES[es['idx']].upper()}"
+                        registration_flash_until = time.time() + 1.5
+                else:
+                    registration_flash_msg = f"No face detected ({pose}) — try again"
+                    registration_flash_until = time.time() + 1.5
     
     # =========================================================================
     # CLEANUP

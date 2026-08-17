@@ -108,6 +108,29 @@ if exist model\20180402-114759-vggface2.pt (
 )
 
 echo.
+echo [6b/6] Ensuring long-range face models (YuNet + SFace) are available...
+if exist model\face_detection_yunet_2023mar.onnx (
+    echo       YuNet detector already present.
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri 'https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx' -OutFile 'model\\face_detection_yunet_2023mar.onnx' } catch { Write-Error $_; exit 1 }"
+    if errorlevel 1 (
+        echo WARNING: Could not download YuNet. Long-range face ID will fall
+        echo          back to MTCNN. Manual URL:
+        echo   https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+    )
+)
+if exist model\face_recognition_sface_2021dec.onnx (
+    echo       SFace recognizer already present.
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri 'https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx' -OutFile 'model\\face_recognition_sface_2021dec.onnx' } catch { Write-Error $_; exit 1 }"
+    if errorlevel 1 (
+        echo WARNING: Could not download SFace. Long-range face ID will fall
+        echo          back to MTCNN. Manual URL:
+        echo   https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+    )
+)
+
+echo.
 echo ============================================================
 echo  Verifying key package versions...
 echo ============================================================

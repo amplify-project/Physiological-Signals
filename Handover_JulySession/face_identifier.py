@@ -319,3 +319,258 @@ class FaceIdentifier:
     @property
     def enrolled_names(self):
         return [e['name'] for e in self.enrolled]
+
+
+# =============================================================================
+# LONG-RANGE ONNX BACKEND — YuNet detector + SFace recognizer (pure OpenCV)
+# =============================================================================
+# MTCNN loses faces below ~30px, which caps recognition range around 2-3m on a
+# 1080p webcam. YuNet (WIDER-FACE-trained) detects down to ~12px and returns
+# 5 landmarks for alignment; SFace embeds the aligned 112x112 crop. Both run
+# as OpenCV DNN ONNX models — no new dependencies, CPU-cheap (~5ms/face).
+
+YUNET_FILENAME = 'face_detection_yunet_2023mar.onnx'
+SFACE_FILENAME = 'face_recognition_sface_2021dec.onnx'
+FACE_MODEL_DIR = Path(__file__).parent.resolve() / 'model'
+
+# Official SFace cosine threshold is 0.363; slightly relaxed for large faces
+# because the live pipeline adds multi-frame voting on top. Small faces carry
+# less identity information and blur-converge (measured impostor sim 0.41 at
+# 24px vs 0.30 at 60px), so below SFACE_FAR_PX the bar is raised.
+SFACE_MATCH_THRESHOLD = 0.34
+SFACE_FAR_THRESHOLD = 0.45
+SFACE_FAR_PX = 40
+
+DETECT_MIN_SIDE = 320    # upscale small head crops so YuNet has enough pixels
+DETECT_MAX_SCALE = 4.0
+LOWRES_SIM_WIDTH = 24    # enrollment augmentation: simulate a ~7m face
+
+
+def head_crop(frame, bbox, top_frac=0.32, width_frac=0.76):
+    """Head region of a person bbox (top ~third, centre-weighted width).
+
+    Detecting inside an upscaled head crop instead of the full frame is an
+    effective free zoom at distance, and keeps neighbours' faces out."""
+    x1, y1, x2, y2 = bbox
+    h, w = frame.shape[:2]
+    bw, bh = x2 - x1, y2 - y1
+    if bw <= 0 or bh <= 0:
+        return None
+    cx = (x1 + x2) / 2.0
+    half_w = bw * width_frac / 2.0
+    nx1 = int(max(0, cx - half_w))
+    nx2 = int(min(w, cx + half_w))
+    ny1 = int(max(0, y1 - 0.05 * bh))
+    ny2 = int(min(h, y1 + top_frac * bh))
+    if nx2 - nx1 < 8 or ny2 - ny1 < 8:
+        return None
+    return frame[ny1:ny2, nx1:nx2]
+
+
+class ONNXFaceIdentifier:
+    """Long-range drop-in replacement for FaceIdentifier.
+
+    Differences that matter at distance:
+      - tiny-face detection (YuNet) with automatic crop upscaling
+      - multi-angle enrollment: several embeddings per name (front/left/right),
+        each also stored as a simulated low-resolution variant so gallery and
+        7m probe live in the same blur domain; match = max cosine over all
+      - identify_crop() reports the *native* face width in pixels so the
+        caller can gate trust by distance
+    """
+
+    def __init__(self, device='cpu'):
+        yunet_path = FACE_MODEL_DIR / YUNET_FILENAME
+        sface_path = FACE_MODEL_DIR / SFACE_FILENAME
+        missing = [p.name for p in (yunet_path, sface_path) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing ONNX face models in '{FACE_MODEL_DIR}': {', '.join(missing)} "
+                f"(rerun SETUP.bat to download)")
+        if not hasattr(cv2, 'FaceDetectorYN'):
+            raise RuntimeError("OpenCV build lacks FaceDetectorYN (need >= 4.5.4)")
+
+        self.detector = cv2.FaceDetectorYN.create(
+            str(yunet_path), "", (320, 320),
+            score_threshold=0.6, nms_threshold=0.3, top_k=50)
+        self.recognizer = cv2.FaceRecognizerSF.create(str(sface_path), "")
+        self.device = 'cpu/opencv-dnn'
+
+        # [{'name': str, 'angle': str, 'embedding': np.ndarray (128,) L2-normed}]
+        self.enrolled = []
+        self._load_enrollments()
+        print(f"ONNXFaceIdentifier ready (YuNet+SFace, "
+              f"{len(self.enrolled_names)} people / {len(self.enrolled)} embeddings)")
+
+    # -----------------------------------------------------------------
+    # Detection / embedding internals
+    # -----------------------------------------------------------------
+    def _detect_best(self, bgr):
+        """Largest face in (possibly upscaled) crop.
+
+        Returns (face_row, scale, img_used) — face_row is None if no face.
+        face_row format: [x, y, w, h, 5x(lm_x, lm_y), score] in img_used coords.
+        """
+        h, w = bgr.shape[:2]
+        if h < 12 or w < 12:
+            return None, 1.0, bgr
+        scale = 1.0
+        short = min(h, w)
+        if short < DETECT_MIN_SIDE:
+            scale = min(DETECT_MAX_SCALE, DETECT_MIN_SIDE / short)
+        if scale != 1.0:
+            img = cv2.resize(bgr, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_CUBIC)
+        else:
+            img = bgr
+        self.detector.setInputSize((img.shape[1], img.shape[0]))
+        try:
+            _, faces = self.detector.detect(img)
+        except cv2.error:
+            return None, scale, img
+        if faces is None or len(faces) == 0:
+            return None, scale, img
+        best = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+        return best, scale, img
+
+    def _embed_aligned(self, aligned_bgr):
+        feat = self.recognizer.feature(aligned_bgr).flatten().astype(np.float32)
+        n = np.linalg.norm(feat)
+        return feat / n if n > 0 else feat
+
+    def _embed(self, img, face_row):
+        aligned = self.recognizer.alignCrop(img, face_row)
+        return self._embed_aligned(aligned), aligned
+
+    # -----------------------------------------------------------------
+    # Registration
+    # -----------------------------------------------------------------
+    def register_from_crop(self, bgr_crop, name='Participant 1', angle='front'):
+        """Register one pose. Stores the embedding plus a low-res-degraded
+        variant (gallery then matches distant, blurry probes far better)."""
+        face, scale, img = self._detect_best(bgr_crop)
+        if face is None:
+            print(f"ERROR: No face detected in crop - registration failed ({name}/{angle})")
+            return False
+
+        emb, aligned = self._embed(img, face)
+        small = cv2.resize(aligned, (LOWRES_SIM_WIDTH, LOWRES_SIM_WIDTH),
+                           interpolation=cv2.INTER_AREA)
+        degraded = cv2.resize(small, (aligned.shape[1], aligned.shape[0]),
+                              interpolation=cv2.INTER_CUBIC)
+        emb_lr = self._embed_aligned(degraded)
+
+        for ang, e in ((angle, emb), (f"{angle}-lowres", emb_lr)):
+            entry = next((x for x in self.enrolled
+                          if x['name'] == name and x['angle'] == ang), None)
+            if entry is not None:
+                entry['embedding'] = e
+            else:
+                self.enrolled.append({'name': name, 'angle': ang, 'embedding': e})
+
+        self._save_enrollments()
+        print(f"Enrolled '{name}' pose={angle} (score={float(face[-1]):.3f}, "
+              f"{len(self.enrolled)} embeddings total)")
+        return True
+
+    # -----------------------------------------------------------------
+    # Identification
+    # -----------------------------------------------------------------
+    def identify_crop(self, bgr_crop):
+        """Identify the largest face in a (head) crop.
+
+        Returns:
+            None                        — no face detected at all
+            {'name': None, 'similarity', 'face_px'}   — face seen, nobody matched
+            {'name': str,  'similarity', 'face_px'}   — matched
+        face_px = face width in NATIVE (pre-upscale) pixels: the caller's
+        distance/trust gate.
+        """
+        face, scale, img = self._detect_best(bgr_crop)
+        if face is None:
+            return None
+        face_px = float(face[2]) / scale
+        if not self.enrolled:
+            return {'name': None, 'similarity': 0.0, 'face_px': face_px}
+
+        emb, _ = self._embed(img, face)
+        best_name, best_sim = None, -1.0
+        for entry in self.enrolled:
+            sim = float(np.dot(emb, entry['embedding']))
+            if sim > best_sim:
+                best_sim = sim
+                best_name = entry['name']
+
+        threshold = SFACE_MATCH_THRESHOLD if face_px >= SFACE_FAR_PX else SFACE_FAR_THRESHOLD
+        if best_sim >= threshold:
+            return {'name': best_name, 'similarity': best_sim, 'face_px': face_px}
+        return {'name': None, 'similarity': best_sim, 'face_px': face_px}
+
+    def detect_faces_in_frame(self, frame_rgb):
+        """All face boxes in a full frame (RGB in, to match old API)."""
+        bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        self.detector.setInputSize((bgr.shape[1], bgr.shape[0]))
+        try:
+            _, faces = self.detector.detect(bgr)
+        except cv2.error:
+            return []
+        if faces is None:
+            return []
+        return [(int(f[0]), int(f[1]), int(f[0] + f[2]), int(f[1] + f[3]))
+                for f in faces]
+
+    # -----------------------------------------------------------------
+    # Persistence
+    # -----------------------------------------------------------------
+    _SAVE_PATH = ENROLLMENTS_DIR / 'enrollments_sface.npz'
+
+    def _save_enrollments(self):
+        ENROLLMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        if not self.enrolled:
+            if self._SAVE_PATH.exists():
+                self._SAVE_PATH.unlink()
+            return
+        np.savez(self._SAVE_PATH,
+                 names=np.array([e['name'] for e in self.enrolled]),
+                 angles=np.array([e['angle'] for e in self.enrolled]),
+                 embeddings=np.stack([e['embedding'] for e in self.enrolled]))
+
+    def _load_enrollments(self):
+        if not self._SAVE_PATH.exists():
+            return
+        try:
+            data = np.load(self._SAVE_PATH)
+            self.enrolled = [
+                {'name': str(n), 'angle': str(a), 'embedding': e.astype(np.float32)}
+                for n, a, e in zip(data['names'], data['angles'], data['embeddings'])
+            ]
+        except Exception as e:
+            print(f"WARNING: Could not load SFace enrollments: {e}")
+            self.enrolled = []
+
+    def clear_enrollments(self):
+        self.enrolled = []
+        if self._SAVE_PATH.exists():
+            self._SAVE_PATH.unlink()
+        print("All enrollments cleared")
+
+    @property
+    def has_enrollments(self):
+        return len(self.enrolled) > 0
+
+    @property
+    def enrolled_names(self):
+        seen = []
+        for e in self.enrolled:
+            if e['name'] not in seen:
+                seen.append(e['name'])
+        return seen
+
+
+def create_face_identifier(device='auto'):
+    """Prefer the long-range YuNet+SFace backend; fall back to MTCNN/FaceNet."""
+    try:
+        return ONNXFaceIdentifier(device)
+    except Exception as e:
+        print(f"WARNING: ONNX face backend unavailable ({e}) — falling back to MTCNN/FaceNet")
+        return FaceIdentifier(device=device)
