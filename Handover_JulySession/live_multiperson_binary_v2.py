@@ -1829,6 +1829,10 @@ def main():
     parser.add_argument('--start-time', type=str, default=None,
                         help='Seek video files to this position before processing '
                              '(SS, MM:SS or HH:MM:SS). Ignored for live cameras.')
+    parser.add_argument('--max-people', type=int, default=None,
+                        help='Simulate a fixed sensor budget: the first N tracked people '
+                             'become the registered set for the whole session; everyone '
+                             'else is an unscored bystander. (Concert: 8 EmotiBits.)')
     parser.add_argument('--redis-host', type=str, default=DEFAULT_REDIS_HOST,
                         help=f'Redis server host/IP address (default: {DEFAULT_REDIS_HOST})')
     parser.add_argument('--redis-port', type=int, default=DEFAULT_REDIS_PORT,
@@ -1927,6 +1931,7 @@ def main():
     FACE_EVICT_MISSES = 6
     FACE_MISS_SIM = 0.25
     face_id_pending = {}  # {track_id: {'name': str, 'count': int}}
+    sensor_sim_ids = set()  # --max-people: sticky first-N 'registered' track ids
 
     # 3-pose enrollment session (guided FRONT/LEFT/RIGHT captures at ~1m).
     # Each pose is captured MANUALLY with SPACE so the subject has time to
@@ -2960,6 +2965,16 @@ def main():
                 face_id_pending.clear()
             system.registered_only = True
             system.registered_ids = {int(tid) for tid in face_id_cache}
+        elif args.max_people and not is_360:
+            # Sensor-budget simulation: first N tracks seen become the sticky
+            # registered set (a lost track's slot is not recycled — exactly
+            # like a wristband wearer leaving the room)
+            for p in people_data:
+                if len(sensor_sim_ids) >= args.max_people:
+                    break
+                sensor_sim_ids.add(int(p['id']))
+            system.registered_only = True
+            system.registered_ids = sensor_sim_ids
         else:
             system.registered_only = False
             system.registered_ids = set()
@@ -2988,8 +3003,9 @@ def main():
                 if person.get('performer'):
                     continue
                 # Registered-only: don't draw bystanders. Only enrolled parents
-                # are tracked, scored and shown; everyone else is ignored.
-                if system.registered_only and not identified:
+                # (or --max-people simulated registrations) are tracked, scored
+                # and shown; everyone else is ignored.
+                if system.registered_only and not identified and int(pid) not in system.registered_ids:
                     continue
                 # Fresh-MP marker: this person got a MediaPipe pass this frame
                 # (vs reusing cached score). Helps visualise the round-robin
