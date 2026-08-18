@@ -620,9 +620,13 @@ class EngagementLogger:
         if frame_size is not None and self._kp_frame_size is None:
             self._kp_frame_size = frame_size
         
+        # None crowd_average (nobody scorable) is logged as JSON null, not 0.0
+        crowd_val = round(crowd_average, 4) if crowd_average is not None else None
+
         # Log each person in this frame
         for person in people_data:
             track_id = int(person['id'])
+            scored = bool(person.get('scored'))
             score = float(person['score'])
             bbox = [int(c) for c in person['bbox']]
             buffer_fill = person.get('buffer_fill', 0.0)
@@ -631,13 +635,18 @@ class EngagementLogger:
                 'timestamp': timestamp,
                 'frame': self.frame_number,
                 'track_id': track_id,
-                'engagement_score': round(score, 4),
+                # null (not 0.0) for people we couldn't score, so unknowns don't
+                # pollute downstream stats; 'scored' flags the real values.
+                'engagement_score': round(score, 4) if scored else None,
+                'scored': scored,
                 'bbox': bbox,
                 'buffer_fill': round(buffer_fill, 3),
-                'crowd_average': round(crowd_average, 4),
+                'crowd_average': crowd_val,
                 'people_count': len(people_data),
                 'fps': round(fps, 1),
             }
+            if person.get('performer'):
+                record['performer'] = True
             
             # Add 360° view info if present
             if is_360:
@@ -910,6 +919,11 @@ class MultiPersonEngagementSystem:
         # registered_only off so aggregation falls back to all tracked people.
         self.registered_only = True
         self.registered_ids = set()
+        # Real face-ID registrations are exempt from performer promotion (an
+        # enrolled parent walking must not be mistaken for a performer). The
+        # --max-people sensor sim turns this OFF so a mis-registered performer
+        # can still promote out of the registered set.
+        self.exempt_registered = True
 
         # Frame index of last sighting per track_id (for stale-track eviction).
         # Updated each time a track is seen; consulted by _evict_stale_tracks().
@@ -1068,16 +1082,17 @@ class MultiPersonEngagementSystem:
             )
             current_frame_data.append(person)
         
+        crowd_average = None
         if current_frame_data:
-            weighted_sum = sum(d['score'] * d['buffer_fill'] for d in current_frame_data
-                              if self._buffer_ready(d['id'])
-                              and (not self.registered_only or int(d['id']) in self.registered_ids))
-            weight_total = sum(d['buffer_fill'] for d in current_frame_data
-                              if self._buffer_ready(d['id'])
-                              and (not self.registered_only or int(d['id']) in self.registered_ids))
-            crowd_average = weighted_sum / weight_total if weight_total > 0 else 0.0
-        else:
-            crowd_average = 0.0
+            scorable = [d for d in current_frame_data
+                        if self._buffer_ready(d['id'])
+                        and (not self.registered_only or int(d['id']) in self.registered_ids)]
+            for d in scorable:
+                d['scored'] = True
+            weight_total = sum(d['buffer_fill'] for d in scorable)
+            if weight_total > 0:
+                weighted_sum = sum(d['score'] * d['buffer_fill'] for d in scorable)
+                crowd_average = weighted_sum / weight_total
 
         self._update_context_seconds()
         return current_frame_data, crowd_average
@@ -1446,8 +1461,11 @@ class MultiPersonEngagementSystem:
         # gaze is the base, the model rescues confident pro cues and caps
         # confident anti cues. Performers are flagged and never scored.
         # Registered people are exempt from performer promotion (audience by
-        # definition — walking must not silently unscore them).
-        self.gaze_engine.excluded_ids = self.registered_ids if self.registered_only else set()
+        # definition — walking must not silently unscore them), unless
+        # exempt_registered is off (sensor sim: let performers promote out).
+        self.gaze_engine.excluded_ids = (self.registered_ids
+                                         if (self.registered_only and self.exempt_registered)
+                                         else set())
         gaze_result = self.gaze_engine.update(gaze_people, self._frame_counter)
         self.last_gaze_result = gaze_result
         for d in current_frame_data:
@@ -1495,16 +1513,22 @@ class MultiPersonEngagementSystem:
             elif self._buffer_ready(d['id']):
                 w = d.get('buffer_fill', 0.0)
             else:
-                continue
+                continue          # no pose / not warmed up: unknown, not a zero
+            d['scored'] = True
             weighted_sum += d['score'] * w
             weight_total += w
-        crowd_average = weighted_sum / weight_total if weight_total > 0 else 0.0
+        # None (not 0.0) when nobody is scorable this frame, so a too-far or
+        # empty crowd reads as "unknown" instead of dragging the average to zero.
+        crowd_average = weighted_sum / weight_total if weight_total > 0 else None
 
         self._update_context_seconds()
             
-        # 5. Publish to Redis (throttled to 1 Hz)
+        # 5. Publish to Redis (throttled to 1 Hz). Skip when crowd_average is
+        # None (nobody scorable) so subscribers keep the last value instead of
+        # receiving a misleading 0.
         current_time = time.time()
-        if self.redis_client and (current_time - self.last_publish_time) >= self.publish_interval:
+        if (self.redis_client and crowd_average is not None
+                and (current_time - self.last_publish_time) >= self.publish_interval):
             try:
                 payload = f"{crowd_average:.4f}"
                 self.redis_client.publish(REDIS_CHANNEL, payload)
@@ -2750,11 +2774,12 @@ def main():
                 print(f"  [PROFILE] e2p={(t_e2p-t0)*1000:.0f}ms  yolo={(t_yolo-t_e2p)*1000:.0f}ms  mp+eng={(t_mp-t_yolo)*1000:.0f}ms  people={n_people}  total={(t_mp-t0)*1000:.0f}ms")
             
             
-            # Aggregate crowd average across all views
+            # Aggregate crowd average across all views (None when nobody is
+            # scorable, so unknown frames don't read as 0% engagement)
             if all_scores:
                 crowd_avg = sum(all_scores) / len(all_scores)
             else:
-                crowd_avg = 0.0
+                crowd_avg = None
             
             people_data = all_people_data
             
@@ -2965,16 +2990,26 @@ def main():
                 face_id_pending.clear()
             system.registered_only = True
             system.registered_ids = {int(tid) for tid in face_id_cache}
+            system.exempt_registered = True
         elif args.max_people and not is_360:
-            # Sensor-budget simulation: first N tracks seen become the sticky
-            # registered set (a lost track's slot is not recycled — exactly
-            # like a wristband wearer leaving the room)
+            # Sensor-budget simulation (N EmotiBit wristbands): the first N
+            # NON-performer tracks become the sticky registered set. A lost
+            # track's slot is not recycled (a wristband wearer leaving the
+            # room), but a track that later promotes to performer — moving,
+            # holding an instrument, facing the audience — is dropped and its
+            # slot freed, since performers wear no sensor.
+            performers = system.gaze_engine.performers
+            sensor_sim_ids.difference_update(performers)
             for p in people_data:
                 if len(sensor_sim_ids) >= args.max_people:
                     break
-                sensor_sim_ids.add(int(p['id']))
+                pid = int(p['id'])
+                if pid in performers or p.get('performer'):
+                    continue
+                sensor_sim_ids.add(pid)
             system.registered_only = True
             system.registered_ids = sensor_sim_ids
+            system.exempt_registered = False
         else:
             system.registered_only = False
             system.registered_ids = set()
@@ -3092,14 +3127,15 @@ def main():
         
         cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
         
-        # Fill Bar
-        fill_w = int(bar_w * crowd_avg)
-        avg_color = (0, int(255 * crowd_avg), int(255 * (1-crowd_avg)))
-        cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), avg_color, -1)
-        
-        # Engagement Text
+        # Fill Bar (leave grey + show "--" when unknown / no scorable audience)
         mode_str = "360" if is_360 else "2D"
-        text = f"CROWD ENGAGEMENT ({mode_str}): {crowd_avg:.1%}"
+        if crowd_avg is None:
+            text = f"CROWD ENGAGEMENT ({mode_str}): --"
+        else:
+            fill_w = int(bar_w * crowd_avg)
+            avg_color = (0, int(255 * crowd_avg), int(255 * (1-crowd_avg)))
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), avg_color, -1)
+            text = f"CROWD ENGAGEMENT ({mode_str}): {crowd_avg:.1%}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         tx = (w - tw) // 2
         ty = bar_y + bar_h + 25

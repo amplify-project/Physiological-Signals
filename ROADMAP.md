@@ -36,6 +36,20 @@ while one CPU core saturates (~30–50 ms/person hard ceiling).
 - [ ] Per-session and post-hoc score calibration for venue-specific behaviour.
 - [ ] (SOTA) Multi-task / domain-adaptive training with fairness slicing across audience styles.
 
+### Distance-robust fusion fallback (shoulder orientation + coarse motion)
+The gaze cue is already **head-orientation** (ear-midpoint → nose vector in
+`person_geometry`), not iris tracking. Because it relies on fine face landmarks
+(nose/ears/eyes), it shares the exact failure mode of the action model: on small
+/ distant crops MediaPipe returns no reliable face landmarks, so gaze **and**
+action collapse together — gaze is therefore not an independent fallback at
+distance. Interim stance: **fuse actions with head-pose (gaze) where possible.**
+
+- [ ] Add a **shoulder-line / torso orientation** "facing the stage" score. The `L/R_SHOULDER`, `HIP`, `KNEE` keypoints are already extracted (currently only for standing-vs-seated) and are far more distance-robust than nose/ears — usable when the face is gone.
+- [ ] Add a **coarse motion / crowd-synchrony** cue (bbox or shoulder/hip velocity: sway, clap, bounce) — independent of fine landmarks and a strong positive family-concert signal.
+- [ ] Wire these as the tier **below** gaze: gaze → shoulder-orientation → coarse-motion, so a person keeps a meaningful score after face landmarks drop out.
+- [ ] Add a presence/persistence baseline (decay last confident score) instead of snapping to unknown.
+- [ ] Recognise the real ceiling is **upstream landmark yield** on far crops (crop upscaling is a partial patch) — no fusion fallback rescues "zero landmarks".
+
 ## Retraining the engagement model
 Work tracked on the `Retrain_Engagement_Model` branch. Scope, datasets, label
 schema, and training/evaluation plan to be defined.
