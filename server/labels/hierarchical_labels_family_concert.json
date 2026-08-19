@@ -1,0 +1,446 @@
+{
+  "version": "family_concert_v1",
+  "date": "2026-08-19",
+  "context": "young-families concert audience (docile, mostly seated). Distinct from the online-class / direct-camera context served by the older 86-class models, where direct camera gaze and distance-from-camera strongly drive the score.",
+  "source_dataset": "kinetics-700",
+  "based_on": "server/labels/hierarchical_labels_young_families.json",
+  "status": "trainer-ready. Consumed by scripts/train_young_families.py via --hierarchical-file. Train against a feature tree filtered to 'train_classes' (see scripts/data/build_family_concert_feature_tree.py). 'to_extract' classes require feature extraction before they can be trained.",
+  "philosophy": "attention-first; presume engaged; low arousal is NOT disengagement; quiet attentive stillness/staring is the strongest engagement cue; disengagement = distraction, distress, restlessness or boredom; neutral/involuntary/consumption actions are excluded; the action head acts mainly as a distraction/distress detector on top of the attentive-presence baseline.",
+  "binary": {
+    "num_classes": 2,
+    "action_to_idx": {
+      "engagement": 0,
+      "disengagement": 1
+    },
+    "idx_to_action": {
+      "0": "engagement",
+      "1": "disengagement"
+    },
+    "classes": [
+      "engagement",
+      "disengagement"
+    ]
+  },
+  "hierarchy": {
+    "applause": {
+      "binary": "engagement",
+      "fine_classes": [
+        "applauding",
+        "clapping"
+      ]
+    },
+    "attention": {
+      "binary": "engagement",
+      "fine_classes": [
+        "staring"
+      ]
+    },
+    "sing_along": {
+      "binary": "engagement",
+      "fine_classes": [
+        "karaoke"
+      ]
+    },
+    "positive_reaction": {
+      "binary": "engagement",
+      "fine_classes": [
+        "laughing"
+      ]
+    },
+    "phone_distraction": {
+      "binary": "disengagement",
+      "fine_classes": [
+        "looking at phone",
+        "texting",
+        "talking on cell phone"
+      ]
+    },
+    "restless_bored": {
+      "binary": "disengagement",
+      "fine_classes": [
+        "fidgeting",
+        "checking watch",
+        "yawning"
+      ]
+    },
+    "disengaged_state": {
+      "binary": "disengagement",
+      "fine_classes": [
+        "sleeping"
+      ]
+    },
+    "distress": {
+      "binary": "disengagement",
+      "fine_classes": [
+        "crying",
+        "falling off chair"
+      ]
+    }
+  },
+  "conversions": {
+    "fine_to_binary": {
+      "staring": "engagement",
+      "applauding": "engagement",
+      "clapping": "engagement",
+      "karaoke": "engagement",
+      "laughing": "engagement",
+      "looking at phone": "disengagement",
+      "texting": "disengagement",
+      "talking on cell phone": "disengagement",
+      "fidgeting": "disengagement",
+      "checking watch": "disengagement",
+      "yawning": "disengagement",
+      "sleeping": "disengagement",
+      "crying": "disengagement",
+      "falling off chair": "disengagement"
+    }
+  },
+  "train_classes": [
+    "staring",
+    "applauding",
+    "clapping",
+    "looking at phone",
+    "texting",
+    "talking on cell phone",
+    "fidgeting",
+    "checking watch",
+    "yawning",
+    "sleeping",
+    "crying",
+    "falling off chair",
+    "karaoke",
+    "laughing"
+  ],
+  "to_extract": {
+    "karaoke": {
+      "binary": "engagement",
+      "note": "sing-along proxy (better-posed than 'singing')"
+    },
+    "laughing": {
+      "binary": "engagement",
+      "note": "optional; positive reaction"
+    }
+  },
+  "feature_layer_signals": {
+    "attentive_stillness_gaze_on_stage": {
+      "polarity": "+",
+      "source": "gaze + orientation"
+    },
+    "looking_away_reduced_attention": {
+      "polarity": "-",
+      "source": "gaze"
+    },
+    "excess_movement_restlessness": {
+      "polarity": "-",
+      "source": "motion-energy/synchrony (replaces dance action-classes for 'kids moving a lot')"
+    },
+    "tapping_along_to_rhythm": {
+      "polarity": "+",
+      "source": "in-domain data / rhythm cue"
+    }
+  },
+  "overrides_vs_standard": [
+    "staring: disengagement -> engagement (attentive stillness = strongest positive cue)",
+    "dropped 74 of the original 86 classes as neutral/irrelevant/undetectable (see dropped_neutral)",
+    "added karaoke (sing-along) and laughing (optional) as engagement classes to extract",
+    "engagement class up-weighted via --engagement-weight (presume-engaged tilt)"
+  ],
+  "dropped_neutral": {
+    "arguing": {
+      "k700_fine_idx": 1,
+      "reason": "ambiguous_or_rare"
+    },
+    "belly dancing": {
+      "k700_fine_idx": 2,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "blowing nose": {
+      "k700_fine_idx": 3,
+      "reason": "involuntary_neutral"
+    },
+    "breakdancing": {
+      "k700_fine_idx": 4,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "burping": {
+      "k700_fine_idx": 5,
+      "reason": "involuntary_neutral"
+    },
+    "cheerleading": {
+      "k700_fine_idx": 7,
+      "reason": "high_arousal_inappropriate_for_docile_audience"
+    },
+    "chewing gum": {
+      "k700_fine_idx": 8,
+      "reason": "involuntary_neutral"
+    },
+    "coughing": {
+      "k700_fine_idx": 10,
+      "reason": "involuntary_neutral"
+    },
+    "country line dancing": {
+      "k700_fine_idx": 11,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "crossing eyes": {
+      "k700_fine_idx": 12,
+      "reason": "face_based_not_visible_from_pose"
+    },
+    "dancing ballet": {
+      "k700_fine_idx": 14,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "dancing charleston": {
+      "k700_fine_idx": 15,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "dancing gangnam style": {
+      "k700_fine_idx": 16,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "dancing macarena": {
+      "k700_fine_idx": 17,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "drinking shots": {
+      "k700_fine_idx": 18,
+      "reason": "neutral_consumption"
+    },
+    "drooling": {
+      "k700_fine_idx": 19,
+      "reason": "involuntary_neutral"
+    },
+    "drumming fingers": {
+      "k700_fine_idx": 20,
+      "reason": "too_subtle_for_pose; rhythm-tapping handled in-domain"
+    },
+    "eating burger": {
+      "k700_fine_idx": 21,
+      "reason": "neutral_consumption"
+    },
+    "eating chips": {
+      "k700_fine_idx": 22,
+      "reason": "neutral_consumption"
+    },
+    "eating doughnuts": {
+      "k700_fine_idx": 23,
+      "reason": "neutral_consumption"
+    },
+    "eating hotdog": {
+      "k700_fine_idx": 24,
+      "reason": "neutral_consumption"
+    },
+    "eating ice cream": {
+      "k700_fine_idx": 25,
+      "reason": "neutral_consumption"
+    },
+    "eating nachos": {
+      "k700_fine_idx": 26,
+      "reason": "neutral_consumption"
+    },
+    "eating spaghetti": {
+      "k700_fine_idx": 27,
+      "reason": "neutral_consumption"
+    },
+    "falling off bike": {
+      "k700_fine_idx": 28,
+      "reason": "wont_occur_indoors_seated"
+    },
+    "gospel singing in church": {
+      "k700_fine_idx": 31,
+      "reason": "pose_undetectable; replaced by karaoke"
+    },
+    "headbanging": {
+      "k700_fine_idx": 32,
+      "reason": "high_arousal_inappropriate_for_docile_audience"
+    },
+    "jumpstyle dancing": {
+      "k700_fine_idx": 33,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "listening with headphones": {
+      "k700_fine_idx": 34,
+      "reason": "uncommon_in_this_audience"
+    },
+    "mosh pit dancing": {
+      "k700_fine_idx": 36,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "playing accordion": {
+      "k700_fine_idx": 37,
+      "reason": "performer_action_not_audience"
+    },
+    "playing bagpipes": {
+      "k700_fine_idx": 38,
+      "reason": "performer_action_not_audience"
+    },
+    "playing bass guitar": {
+      "k700_fine_idx": 39,
+      "reason": "performer_action_not_audience"
+    },
+    "playing cello": {
+      "k700_fine_idx": 40,
+      "reason": "performer_action_not_audience"
+    },
+    "playing clarinet": {
+      "k700_fine_idx": 41,
+      "reason": "performer_action_not_audience"
+    },
+    "playing cymbals": {
+      "k700_fine_idx": 42,
+      "reason": "performer_action_not_audience"
+    },
+    "playing drums": {
+      "k700_fine_idx": 43,
+      "reason": "performer_action_not_audience"
+    },
+    "playing guitar": {
+      "k700_fine_idx": 44,
+      "reason": "performer_action_not_audience"
+    },
+    "playing harmonica": {
+      "k700_fine_idx": 45,
+      "reason": "performer_action_not_audience"
+    },
+    "playing keyboard": {
+      "k700_fine_idx": 46,
+      "reason": "performer_action_not_audience"
+    },
+    "playing piano": {
+      "k700_fine_idx": 47,
+      "reason": "performer_action_not_audience"
+    },
+    "playing saxophone": {
+      "k700_fine_idx": 48,
+      "reason": "performer_action_not_audience"
+    },
+    "playing trombone": {
+      "k700_fine_idx": 49,
+      "reason": "performer_action_not_audience"
+    },
+    "playing trumpet": {
+      "k700_fine_idx": 50,
+      "reason": "performer_action_not_audience"
+    },
+    "playing ukulele": {
+      "k700_fine_idx": 51,
+      "reason": "performer_action_not_audience"
+    },
+    "playing violin": {
+      "k700_fine_idx": 52,
+      "reason": "performer_action_not_audience"
+    },
+    "reading book": {
+      "k700_fine_idx": 53,
+      "reason": "wont_occur_or_ambiguous"
+    },
+    "reading newspaper": {
+      "k700_fine_idx": 54,
+      "reason": "wont_occur_or_ambiguous"
+    },
+    "recording music": {
+      "k700_fine_idx": 55,
+      "reason": "performer_or_tech_action"
+    },
+    "robot dancing": {
+      "k700_fine_idx": 56,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "rolling eyes": {
+      "k700_fine_idx": 57,
+      "reason": "face_based_not_visible_from_pose"
+    },
+    "salsa dancing": {
+      "k700_fine_idx": 58,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "shaking head": {
+      "k700_fine_idx": 59,
+      "reason": "ambiguous_or_rare"
+    },
+    "shoot dance": {
+      "k700_fine_idx": 60,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "singing": {
+      "k700_fine_idx": 61,
+      "reason": "pose_undetectable; replaced by karaoke"
+    },
+    "sipping cup": {
+      "k700_fine_idx": 62,
+      "reason": "neutral_consumption"
+    },
+    "smoking": {
+      "k700_fine_idx": 64,
+      "reason": "wont_occur_at_family_concert"
+    },
+    "smoking hookah": {
+      "k700_fine_idx": 65,
+      "reason": "wont_occur_at_family_concert"
+    },
+    "smoking pipe": {
+      "k700_fine_idx": 66,
+      "reason": "wont_occur_at_family_concert"
+    },
+    "sneezing": {
+      "k700_fine_idx": 67,
+      "reason": "involuntary_neutral"
+    },
+    "square dancing": {
+      "k700_fine_idx": 68,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "stretching arm": {
+      "k700_fine_idx": 70,
+      "reason": "ambiguous; attention handled by gaze feature"
+    },
+    "stretching leg": {
+      "k700_fine_idx": 71,
+      "reason": "ambiguous; attention handled by gaze feature"
+    },
+    "surfing crowd": {
+      "k700_fine_idx": 72,
+      "reason": "high_arousal_inappropriate_for_docile_audience"
+    },
+    "swing dancing": {
+      "k700_fine_idx": 73,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "tango dancing": {
+      "k700_fine_idx": 75,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "tap dancing": {
+      "k700_fine_idx": 76,
+      "reason": "wont_occur_or_poor_proxy; restlessness handled by motion-energy feature"
+    },
+    "tapping pen": {
+      "k700_fine_idx": 77,
+      "reason": "too_subtle_for_pose; rhythm-tapping handled in-domain"
+    },
+    "twiddling fingers": {
+      "k700_fine_idx": 79,
+      "reason": "too_subtle_for_pose; rhythm-tapping handled in-domain"
+    },
+    "using megaphone": {
+      "k700_fine_idx": 80,
+      "reason": "performer_or_tech_action"
+    },
+    "waiting in line": {
+      "k700_fine_idx": 81,
+      "reason": "wont_occur_or_ambiguous"
+    },
+    "waking up": {
+      "k700_fine_idx": 82,
+      "reason": "ambiguous; attention handled by gaze feature"
+    },
+    "watching tv": {
+      "k700_fine_idx": 83,
+      "reason": "wont_occur_or_ambiguous"
+    },
+    "winking": {
+      "k700_fine_idx": 84,
+      "reason": "face_based_not_visible_from_pose"
+    }
+  }
+}
