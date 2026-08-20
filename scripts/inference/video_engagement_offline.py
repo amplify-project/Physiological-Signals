@@ -60,6 +60,26 @@ OFF_FACE = 33
 OFF_LHAND = 33 + 468        # 501
 OFF_RHAND = 33 + 468 + 21   # 522
 
+# graded overlay bands (green/amber/red) - mirrors the gaze-rules overlay policy
+PERSON_GREEN = 0.50   # >= green (engaged); between = amber; < PERSON_RED = red
+PERSON_RED = 0.30
+CROWD_GREEN = 0.75    # crowd banner: green >= 0.75, amber, red < CROWD_RED
+CROWD_RED = 0.30
+
+GREEN = (0, 200, 0)
+AMBER = (0, 165, 255)
+RED = (0, 0, 230)
+GREY = (160, 160, 160)
+
+
+def grade_color(score, green_at=PERSON_GREEN, red_at=PERSON_RED):
+    """BGR colour on a green->amber->red gradient (no hard engaged/disengaged flip)."""
+    if score >= green_at:
+        return GREEN
+    if score < red_at:
+        return RED
+    return AMBER
+
 
 # =============================================================================
 # MODEL (identical architecture to the live/training script)
@@ -235,6 +255,7 @@ def main():
 
     raw_idx = 0               # raw source frame counter
     proc_idx = 0              # processed (strided) frame counter
+    crowd_history = []        # crowd engagement per scored frame (for end summary)
     t0 = time.time()
 
     while True:
@@ -291,11 +312,10 @@ def main():
             x1, y1, x2, y2 = bbox
             if tid in ema_score:
                 s = ema_score[tid]
-                engaged = s >= 0.5
-                color = (0, 200, 0) if engaged else (0, 0, 230)
-                label = f"ID{tid} {'ENG' if engaged else 'DIS'} {s*100:.0f}%"
+                color = grade_color(s)
+                label = f"ID{tid} {s*100:.0f}%"
             else:
-                color = (160, 160, 160)
+                color = GREY
                 label = f"ID{tid} ..."
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -314,10 +334,12 @@ def main():
         # --- crowd average banner ---
         n_active = len(active_scores)
         crowd = float(np.mean(active_scores)) if active_scores else 0.0
+        if n_active:
+            crowd_history.append(crowd)
         banner_h = 46
         cv2.rectangle(frame, (0, 0), (src_w, banner_h), (30, 30, 30), -1)
         if n_active:
-            bcol = (0, 200, 0) if crowd >= 0.5 else (0, 120, 230)
+            bcol = grade_color(crowd, green_at=CROWD_GREEN, red_at=CROWD_RED)
             btxt = f"CROWD ENGAGEMENT: {crowd*100:.0f}%  |  scored adults: {n_active}"
         else:
             bcol = (200, 200, 200)
@@ -373,6 +395,24 @@ def main():
     else:
         print("\nDone (no file saved).")
     print(f"Processed {proc_idx} frames in {dt/60:.1f} min ({proc_idx/dt:.1f} proc-fps)")
+
+    # --- engagement summary (smoke-test verification) ---
+    if crowd_history:
+        ch = np.array(crowd_history, dtype=np.float32)
+        pct_engaged_frames = float(np.mean(ch >= 0.5) * 100.0)
+        print("\n=== ENGAGEMENT SUMMARY ===")
+        print(f"model            : {args.model}")
+        print(f"scored frames    : {len(ch)}")
+        print(f"mean crowd eng   : {ch.mean()*100:.1f}%")
+        print(f"median crowd eng : {float(np.median(ch))*100:.1f}%")
+        print(f"min / max        : {ch.min()*100:.1f}% / {ch.max()*100:.1f}%")
+        print(f"frames >= 50%    : {pct_engaged_frames:.1f}% (majority-engaged share)")
+        if ema_score:
+            per = np.array(list(ema_score.values()), dtype=np.float32)
+            print(f"final per-person : n={len(per)} mean={per.mean()*100:.1f}% "
+                  f"engaged={int((per >= 0.5).sum())}/{len(per)}")
+    else:
+        print("\n=== ENGAGEMENT SUMMARY ===\n(no frames scored - no people detected/tracked long enough)")
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ Usage (PowerShell):
 import argparse
 import os
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 
 import cv2
@@ -75,7 +76,7 @@ def draw_person(frame, tid, bbox, geom, is_performer, is_gazed, stat):
             color = COL_LOW
         thick = 2
         label = f"ID{tid} {s*100:.0f}%"
-        if stat['reason'] in ('shift', 'off-focal'):
+        if stat['reason'] and any(k in stat['reason'] for k in ('shift', 'off-focal', 'act')):
             label += f" [{stat['reason']}]"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -136,6 +137,15 @@ def main():
                     help=f'override QUORUM_FRAC (default {gr.QUORUM_FRAC}): fraction of audience '
                          'gaze rays that must converge for a valid focal point')
     ap.add_argument('--no-save', action='store_true', help='do not write an output file')
+    ap.add_argument('--action-model', default=None,
+                    help='optional action-transformer checkpoint; its DISENGAGEMENT probability '
+                         'is subtracted from the gaze (presume-engaged) score - the action head '
+                         'acts purely as a distraction/distress detector on top of the gaze base')
+    ap.add_argument('--dis-tau', type=float, default=0.60,
+                    help='disengagement prob must exceed this before ANY action penalty applies')
+    ap.add_argument('--action-penalty-max', type=float, default=0.7,
+                    help='max score the action head can subtract (reached at disengagement prob 1.0)')
+    ap.add_argument('--device', default=None, help='torch device for the action model (auto)')
     args = ap.parse_args()
 
     if args.quorum is not None:
@@ -186,8 +196,29 @@ def main():
     print(f"Output: {'(not saving)' if writer is None else out_path}")
 
     engine = GazeRulesEngine()
+
+    # optional action head = a DISENGAGEMENT detector; it only ever SUBTRACTS
+    # from the gaze presume-engaged base (it never sets the baseline).
+    action_model = a_device = None
+    a_buffers = a_penalty = a_last_pred = a_cfg = None
+    if args.action_model:
+        import torch
+        from video_engagement_offline import (
+            load_model, resample, ENGAGEMENT_IDX, SEQUENCE_LENGTH,
+            MIN_FRAMES_FOR_PRED, PREDICT_EVERY, BUFFER_MAXLEN,
+        )
+        a_device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+        print(f"Loading action model: {args.action_model} (device {a_device})")
+        action_model = load_model(args.action_model, a_device)
+        a_buffers = defaultdict(lambda: deque(maxlen=BUFFER_MAXLEN))
+        a_penalty = {}
+        a_last_pred = {}
+        a_cfg = dict(torch=torch, resample=resample, dis_idx=1 - ENGAGEMENT_IDX,
+                     seq=SEQUENCE_LENGTH, min_frames=MIN_FRAMES_FOR_PRED, every=PREDICT_EVERY)
+
     last_seen = {}
     raw_idx = proc_idx = 0
+    crowd_history = []
     t0 = time.time()
 
     while True:
@@ -226,6 +257,8 @@ def main():
                 continue
             people[tid] = {'geom': person_geometry(kp, pbox), 'bbox': bbox,
                            'sig': appearance_sig(frame, bbox)}
+            if action_model is not None:
+                a_buffers[tid].append(kp.flatten())
 
         # --- rules engine ---
         result = engine.update(people, proc_idx)
@@ -235,17 +268,61 @@ def main():
             if proc_idx - last_seen[tid] > STALE_TRACK_FRAMES:
                 engine.evict(tid)
                 last_seen.pop(tid, None)
+                if action_model is not None:
+                    a_buffers.pop(tid, None)
+                    a_penalty.pop(tid, None)
+                    a_last_pred.pop(tid, None)
+
+        # --- action head: subtract a DISENGAGEMENT penalty from the gaze score ---
+        status_draw = result['status']
+        if action_model is not None:
+            torch = a_cfg['torch']
+            for tid in people:
+                buf = a_buffers[tid]
+                if (len(buf) >= a_cfg['min_frames'] and
+                        proc_idx - a_last_pred.get(tid, -10**9) >= a_cfg['every']):
+                    seq = a_cfg['resample'](buf, a_cfg['seq'])
+                    with torch.no_grad():
+                        x = torch.from_numpy(seq).unsqueeze(0).to(a_device)
+                        probs = torch.softmax(action_model(x), dim=1)
+                        p_dis = float(probs[0, a_cfg['dis_idx']].item())
+                    # only CONFIDENT disengagement bites; scale linearly past the threshold
+                    pen = max(0.0, (p_dis - args.dis_tau) / max(1e-6, 1.0 - args.dis_tau))
+                    pen *= args.action_penalty_max
+                    prev = a_penalty.get(tid, 0.0)
+                    alpha = 0.4 if pen >= prev else 0.25   # ease penalty in, release it slower
+                    a_penalty[tid] = alpha * pen + (1.0 - alpha) * prev
+                    a_last_pred[tid] = proc_idx
+            status_draw = {}
+            for tid, st in result['status'].items():
+                if st is None or st['score'] is None:
+                    status_draw[tid] = st
+                    continue
+                pen = a_penalty.get(tid, 0.0)
+                reason = st['reason']
+                if pen > 0.05:
+                    reason = (reason + '+act') if reason and reason != 'at-focal' else 'act'
+                status_draw[tid] = {'score': max(0.0, min(1.0, st['score'] - pen)),
+                                    'reason': reason, 'contributed': st.get('contributed')}
 
         # --- overlay ---
-        n_scored = sum(1 for s in result['status'].values() if s['score'] is not None)
+        result_draw = dict(result)
+        result_draw['status'] = status_draw
+        n_scored = sum(1 for s in status_draw.values() if s and s['score'] is not None)
         performer_boxes = [people[t]['bbox'] for t in engine.performers if t in people]
         draw_gaze_rays(frame, people, result['focal'], performer_boxes, engine.performers)
         for tid, p in people.items():
             draw_person(frame, tid, p['bbox'], p['geom'],
                         tid in engine.performers,
                         tid in result['gazed_performers'],
-                        result['status'].get(tid))
-        draw_global(frame, result, n_scored, src_w)
+                        status_draw.get(tid))
+        draw_global(frame, result_draw, n_scored, src_w)
+
+        # crowd history for the end-of-run summary
+        if result['started']:
+            cs = [s['score'] for s in status_draw.values() if s and s['score'] is not None]
+            if cs:
+                crowd_history.append(float(np.mean(cs)))
 
         if writer is not None:
             writer.write(frame)
@@ -291,6 +368,21 @@ def main():
     holistic.close()
     dt = time.time() - t0
     print(f"Processed {proc_idx} frames in {dt/60:.1f} min ({proc_idx/max(dt,1e-9):.1f} proc-fps)")
+
+    if crowd_history:
+        ch = np.array(crowd_history, dtype=np.float32)
+        tag = " - action disengagement penalty" if args.action_model else ""
+        print(f"\n=== ENGAGEMENT SUMMARY (gaze base{tag}) ===")
+        if args.action_model:
+            print(f"action model     : {args.action_model} (dis-tau {args.dis_tau}, "
+                  f"max penalty {args.action_penalty_max})")
+        print(f"scored frames    : {len(ch)}")
+        print(f"mean crowd eng   : {ch.mean()*100:.1f}%")
+        print(f"median crowd eng : {float(np.median(ch))*100:.1f}%")
+        print(f"min / max        : {ch.min()*100:.1f}% / {ch.max()*100:.1f}%")
+        print(f"frames >= 50%    : {float(np.mean(ch >= 0.5)*100):.1f}%")
+    else:
+        print("\n=== ENGAGEMENT SUMMARY ===\n(no LIVE frames - never reached a started/focal state)")
 
 
 if __name__ == '__main__':

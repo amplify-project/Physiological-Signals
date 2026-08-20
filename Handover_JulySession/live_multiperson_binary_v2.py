@@ -253,17 +253,37 @@ REDIS_CHANNEL = 'engagement_score'  # Channel to publish to
 #        <repo>/scripts/inference/live_multiperson_binary_v2.py
 #        <repo>/models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth
 #        <repo>/yolo11n.pt
+#
+# Engagement action model selection:
+#   The family-concert model (attention-first disengagement detector) supersedes
+#   the original 86-class binary model. CRITICAL: the two models use OPPOSITE
+#   class orders, so ENGAGEMENT_IDX is bound to whichever file is resolved:
+#     family_concert_v1 -> engaged = class 0  (disengaged = class 1)
+#     original binary_v2 -> engaged = class 1  (disengaged = class 0)
+#   Preference order per layout: family_concert first, original as fallback.
 SCRIPT_DIR = Path(__file__).parent.resolve()
-_LOCAL_MODEL = SCRIPT_DIR / 'model' / 'best_model.pth'
-if _LOCAL_MODEL.exists():
+_BUNDLE_FC = SCRIPT_DIR / 'model' / 'best_model_family_concert.pth'
+_BUNDLE_OLD = SCRIPT_DIR / 'model' / 'best_model.pth'
+if _BUNDLE_FC.exists() or _BUNDLE_OLD.exists():
     # Self-contained bundle
-    MODEL_PATH = _LOCAL_MODEL
+    if _BUNDLE_FC.exists():
+        MODEL_PATH = _BUNDLE_FC
+        ENGAGEMENT_IDX = 0
+    else:
+        MODEL_PATH = _BUNDLE_OLD
+        ENGAGEMENT_IDX = 1
     YOLO_MODEL_PATH = SCRIPT_DIR / 'yolo11n.pt'
     YOLO_FALLBACK_PATH = SCRIPT_DIR / 'yolo26n.pt'
 else:
     # Project tree
     PROJECT_ROOT = SCRIPT_DIR.parent.parent
-    MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
+    _REPO_FC = PROJECT_ROOT / 'models' / 'action_transformer_family_concert_v1' / 'best_model.pth'
+    if _REPO_FC.exists():
+        MODEL_PATH = _REPO_FC
+        ENGAGEMENT_IDX = 0
+    else:
+        MODEL_PATH = PROJECT_ROOT / 'models' / 'action_transformer_12gpus_binary_v2_cleaned' / 'best_model.pth'
+        ENGAGEMENT_IDX = 1
     YOLO_MODEL_PATH = PROJECT_ROOT / 'yolo11n.pt'
     YOLO_FALLBACK_PATH = PROJECT_ROOT / 'yolo26n.pt'
 
@@ -276,17 +296,21 @@ SESSIONS_DIR = Path.cwd() / 'data' / 'sessions'
 CONFIDENCE_THRESHOLD = 0.5          # Engagement threshold for binary decision
 
 # --- Gaze + actions late fusion (Gaze_Rules integration) ---
-# The gaze rules produce the BASE attention score (available within a couple
-# of frames, no model warm-up). The action-transformer output is blended in
-# and can RESCUE a low gaze score on a confident pro-engagement cue (e.g.
-# nodding along while looking away) or CAP the score on a confident anti cue
-# (e.g. phone use the gaze ray misses). Before the show starts (no common
-# focal point) the pipeline falls back to the pure action-model score.
-GAZE_WEIGHT = 0.7                   # gaze share of the blended score
-ACTION_RESCUE_PROB = 0.75           # model this confident in 'engaged' ...
-ACTION_RESCUE_FLOOR = 0.65          # ... floors the fused score here
-ACTION_OVERRIDE_PROB = 0.25         # model this confident in 'disengaged' ...
-ACTION_OVERRIDE_CAP = 0.40          # ... caps the fused score here
+# Design (validated offline on the 4th-lab concert, family_concert_v1):
+#   The gaze rules produce the BASE attention score and already presume
+#   engaged (SCORE_SEED=1.0), decaying on off-focal / shifting gaze. The
+#   action transformer is a DISENGAGEMENT detector: we only let it SUBTRACT
+#   from the gaze base when it is confident the person is disengaged. There is
+#   no additive "rescue" — a calm attentive audience must not be dragged down
+#   by the model's ~50/50 idle output.
+#     p_dis   = P(disengaged) from the action head
+#     penalty = clamp((p_dis - ACTION_DIS_TAU)/(1-ACTION_DIS_TAU), 0, 1)
+#               * ACTION_PENALTY_MAX
+#     fused   = clamp(gaze_score - penalty, 0, 1)
+# Before the show starts (no common focal point) the pipeline falls back to the
+# pure action-model engaged score.
+ACTION_DIS_TAU = 0.60               # only penalise above this disengagement prob
+ACTION_PENALTY_MAX = 0.7            # max the action head can subtract from gaze
 # Gaze rule thresholds are tuned at ~3 processed fps (offline stride-10
 # validation); the live loop targets TARGET_FPS_FLOOR=12, so frame-count
 # windows inside the engine are scaled by 4 to keep wall-clock behaviour.
@@ -1047,7 +1071,7 @@ class MultiPersonEngagementSystem:
                 with torch.no_grad():
                     logits = self.model(input_tensor)
                     probs = torch.softmax(logits, dim=1)
-                    score = probs[0][1].item()
+                    score = probs[0][ENGAGEMENT_IDX].item()
                     self.person_scores[track_id] = score
 
         return {
@@ -1432,8 +1456,8 @@ class MultiPersonEngagementSystem:
                             with torch.no_grad():
                                 logits = self.model(input_tensor)
                                 probs = torch.softmax(logits, dim=1)
-                                # Class 1 is 'Engaged'
-                                score = probs[0][1].item()
+                                # Engaged-class prob (ENGAGEMENT_IDX bound to model)
+                                score = probs[0][ENGAGEMENT_IDX].item()
                                 self.person_scores[track_id] = score
                 else:
                     # Throttled this frame: skip MediaPipe + model, keep cached score.
@@ -1487,13 +1511,16 @@ class MultiPersonEngagementSystem:
             d['gaze_reason'] = stat['reason']
             d['gaze_scored'] = True
             if self._buffer_ready(d['id']):
-                action_s = d['score']
-                fused = GAZE_WEIGHT * gaze_s + (1.0 - GAZE_WEIGHT) * action_s
-                if action_s >= ACTION_RESCUE_PROB and fused < ACTION_RESCUE_FLOOR:
-                    fused = ACTION_RESCUE_FLOOR     # confident pro cue rescues off-focal gaze
-                elif action_s <= ACTION_OVERRIDE_PROB:
-                    fused = min(fused, ACTION_OVERRIDE_CAP)  # confident anti cue caps
-                d['score'] = fused
+                # Presume-engaged base (gaze) MINUS a disengagement penalty from
+                # the action head. score is P(engaged); p_dis = 1 - P(engaged).
+                # The model can only pull the score DOWN, and only once it is
+                # past ACTION_DIS_TAU confident of disengagement.
+                action_engaged = d['score']
+                p_dis = 1.0 - action_engaged
+                penalty = max(0.0, (p_dis - ACTION_DIS_TAU) / (1.0 - ACTION_DIS_TAU))
+                penalty = min(1.0, penalty) * ACTION_PENALTY_MAX
+                fused = gaze_s - penalty
+                d['score'] = max(0.0, min(1.0, fused))
             else:
                 d['score'] = gaze_s                 # gaze-only until the model warms up
 
