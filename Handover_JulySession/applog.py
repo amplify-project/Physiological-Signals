@@ -39,6 +39,7 @@ from pathlib import Path
 
 _LISTENER: logging.handlers.QueueListener | None = None
 _LOG_PATH: Path | None = None
+_CONSOLE_MIRRORED: bool = False
 
 
 def _default_log_dir(script_name: str) -> Path:
@@ -135,6 +136,60 @@ def setup_logging(
 def get_log_path() -> Path | None:
     """Path of the active log file, or None before setup_logging() runs."""
     return _LOG_PATH
+
+
+class _TeeStream:
+    """Write-through stream wrapper that also mirrors whole lines to a logger.
+
+    The wrapped stream still receives every write, so the terminal looks
+    unchanged; completed lines are additionally forwarded to `log_fn` so
+    console output (boot banner, camera negotiation, warnings) is preserved
+    in the session log. Only newline-terminated lines are forwarded to avoid
+    fragmenting messages across partial writes."""
+
+    def __init__(self, stream, log_fn):
+        self._stream = stream
+        self._log_fn = log_fn
+        self._buf = ""
+
+    def write(self, text):
+        self._stream.write(text)
+        self._buf += text
+        if "\n" in self._buf:
+            *lines, self._buf = self._buf.split("\n")
+            for line in lines:
+                line = line.rstrip("\r")
+                if line.strip():
+                    try:
+                        self._log_fn(line)
+                    except Exception:
+                        pass
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def mirror_console_to_log(level: int = logging.INFO) -> None:
+    """Tee stdout/stderr into the log file so on-screen output is recorded.
+
+    Call once, right after setup_logging(). print()s keep appearing on screen
+    and are additionally captured in the session log so a run can be reviewed
+    afterwards. The console handler captured the real stderr at setup time, so
+    wrapping here does not loop. No-op before setup or if called twice."""
+    global _CONSOLE_MIRRORED
+    if _CONSOLE_MIRRORED or _LISTENER is None:
+        return
+    out_log = logging.getLogger("stdout")
+    err_log = logging.getLogger("stderr")
+    sys.stdout = _TeeStream(sys.stdout, lambda m: out_log.log(level, m))
+    sys.stderr = _TeeStream(sys.stderr, lambda m: err_log.log(level, m))
+    _CONSOLE_MIRRORED = True
 
 
 def _shutdown() -> None:

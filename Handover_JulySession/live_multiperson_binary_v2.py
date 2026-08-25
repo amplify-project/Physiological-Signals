@@ -92,9 +92,17 @@ import sys as _sys
 _here = Path(__file__).resolve().parent
 if str(_here) not in _sys.path:
     _sys.path.insert(0, str(_here))
-from applog import setup_logging, install_excepthook  # noqa: E402
+from applog import setup_logging, install_excepthook, mirror_console_to_log  # noqa: E402
 import logging as _logging
 log = _logging.getLogger('engagement')
+
+
+def _short_identity(name):
+    """On-overlay identity: an EmotiBit serial (…0000334) collapses to its
+    last 4 digits (0334); other labels are shown unchanged."""
+    if name and name[-4:].isdigit():
+        return name[-4:]
+    return name
 
 # Gaze-first rules layer (shared module, sits beside this script; same file
 # as scripts/inference/gaze_rules.py). Provides the per-person gaze-ray ->
@@ -659,6 +667,16 @@ class EngagementLogger:
                 'timestamp': timestamp,
                 'frame': self.frame_number,
                 'track_id': track_id,
+                # EmotiBit serial = the persistent participant identity; always
+                # present (null when unmatched) so every engagement row can be
+                # grouped per-participant for post-concert analysis.
+                'emotibit_id': person.get('identified_as'),
+                # How that id was resolved: 'face' (live match this frame),
+                # 'coast' (same track, face briefly unseen), 'inferred'
+                # (re-bound by appearance after track churn) or null. Paired
+                # with id_confidence so inferred guesses stay filterable.
+                'id_source': person.get('id_source'),
+                'id_confidence': round(person['id_confidence'], 3) if person.get('id_confidence') is not None else None,
                 # null (not 0.0) for people we couldn't score, so unknowns don't
                 # pollute downstream stats; 'scored' flags the real values.
                 'engagement_score': round(score, 4) if scored else None,
@@ -677,9 +695,8 @@ class EngagementLogger:
                 record['view'] = person.get('view')
                 record['yaw'] = person.get('yaw')
             
-            # Add face identification if matched
+            # Face-match confidence for the EmotiBit binding (only when matched)
             if person.get('identified_as'):
-                record['identified_as'] = person['identified_as']
                 record['face_similarity'] = round(person.get('face_similarity', 0.0), 3)
             
             # Native face width in px — the distance-test ground truth
@@ -1919,6 +1936,7 @@ def main():
         'save': str(args.save or args.save_engagement or args.save_keypoints),
     })
     install_excepthook(log)
+    mirror_console_to_log()  # tee console output into the session log
     log.info('Engagement inference starting (args=%s)', vars(args))
 
     print(f"🖥️  Platform: {platform_info['os']} ({platform_info['machine']})")
@@ -1982,6 +2000,18 @@ def main():
     FACE_EVICT_MISSES = 6
     FACE_MISS_SIM = 0.25
     face_id_pending = {}  # {track_id: {'name': str, 'count': int}}
+
+    # --- Identity re-binding (guess a lost EmotiBit from appearance) ---
+    # When a registered participant's track churns and the face is too small to
+    # re-match, re-bind the new track to the participant whose torso colour
+    # signature (and, when recent, last-known position) matches. Correlation is
+    # the HSV histogram from appearance_sig; the position-assisted floor is
+    # looser because a recent, nearby match is corroborating evidence.
+    REBIND_SIG_MIN = 0.85   # appearance-only correlation to accept a guess
+    REBIND_SIG_POS = 0.70   # looser floor when last-known position corroborates
+    REBIND_POS_FRAC = 0.20  # position radius as a fraction of the frame diagonal
+    REBIND_MAX_GAP_S = 5.0  # ignore last-known positions older than this (s)
+    registered_profiles = {}  # {serial: {'sig': hist, 'centre': (x,y), 'seen': t}}
     sensor_sim_ids = set()  # --max-people: sticky first-N 'registered' track ids
 
     # 3-pose enrollment session (guided FRONT/LEFT/RIGHT captures at ~1m).
@@ -2204,16 +2234,23 @@ def main():
         # Non-Windows: default backend
         return cv2.VideoCapture(index)
 
-    def _ensure_high_res_capture(cap, index, target_w=1920, target_h=1080):
-        """Renegotiate the live camera to 1080p30.
+    def _ensure_high_res_capture(cap, index, target_w=None, target_h=None):
+        """Renegotiate the live camera to its highest usable resolution.
 
         A 7m face is ~24px at 1080p and ~10px at 480p — capture resolution is
-        the distance budget. Windows needs a clean reopen with MJPG requested
-        BEFORE the first read: both DSHOW and MSMF lock their format once
-        streaming, and uncompressed YUY2 at 1080p is USB-capped to ~1-5fps.
-        Right after the camera-selector previews release the device the driver
-        can refuse the mode, so each backend gets a settle-and-retry.
-        360° (equirect) cameras keep their native mode."""
+        the distance budget, so by default we drive the camera to the top mode
+        it actually supports rather than a fixed 1080p target. The ceiling is
+        discovered by requesting an oversized frame with MJPG and reading back
+        what the driver clamps to; capture then walks down a ladder from that
+        ceiling to the first mode that still streams >=10fps (a 4K sensor that
+        can only manage a few fps at its top mode steps down instead of
+        collapsing to the 640x480 default).
+
+        Windows needs a clean reopen with MJPG requested BEFORE the first read:
+        both DSHOW and MSMF lock their format once streaming, and uncompressed
+        YUY2 is USB-capped to ~1-5fps at high resolutions. Pass target_w/target_h
+        to pin a specific mode instead of auto-selecting the ceiling. 360°
+        (equirect) cameras keep their native mode."""
         ret, probe = cap.read()
         if not ret or probe is None:
             return cap
@@ -2228,8 +2265,18 @@ def main():
                 n += 1 if c.read()[0] else 0
             return n / secs
 
+        def _res_ladder(max_w, max_h):
+            """Highest supported mode first, then common modes below it."""
+            ladder = [(max_w, max_h)]
+            for cw, ch in ((3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)):
+                if cw < max_w and (cw, ch) not in ladder:
+                    ladder.append((cw, ch))
+            return ladder
+
+        auto = target_w is None or target_h is None
         cur_fps = _measure_fps(cap)
-        if w >= target_w and cur_fps >= 15:
+        _already_hi = w >= (1920 if auto else target_w)
+        if _already_hi and cur_fps >= 15:
             print(f"📷 Capture: {w}x{h} @ ~{cur_fps:.0f}fps (native)")
             log.info(f"capture: {w}x{h} @ {cur_fps:.1f}fps native")
             return cap
@@ -2240,9 +2287,9 @@ def main():
             # DSHOW index 4 but MSMF index 0 on this rig), so scan MSMF
             # indices rather than trusting the DSHOW index. Failed MSMF
             # opens time out slowly, so the last known-good index (cached)
-            # is tried first. Wrong-device grabs are rejected: virtual cams
-            # can't deliver 1920 wide and black/static streams fail the
-            # content check.
+            # is tried first. The right device delivers a real frame wider
+            # than the default mode; black/static streams and virtual cams
+            # fail the content + width checks.
             cached_msmf = None
             if MSMF_CACHE_FILE.exists():
                 try:
@@ -2253,40 +2300,72 @@ def main():
             for i in ([cached_msmf] if cached_msmf is not None else []) + [index] + list(range(6)):
                 if i not in msmf_candidates:
                     msmf_candidates.append(i)
+
+            # Phase 1: find the right MSMF index and probe its resolution ceiling.
+            found_idx, max_w, max_h = None, 0, 0
             for midx in msmf_candidates:
-                new = cv2.VideoCapture(midx, cv2.CAP_MSMF)
-                if not new.isOpened():
-                    new.release()
+                probe_cap = cv2.VideoCapture(midx, cv2.CAP_MSMF)
+                if not probe_cap.isOpened():
+                    probe_cap.release()
                     continue
-                new.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                new.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
-                new.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
-                new.set(cv2.CAP_PROP_FPS, 30)
-                ret2, probe2 = new.read()
-                if ret2 and probe2 is not None and probe2.shape[1] >= target_w:
-                    if np.mean(probe2) > 5 and np.std(probe2) > 10:
-                        new_fps = _measure_fps(new)
-                        if new_fps >= 10:
-                            nh, nw = probe2.shape[:2]
-                            print(f"📷 Capture boosted: {w}x{h}@~{cur_fps:.0f}fps → "
-                                  f"{nw}x{nh}@~{new_fps:.0f}fps (MSMF idx {midx}, MJPG)")
-                            log.info(f"capture: boosted {w}x{h}@{cur_fps:.1f} -> "
-                                     f"{nw}x{nh}@{new_fps:.1f} via MSMF idx {midx}")
-                            try:
-                                MSMF_CACHE_FILE.write_text(str(midx))
-                            except OSError:
-                                pass
-                            return new
-                new.release()
-            print(f"⚠️  1080p30 renegotiation FAILED — reverting to default camera mode. "
-                  f"Face range will be reduced (~2.4x).")
-            log.warning(f"capture: 1080p renegotiation failed, default mode kept (was {w}x{h})")
+                probe_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                req_w, req_h = (7680, 4320) if auto else (target_w, target_h)
+                probe_cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+                probe_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
+                ret2, probe2 = probe_cap.read()
+                pw = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                ph = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                probe_cap.release()
+                if (ret2 and probe2 is not None and pw > w
+                        and np.mean(probe2) > 5 and np.std(probe2) > 10):
+                    found_idx, max_w, max_h = midx, pw, ph
+                    break
+
+            if found_idx is not None:
+                # Phase 2: walk the ladder down from the ceiling until a mode
+                # sustains a usable frame rate. MSMF locks its format once
+                # streaming, so each rung gets a clean reopen.
+                targets = _res_ladder(max_w, max_h) if auto else [(target_w, target_h)]
+                for req_w, req_h in targets:
+                    new = cv2.VideoCapture(found_idx, cv2.CAP_MSMF)
+                    if not new.isOpened():
+                        new.release()
+                        continue
+                    new.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    new.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+                    new.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
+                    new.set(cv2.CAP_PROP_FPS, 30)
+                    ret2, probe2 = new.read()
+                    if (not ret2 or probe2 is None
+                            or np.mean(probe2) <= 5 or np.std(probe2) <= 10):
+                        new.release()
+                        continue
+                    nh, nw = probe2.shape[:2]
+                    if nw < req_w * 0.9:
+                        new.release()  # driver didn't honour this mode
+                        continue
+                    new_fps = _measure_fps(new)
+                    if new_fps >= 10:
+                        print(f"📷 Capture boosted: {w}x{h}@~{cur_fps:.0f}fps → "
+                              f"{nw}x{nh}@~{new_fps:.0f}fps (MSMF idx {found_idx}, MJPG)")
+                        log.info(f"capture: boosted {w}x{h}@{cur_fps:.1f} -> "
+                                 f"{nw}x{nh}@{new_fps:.1f} via MSMF idx {found_idx}")
+                        try:
+                            MSMF_CACHE_FILE.write_text(str(found_idx))
+                        except OSError:
+                            pass
+                        return new
+                    new.release()
+            print(f"⚠️  High-res renegotiation FAILED — reverting to default camera mode. "
+                  f"Face range will be reduced.")
+            log.warning(f"capture: high-res renegotiation failed, default mode kept (was {w}x{h})")
             return _open_camera(index)
 
-        # Non-Windows: in-place request is honoured by V4L2/AVFoundation
+        # Non-Windows: in-place request is honoured by V4L2/AVFoundation.
+        # An oversized request clamps to the sensor's top mode.
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w if not auto else 7680)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h if not auto else 4320)
         return cap
 
     def select_camera_interactively(detected_cameras, default_camera, force=False):
@@ -2877,6 +2956,8 @@ def main():
         if face_id and face_id.has_enrollments and not is_360:
             face_id_counter += 1
             run_face_id = (face_id_counter % FACE_ID_INTERVAL == 0)
+            now_t = time.time()
+            newly_face_matched = set()  # tids confirmed by a live face this frame
             
             for person in people_data:
                 tid = person['id']
@@ -2905,7 +2986,9 @@ def main():
                             if cached and cached['name'] == name:
                                 cached['similarity'] = res['similarity']
                                 cached['miss'] = 0
+                                cached.pop('inferred', None)
                                 face_id_pending.pop(tid, None)
+                                newly_face_matched.add(tid)
                             else:
                                 # New/changed identity: near faces assign on one
                                 # vote, far faces need FACE_VOTES_FAR in a row
@@ -2921,6 +3004,7 @@ def main():
                                                           'similarity': res['similarity'],
                                                           'miss': 0}
                                     face_id_pending.pop(tid, None)
+                                    newly_face_matched.add(tid)
                                     log.info(f"face-id: track {tid} = {name} "
                                              f"(sim={res['similarity']:.3f}, face={face_px:.0f}px)")
                         elif cached and trusted and res['similarity'] < FACE_MISS_SIM:
@@ -2945,14 +3029,35 @@ def main():
                         face_id_cache[tid] = {'name': res['name'],
                                               'similarity': res['similarity'],
                                               'miss': 0}
+                        newly_face_matched.add(tid)
                     # res None = no face visible (turned away / below detector
                     # floor): identity coasts on the track, never evicted here
                 
                 # Apply cached result
                 cached = face_id_cache.get(tid)
                 if cached:
-                    person['identified_as'] = cached['name']
+                    serial = cached['name']
+                    person['identified_as'] = serial
                     person['face_similarity'] = cached['similarity']
+                    if cached.get('inferred'):
+                        person['id_source'] = 'inferred'
+                    elif tid in newly_face_matched:
+                        person['id_source'] = 'face'
+                    else:
+                        person['id_source'] = 'coast'
+                    person['id_confidence'] = cached['similarity']
+                    # Keep the participant's last-known position fresh while the
+                    # track lives; refresh the appearance signature only on a
+                    # trusted face match (never from a guess) to avoid drift.
+                    prof = registered_profiles.setdefault(serial, {})
+                    px1, py1, px2, py2 = person['bbox']
+                    prof['centre'] = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
+                    prof['seen'] = now_t
+                    if tid in newly_face_matched:
+                        _sig = appearance_sig(frame, person['bbox'])
+                        if _sig is not None:
+                            _old = prof.get('sig')
+                            prof['sig'] = _sig if _old is None else cv2.addWeighted(_old, 0.8, _sig, 0.2, 0)
 
             # One live track per name: duplicate claims keep the highest
             # similarity (prevents a far false-positive stealing a serial)
@@ -2964,13 +3069,64 @@ def main():
                         by_name.setdefault(entry['name'], []).append((tid, entry))
                 for name, claims in by_name.items():
                     if len(claims) > 1:
-                        claims.sort(key=lambda te: te[1]['similarity'], reverse=True)
+                        # Confirmed faces outrank inferred guesses regardless of
+                        # score (face similarity and histogram correlation are
+                        # different scales); within a class, higher score wins.
+                        claims.sort(key=lambda te: (0 if te[1].get('inferred') else 1,
+                                                    te[1]['similarity']), reverse=True)
                         for tid, _ in claims[1:]:
                             face_id_cache.pop(tid, None)
                             for person in people_data:
                                 if person['id'] == tid:
                                     person.pop('identified_as', None)
                                     person.pop('face_similarity', None)
+                                    person.pop('id_source', None)
+                                    person.pop('id_confidence', None)
+
+            # --- Re-bind churned tracks to a registered participant by torso
+            # appearance (+ recent last-known position) when face ID can't help
+            # — small or again-lost faces. The guess is written into the identity
+            # cache so it coasts, scores and draws like a known participant, but
+            # is flagged inferred so provenance survives into the JSONL.
+            if registered_profiles:
+                fh, fw = frame.shape[:2]
+                radius = REBIND_POS_FRAC * math.hypot(fw, fh)
+                live_tids = {p['id'] for p in people_data}
+                claimed = {e['name'] for t, e in face_id_cache.items() if t in live_tids}
+                for person in people_data:
+                    tid = person['id']
+                    if tid in face_id_cache or person.get('performer'):
+                        continue
+                    sig = appearance_sig(frame, person['bbox'])
+                    if sig is None:
+                        continue
+                    bx1, by1, bx2, by2 = person['bbox']
+                    centre = (0.5 * (bx1 + bx2), 0.5 * (by1 + by2))
+                    best_serial, best_c = None, 0.0
+                    for serial, prof in registered_profiles.items():
+                        if serial in claimed:
+                            continue
+                        ref = prof.get('sig')
+                        if ref is None:
+                            continue
+                        c = float(cv2.compareHist(sig, ref, cv2.HISTCMP_CORREL))
+                        pc = prof.get('centre')
+                        near = (pc is not None
+                                and (now_t - prof.get('seen', 0.0)) <= REBIND_MAX_GAP_S
+                                and math.hypot(centre[0] - pc[0], centre[1] - pc[1]) <= radius)
+                        floor = REBIND_SIG_POS if near else REBIND_SIG_MIN
+                        if c >= floor and c > best_c:
+                            best_serial, best_c = serial, c
+                    if best_serial is not None:
+                        face_id_cache[tid] = {'name': best_serial, 'similarity': best_c,
+                                              'miss': 0, 'inferred': True}
+                        person['identified_as'] = best_serial
+                        person['face_similarity'] = best_c
+                        person['id_source'] = 'inferred'
+                        person['id_confidence'] = best_c
+                        claimed.add(best_serial)
+                        log.info(f"re-bind: track {tid} ~= {best_serial} "
+                                 f"(corr={best_c:.2f}, inferred)")
 
         # =================================================================
         # 3-POSE ENROLLMENT SESSION — guided FRONT/LEFT/RIGHT captures
@@ -3015,6 +3171,7 @@ def main():
             if not face_id.has_enrollments and face_id_cache:
                 face_id_cache.clear()
                 face_id_pending.clear()
+                registered_profiles.clear()
             system.registered_only = True
             system.registered_ids = {int(tid) for tid in face_id_cache}
             system.exempt_registered = True
@@ -3097,17 +3254,25 @@ def main():
                     # Magenta box + name for focused participant
                     color = IDENTIFIED_COLOR
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 3)
-                    name_label = f"{identified} {score:.0%}{gaze_tag}{face_tag}"
+                    _sid = _short_identity(identified)
+                    if person.get('id_source') == 'inferred':
+                        _sid = f"~{_sid}?"
+                    name_label = f"{_sid} {score:.0%}{gaze_tag}{face_tag}"
                     cv2.putText(display_frame, name_label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 else:
                     # Standard engagement gradient box
                     color = (0, int(255 * score), int(255 * (1-score)))
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    # Always show EmotiBit serial if enrolled; otherwise a short,
-                    # recyclable display label (P1/P2/...) instead of the raw
-                    # YOLO track id which inflates rapidly in dense crowds.
-                    id_str = identified if identified else system.display_label(pid)
+                    # Always show EmotiBit serial (last 4 digits) if enrolled;
+                    # otherwise a short, recyclable display label (P1/P2/...)
+                    # instead of the raw YOLO track id which inflates rapidly
+                    # in dense crowds. Inferred guesses are marked ~NNNN?.
+                    if identified:
+                        _sid = _short_identity(identified)
+                        id_str = f"~{_sid}?" if person.get('id_source') == 'inferred' else _sid
+                    else:
+                        id_str = system.display_label(pid)
                     if bf < 0.9:
                         label = f"{id_str} {score:.0%}{gaze_tag}{face_tag} conf:{bf:.0%}"
                         cv2.putText(display_frame, label, (x1, y1 - 10),
@@ -3387,6 +3552,7 @@ def main():
             face_id.clear_enrollments()
             face_id_cache.clear()   # drop stale track→name matches immediately
             face_id_pending.clear()
+            registered_profiles.clear()
             enroll_session = None
             focus_target = 'all'
             registration_flash_msg = "All enrollments cleared"
