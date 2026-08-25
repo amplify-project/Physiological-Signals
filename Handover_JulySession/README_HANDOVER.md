@@ -209,7 +209,40 @@ All AR data flows over Redis pub/sub on `localhost:6379`.
 
 | Channel | Payload | Description |
 |---------|---------|-------------|
-| `engagement_score` | `{frame, persons:[{id, score, bbox, identified, …}], crowd_avg, fps, ts}` | Single per-frame snapshot. In the default **registered-people-only** mode `persons` and `crowd_avg` cover only enrolled (EmotiBit-wearing) participants — bystanders are tracked cheaply by YOLO for enrolment but are not scored, drawn or aggregated. The Unity / `test_subscriber.py` consumers extract their target by id. |
+| `engagement_score` | `0.5342` (bare float string, crowd average 0–1) | Legacy **crowd-average** channel, published ~1 Hz. In the default **registered-people-only** mode it is the confidence-weighted average over enrolled (EmotiBit-wearing) participants only — bystanders are tracked cheaply by YOLO for enrolment but are not scored or aggregated. Unchanged, keep using it for the single crowd number. |
+| `device:{serial}:engagement` | `{device, engagement, confirmed, confidence, source, timestamp}` | **Per-participant** engagement, one channel per EmotiBit, published ~1 Hz. `{serial}` is the same EmotiBit id the physio publisher uses (e.g. `MD-V5-0000334`), so this drops straight into the `device:*` namespace. See below. |
+
+#### Per-participant engagement — `device:{serial}:engagement`
+
+For each registered participant the vision system publishes their individual engagement on a channel keyed by their EmotiBit serial — the **same id** the physio publisher streams on `device:{serial}:physio_metrics`, so one participant's engagement and physiology share a key. Subscribe with a pattern:
+
+```
+PSUBSCRIBE device:*:engagement
+```
+
+Payload (JSON string, one message per participant per ~1 s tick):
+
+```json
+{
+  "device": "MD-V5-0000334",
+  "engagement": 0.72,
+  "confirmed": true,
+  "confidence": 0.61,
+  "source": "face",
+  "timestamp": 1756113600.0
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `device` | EmotiBit serial — matches `device:{serial}:physio_metrics` for the same person. |
+| `engagement` | Engagement score `0.0–1.0` (same scale as the crowd average). |
+| `confirmed` | `true` when the identity is a live or recently-seen **face match** (`source` = `face`/`coast`) — safe to attribute. `false` when it is an **appearance-inferred guess** after the person's track was lost and re-bound by body/clothing colour. Use this to drive a **green (confirmed) vs red (uncertain) indicator** in the AR overlay. |
+| `confidence` | Numeric match strength `0.0–1.0` behind the id (face cosine similarity for `face`/`coast`, histogram correlation for an inferred guess). |
+| `source` | `face` = live face match this second · `coast` = same track, face briefly unseen (still the same person) · `inferred` = re-bound by appearance after track churn (a guess). |
+| `timestamp` | Unix epoch seconds when published. |
+
+Only registered (enrolled) participants are published; unenrolled bystanders never appear. A participant whose track is lost and never re-bound simply stops publishing until they are seen again.
 
 ### Physiological (EmotiBit)
 
@@ -248,6 +281,35 @@ Backwards-compat: the original `*_sd` magnitude fields stay in the payload so th
 ## 🔌 Unity Integration
 
 Drop **`UnityRedisSubscriber.cs`** into your Unity project. It subscribes to the Redis channels above and exposes the scores to your AR scene. Requires the [StackExchange.Redis](https://github.com/StackExchange/StackExchange.Redis) NuGet package in your Unity project.
+
+The bundled `UnityRedisSubscriber.cs` subscribes to the legacy `engagement_score` crowd float. To drive **per-participant** AR overlays, add a pattern subscription to `device:*:engagement` and parse the JSON payload — the `device` field tells you which participant and `confirmed` drives the green/red certainty indicator:
+
+```csharp
+// Per-participant engagement (one message per EmotiBit per ~1 s).
+subscriber.Subscribe("device:*:engagement", (channel, message) =>
+{
+    // Runs on a Redis background thread — do NOT call Unity APIs here.
+    // message is JSON: {"device","engagement","confirmed","confidence","source","timestamp"}
+    var e = JsonUtility.FromJson<ParticipantEngagement>(message);
+    // e.device      → EmotiBit serial (matches device:{serial}:physio_metrics)
+    // e.engagement  → 0..1 score
+    // e.confirmed   → true = positive face ID (green dot); false = inferred guess (red dot)
+    // Buffer e by e.device and apply it on the Unity main thread in Update().
+});
+
+[System.Serializable]
+public class ParticipantEngagement
+{
+    public string device;
+    public float  engagement;
+    public bool   confirmed;
+    public float  confidence;
+    public string source;
+    public double timestamp;
+}
+```
+
+Because the serial in `device:{serial}:engagement` is the **same** id as `device:{serial}:physio_metrics`, you can key one AR marker per participant and merge their engagement with their HR/EDA/valence/arousal from the physio channels.
 
 ---
 

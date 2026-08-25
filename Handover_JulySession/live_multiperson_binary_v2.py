@@ -249,6 +249,10 @@ check_venv()
 DEFAULT_REDIS_HOST = 'localhost'
 DEFAULT_REDIS_PORT = 6379
 REDIS_CHANNEL = 'engagement_score'  # Channel to publish to
+# Per-participant engagement, one channel per EmotiBit. Serial matches Sowmya's
+# physio source_id (the DI device id, e.g. MD-V5-0000334), so the AR client
+# pattern-subscribes device:*:engagement alongside device:*:physio_metrics.
+INDIVIDUAL_CHANNEL_FMT = 'device:{serial}:engagement'
 
 # Cross-platform paths using pathlib.
 # Two supported layouts:
@@ -874,6 +878,11 @@ class MultiPersonEngagementSystem:
         self._console_pub_last = 0.0
         self._console_pub_interval = 60.0
         self._console_pub_warmup = 3
+        # Per-participant publish throttle (independent of the crowd channel)
+        self.last_individual_publish_time = 0.0
+        self.individual_publish_interval = 1.0
+        self._indiv_pub_count = 0
+        self._indiv_pub_last = 0.0
 
         # 2. Load YOLO (person detection)
         def _check_lfs(p):
@@ -1586,6 +1595,45 @@ class MultiPersonEngagementSystem:
                 print(f"Redis Error: {e}")
 
         return current_frame_data, crowd_average
+
+    def publish_individual(self, people_data):
+        """Publish each registered participant's engagement on its own
+        device:<serial>:engagement channel (Sowmya's physio namespace).
+        confirmed=True is a live/coasting face ID (green in AR); confirmed=False
+        is an appearance-inferred guess after track churn (red in AR)."""
+        if self.redis_client is None:
+            return
+        now = time.time()
+        if now - self.last_individual_publish_time < self.individual_publish_interval:
+            return
+        published = 0
+        for p in people_data:
+            serial = p.get('identified_as')
+            if not serial or not p.get('scored'):
+                continue
+            src = p.get('id_source')
+            payload = json.dumps({
+                'device': serial,
+                'engagement': round(float(p['score']), 4),
+                'confirmed': src in ('face', 'coast'),
+                'confidence': round(float(p.get('id_confidence') or 0.0), 3),
+                'source': src,
+                'timestamp': round(now, 3),
+            })
+            try:
+                self.redis_client.publish(
+                    INDIVIDUAL_CHANNEL_FMT.format(serial=serial), payload)
+                published += 1
+            except Exception as e:
+                print(f"Redis Error (individual): {e}")
+                break
+        if published:
+            self.last_individual_publish_time = now
+            self._indiv_pub_count += 1
+            if (self._indiv_pub_count <= self._console_pub_warmup
+                    or (now - self._indiv_pub_last) >= self._console_pub_interval):
+                print(f"📡 Redis pub → device:*:engagement ({published} registered)")
+                self._indiv_pub_last = now
 
 SIDEBAR_W = 280  # pixel width of the EmotiBit physio sidebar panel
 
@@ -2769,6 +2817,7 @@ def main():
     
     print(f"🚀 System Running!")
     print(f"📡 Publishing to Redis Channel: '{REDIS_CHANNEL}'")
+    print(f"📡 Per-participant channels: 'device:<serial>:engagement'")
     if is_360:
         print(f"🌐 360° Mode: Processing {NUM_360_VIEWS} views per frame")
     if logger:
@@ -3197,6 +3246,10 @@ def main():
         else:
             system.registered_only = False
             system.registered_ids = set()
+        
+        # Publish each registered participant's engagement contribution on its
+        # own device:<serial>:engagement channel (AR pattern-subscribes device:*).
+        system.publish_individual(people_data)
         
         # Draw Individual Boxes (2D mode only — 360° draws in mosaic above)
         if not is_360:

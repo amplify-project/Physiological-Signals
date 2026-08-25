@@ -2,6 +2,14 @@
 
 Real-time audience engagement estimation for live performances using pose-based machine learning and EmotiBit physiological signal processing.
 
+> **Release V3.1 — Individual Engagement Channels (2026-08):**
+> *(landed in the `Handover_JulySession/` reference build)*
+> - **Per-participant engagement over Redis** — in addition to the crowd average (`engagement_score`), each registered participant's engagement is now published on its own `device:{serial}:engagement` channel, keyed by the **same EmotiBit serial** the physio publisher uses, so an AR client can pattern-subscribe `device:*:engagement` and merge each person's engagement with their HR/EDA/valence/arousal. Payload carries a `confirmed` flag (positive face ID = green vs appearance-inferred guess = red) plus a numeric `confidence`.
+> - **Identity re-binding (appearance re-ID)** — when a registered participant's tracker id churns and their face is too small to re-match, their EmotiBit identity is re-bound from a torso colour signature (+ recent last-known position), so their engagement keeps flowing through track loss instead of going dark. Guesses are flagged distinctly from confirmed face matches and self-correct when a real face reappears.
+> - **Identity provenance in the session JSONL** — every row now carries `emotibit_id`, `id_source` (`face` / `coast` / `inferred`) and `id_confidence`, so post-concert analysis can group per participant and filter out low-confidence guesses.
+> - **Auto camera resolution** — capture negotiates the camera's highest workable resolution via a ceiling probe + step-down FPS ladder, replacing a fixed 1080p request that silently fell back to 480p on 720p webcams.
+> - **Console mirrored to the run log** — stdout/stderr (boot banner, per-publish lines) are tee'd into the engagement log, so a headless/handover session is fully reconstructable from the log alone.
+
 > **Release V3.0 — July Family Lab (2026-07):**
 > - **Real-time audio classification** (music / singing / pause) with CSV + WAV recording and automatic microphone selection — new `audio/` component.
 > - **Full-rate accelerometer/IMU capture** — raw motion samples are no longer decimated to 1 Hz; every accel/gyro/mag sample is logged to `raw_motion_<serial>_<ts>.csv` and latest raw sensor values stream to Redis (`device:{serial}:raw_sensors`), with Redis Streams mirrors for audio–physio time alignment.
@@ -130,7 +138,7 @@ python scripts/analysis/playback_keypoints.py <path> --all-tracks --smooth
 python scripts/inference/console_subscriber.py
 ```
 
-**Output**: Crowd engagement score (0.0-1.0) published to Redis channel `engagement_score` at 1 Hz. Visual overlay shows red→green engagement bar at top of window. Progressive confidence scoring produces initial estimates within ~1 second of launch, with per-person confidence indicators during buffer ramp-up. Data logging is opt-in via `--save` (both), `--save-engagement` (JSONL only), or `--save-keypoints` (NPZ only). Sessions are saved to `data/sessions/`.
+**Output**: Crowd engagement score (0.0-1.0) published to Redis channel `engagement_score` at 1 Hz. Per-participant engagement is additionally published on `device:{serial}:engagement` (one channel per registered EmotiBit). Visual overlay shows red→green engagement bar at top of window. Progressive confidence scoring produces initial estimates within ~1 second of launch, with per-person confidence indicators during buffer ramp-up. Data logging is opt-in via `--save` (both), `--save-engagement` (JSONL only), or `--save-keypoints` (NPZ only). Sessions are saved to `data/sessions/`.
 
 > **Registered-only engagement:** the crowd score now aggregates only people identified by facial recognition as **registered** attendees (the EmotiBit-wearing parents), not the whole crowd. Bystanders are still YOLO-tracked (so they can be face-matched and enrolled) but skip MediaPipe + the transformer entirely and are **not** drawn — only registered parents get bounding boxes, restoring the 12 fps floor. A registered parent's box turns **magenta** only when their EmotiBit row is selected in the sidebar, for at-a-glance owner identification. The physio sidebar now reflows to **two columns** beyond four wearers (up to 8 combos). With face ID active (2D), registered-only stays on even before anyone enrols — **zero registered means zero crowd score** (no bystander is ever averaged in). Only `--no-face-id` or 360° mode (no per-face matching) falls back to whole-crowd aggregation.
 
@@ -239,6 +247,13 @@ The pinned stack is `torch==2.6.0+cu124` (see `Handover_JulySession/constraints.
 ---
 
 ## ✨ Features
+
+### 🎯 Per-Participant Engagement Streaming & Identity Re-binding
+- **One Redis channel per EmotiBit** — each registered participant's engagement streams on `device:{serial}:engagement` at ~1 Hz, alongside the legacy crowd-average `engagement_score` float. The `{serial}` is the same EmotiBit id (e.g. `MD-V5-0000334`) the physio publisher streams on `device:{serial}:physio_metrics`, so engagement and physiology for one person share a key. Subscribe with `PSUBSCRIBE device:*:engagement`.
+- **JSON payload** — `{device, engagement, confirmed, confidence, source, timestamp}`. `confirmed` is `true` for a live/coasting **face** match (green in AR) and `false` for an appearance-**inferred** guess (red in AR); `confidence` is the numeric match strength and `source` is `face` / `coast` / `inferred`.
+- **Identity re-binding** — when a registered participant's tracker id churns and their face is too small to re-match, their EmotiBit identity is re-bound from a torso colour-histogram signature (+ recent last-known position), so scoring survives track loss. A real face match always outranks a guess, and a wrong guess self-corrects the moment a face reappears.
+- **Provenance in the session JSONL** — every per-person row carries `emotibit_id`, `id_source` (`face` / `coast` / `inferred`) and `id_confidence`, so per-participant post-concert analysis can group by wearer and filter low-confidence guesses. Inferred identities are marked `~NNNN?` in the on-screen overlay.
+- See [Handover_JulySession/README_HANDOVER.md](Handover_JulySession/README_HANDOVER.md) for the full AR-dev subscribe contract and a Unity C# example.
 
 ### 📷 Smart Camera Detection
 - **Phase 1**: Checks cached (last-used) camera index with a full 3-frame real-content test — instant startup when the same camera is plugged in
