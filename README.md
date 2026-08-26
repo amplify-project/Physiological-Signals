@@ -167,10 +167,24 @@ python scripts/inference/console_subscriber.py
 
 ## 🎯 Model Performance
 
-**Binary Engagement Classifier** — 82.75% accuracy
+**Binary Engagement Classifier** — 82.75% accuracy (**Standard / Concert** model)
 
-- **Engaged**: Dancing, clapping, cheering, singing, playing instruments, attentive gazing
-- **Disengaged**: Phone use, sleeping, negative body language, checking time
+The original **Standard / Concert** model (`…binary_v2_cleaned`, 82.75%) was
+trained to reward expressive, higher-arousal behaviour:
+
+- **Engaged**: clapping, dancing, cheering, singing, playing instruments, attentive gazing
+- **Disengaged**: phone use, sleeping, negative body language, checking time
+
+> ⚠️ **The newer attention-first family-concert model is different.**
+> `action_transformer_family_concert_v1` targets a docile, **seated** family
+> audience watching performers **at a distance**, so it deliberately **drops the
+> performer-style / high-arousal actions** — **dancing, cheering, playing
+> instruments, recording** — because a seated audience doesn't do them (and
+> performers are excluded from scoring anyway). There, **quiet attentive
+> stillness / sustained gaze at the stage is the strongest engagement cue**, and
+> the action head is used mainly as a *disengagement* detector (phone use,
+> looking away, fidgeting / restlessness, yawning, sleeping). Full kept/dropped
+> inventory in [docs/engagement_action_inventory.md](docs/engagement_action_inventory.md).
 
 **Output**: Engagement score (0.0–1.0) published to Redis at 1 Hz
 
