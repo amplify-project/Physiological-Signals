@@ -216,6 +216,58 @@ rear-/front-camera video evaluation.
 > (`idx_to_action = {0: 'engagement', 1: 'disengagement'}`). Inference code must
 > read the correct index — see `scripts/inference/video_engagement_offline.py`.
 
+### 🧠 What the "Young Families" model considers as adult reactions
+
+The young-families profile does **not** read facial micro-expressions. Adult
+reactions are inferred from **body pose, head / gaze orientation and coarse
+actions** (from the MediaPipe skeleton + YOLO person/object detector), and are
+combined with each parent's **wearable physiology** (EmotiBit). Its stance is
+*presume engaged, and only subtract when a clear anti-engagement cue appears*:
+
+$$\text{score}=\sigma\!\Big(w_0 + w_m\,p_\text{engaged} - \sum_k \lambda_k\,a_k\Big)$$
+
+where $p_\text{engaged}$ is the transformer's engagement probability, $w_0$ the
+default-engaged prior, $a_k$ the anti-cue activations and $\lambda_k$ their
+penalties.
+
+**Considered pro-engagement cues**
+
+| Cue | Where handled |
+|-----|---------------|
+| Clapping / applause | trained action head |
+| Dancing / mimicking the performers | trained action head |
+| Singing along | action head + mouth/jaw landmarks (or audio) |
+| Sustained attention / still head toward the stage | learned `staring`→engaged + head-pose-variance feature |
+| Tapping hands on lap (moving to the rhythm) | rhythmic-motion feature |
+| Seated / settled | posture feature |
+
+**Considered anti-engagement cues**
+
+| Cue | Where handled |
+|-----|---------------|
+| Turned away from the performance | torso / head-orientation feature |
+| Distracted by their child (attending to / holding them) | body-orientation + arm-pose feature |
+| Agitation / a lot of movement | motion-energy feature (high movement ⇒ *dis*engaged here) |
+| Phone use | trained action head (`phone_distraction`) |
+| Eating / drinking | trained action head (`eating_drinking`) |
+| Touching face | hand-to-face-proximity feature |
+| Holding an object (bottle / phone) | YOLO object-in-hand feature |
+| Sudden synchronised gaze shift across several parents | multi-person temporal feature |
+
+Roughly half the cues come from the **trained action head** (clapping, dancing,
+singing, eating/drinking, phone); the rest are **geometric / temporal rule-layer
+features** computed from the pose stream per registered adult, per rolling
+window. A **standing** adult is treated as a performer and excluded from
+audience scoring.
+
+**Data taken into account for the score.** Per registered adult: the
+transformer's engagement probability, the rule-layer anti-cue features above,
+and — separately, from the EmotiBit wristband — heart rate, electrodermal
+activity (skin conductance) and skin temperature, mapped to valence / arousal.
+Face recognition is used **only** to match each person to their own EmotiBit, not
+to read emotion. Full taxonomy and rationale in
+[docs/young_families_engagement_model.md](docs/young_families_engagement_model.md).
+
 ### 📦 Checkpoint Format (PyTorch 2.6+)
 
 `models/action_transformer_12gpus_binary_v2_cleaned/best_model.pth` is stored
