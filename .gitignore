@@ -90,8 +90,12 @@ Enter.pub
 # Colleague repo clone (reference only, not submodule)
 sowmya/
 
-# Camera cache
+# Runtime caches (camera pick, discovered Redis broker)
 .last_camera
+.last_*
+
+# Archive bundles (never sync large zips)
+*.zip
 
 # Face enrollment embeddings (user-specific, contains biometric data)
 .face_enrollments/

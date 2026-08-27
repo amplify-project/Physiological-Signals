@@ -2443,8 +2443,8 @@ def main():
         if not args.no_discover:
             print("🔎 Looking for the Redis broker on the network (mDNS)...")
             try:
-                from redis_discovery import discover_redis_broker
-                found = discover_redis_broker(timeout=5.0)
+                from redis_discovery import resolve_redis_broker
+                found = resolve_redis_broker(timeout=6.0)
             except Exception as e:
                 print(f"   Discovery unavailable ({e}); falling back to localhost.")
         if found:
@@ -2742,15 +2742,23 @@ def main():
         # Non-Windows: default backend
         return cv2.VideoCapture(index)
 
-    def _open_camera_pinned(index, target_w, target_h):
+    def _open_camera_pinned(index, target_w, target_h, dshow_only=False):
         """Open one specific camera index at target MJPG resolution WITHOUT the
         cross-index MSMF scan _ensure_high_res_capture performs. Dual mode needs
         each feed pinned to its own device — otherwise both cameras' scans pick
         the same 'best' index and one panel just mirrors the other. Tries DSHOW
         then MSMF on the SAME index; accepts any real (even dim) frame so a dark
-        venue camera isn't rejected. Returns a closed capture if none stream."""
-        backends = ((cv2.CAP_DSHOW, cv2.CAP_MSMF)
-                    if platform.system() == 'Windows' else (None,))
+        venue camera isn't rejected. Returns a closed capture if none stream.
+
+        dshow_only=True pins to DSHOW (no MSMF fallback): Windows' MSMF backend
+        cannot run two UVC cameras at once — the second silently returns stale
+        buffered frames then stalls — so dual capture MUST use DSHOW for both."""
+        if platform.system() != 'Windows':
+            backends = (None,)
+        elif dshow_only:
+            backends = (cv2.CAP_DSHOW,)
+        else:
+            backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF)
         for backend in backends:
             c = cv2.VideoCapture(index, backend) if backend is not None else cv2.VideoCapture(index)
             if not c.isOpened():
@@ -2765,6 +2773,8 @@ def main():
             for _ in range(8):
                 ret, frame = c.read()
                 if ret and frame is not None:
+                    _bname = {cv2.CAP_DSHOW: 'DSHOW', cv2.CAP_MSMF: 'MSMF'}.get(backend, 'default')
+                    log.info(f"camera {index} opened via {_bname} (requested {target_w}x{target_h})")
                     return c
                 time.sleep(0.03)
             c.release()
@@ -2905,64 +2915,127 @@ def main():
         return cap
 
     def _measure_pair_fps(caps, secs=0.8):
-        """Read every cap in lockstep and return the MIN sustained fps across
-        them. Shared-USB-bus starvation only shows when both cameras stream at
-        once, so the pair must be measured together, not one at a time."""
+        """Read every cap in lockstep; return (min_fps, min_delivered_w,
+        delivered_h). Counts only UNIQUE frames: a stalled camera (classic MSMF
+        dual-UVC failure) keeps returning ok=True on the SAME buffered frame, so
+        counting raw reads would fake a healthy fps while nothing is streaming.
+        Judged by the ACTUAL frame shape too, because Windows drivers report a
+        CAP_PROP_FRAME_WIDTH they cannot deliver — delivered size is the only
+        truth. Bus starvation only shows when both stream at once, so the pair
+        must be measured together."""
         counts = [0] * len(caps)
+        last_sig = [None] * len(caps)
+        min_w = 0
+        got_h = 0
         t0 = time.time()
         while time.time() - t0 < secs:
             for i, c in enumerate(caps):
-                if c.read()[0]:
-                    counts[i] += 1
+                ok, frame = c.read()
+                if ok and frame is not None:
+                    sig = hash(frame[::17, ::17].tobytes())  # cheap content signature
+                    if sig != last_sig[i]:
+                        counts[i] += 1
+                        last_sig[i] = sig
+                    fw = frame.shape[1]
+                    if min_w == 0 or fw < min_w:
+                        min_w, got_h = fw, frame.shape[0]
         dt = max(1e-3, time.time() - t0)
-        return min(counts) / dt
+        return min(counts) / dt, min_w, got_h
+
+    def _probe_native_max(idx):
+        """Discover a camera's true top resolution at runtime: request an
+        oversize mode and return the DELIVERED frame size. Windows drivers clamp
+        an oversize request to the sensor's real maximum but lie about the
+        reported CAP_PROP width, so the frame shape is the only truth.
+        Returns (w, h), or (0, 0) if the camera never delivers a frame."""
+        cap = _open_camera_pinned(idx, 7680, 4320, dshow_only=True)
+        w = h = 0
+        if cap.isOpened():
+            for _ in range(6):
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    w, h = frame.shape[1], frame.shape[0]
+        cap.release()
+        return w, h
 
     def _negotiate_dual_capture(idx_a, idx_b, min_fps=10.0):
         """Pick the HIGHEST resolution both cameras can stream simultaneously.
 
         Two USB cameras on one controller share the bus, so a mode each can do
-        alone (e.g. 4K) can starve to ~0 fps when run together. We walk a shared
-        ladder from 4K down, open both feeds pinned to their own index (no
-        cross-index scan, so neither mirrors the other), warm up, and measure the
-        pair's concurrent fps. The first (highest) rung the pair sustains at
-        >= min_fps wins — there is NO 1080p cap, so a fast PC on a USB3 bus keeps
-        4K while a bandwidth-starved USB2 bus steps down and warns. Returns
+        alone (e.g. 4K) can starve to ~0 fps when run together. We first probe
+        each camera's true native ceiling at runtime (no hardcoded cap or floor),
+        take the smaller of the two as the shared ceiling, then walk standard
+        rungs from that ceiling DOWN — never requesting a mode a camera can't
+        deliver (forcing 720p on a 480p webcam makes Windows report a fake 720p
+        while the stream delivers nothing, which looks like "bandwidth" but is an
+        unsupported mode). Each rung opens both feeds pinned to their own index
+        (no cross-index scan, so neither mirrors the other), warms up, and is
+        judged by the DELIVERED frame size and the pair's concurrent fps. The
+        highest rung sustaining >= min_fps wins — no 1080p cap: a USB3 bus keeps
+        4K, a starved USB2 bus steps down and warns. Returns
         (cap_a, cap_b, (w, h), fps) or None if the pair never opens."""
-        ladder = [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)]
-        last_opened = None  # lowest rung that at least opened, as a last resort
+        na = _probe_native_max(idx_a)
+        nb = _probe_native_max(idx_b)
+        if not (na[0] and nb[0]):
+            return None
+        ceiling = na if na[0] <= nb[0] else nb  # highest resolution BOTH can deliver
+        standard = [(3840, 2160), (2560, 1440), (1920, 1080),
+                    (1280, 720), (960, 540), (640, 480)]
+        ladder = [ceiling] + [(w, h) for (w, h) in standard if w < ceiling[0]]
+        winner = None       # (w, h, fps) of the highest rung sustaining min_fps
+        last_meta = None    # (w, h, fps) of the lowest rung that at least opened
+        bus_limited = False  # saw a rung the cameras support but the bus can't sustain
         for w, h in ladder:
-            ca = _open_camera_pinned(idx_a, w, h)
-            cb = _open_camera_pinned(idx_b, w, h)
-            if not (ca.isOpened() and cb.isOpened()):
-                ca.release(); cb.release()
+            ca = _open_camera_pinned(idx_a, w, h, dshow_only=True)
+            cb = _open_camera_pinned(idx_b, w, h, dshow_only=True)
+            opened = ca.isOpened() and cb.isOpened()
+            honoured = False
+            if opened:
+                for _ in range(5):  # discard the first post-switch frames
+                    ca.read(); cb.read()
+                fps, dw, dh = _measure_pair_fps([ca, cb])
+                honoured = dw > 0 and dw >= w * 0.9  # cameras actually delivered this mode
+            # ALWAYS release both handles before the next rung: holding two
+            # handles on the SAME device index at once (old rung + new rung) and
+            # releasing the old one tears down the shared DShow graph and wedges
+            # the survivor — both feeds then read False forever. So measure, then
+            # let go, and re-open the chosen mode ONCE, fresh, below.
+            ca.release(); cb.release()
+            if not opened:
                 continue
-            wa = int(ca.get(cv2.CAP_PROP_FRAME_WIDTH))
-            wb = int(cb.get(cv2.CAP_PROP_FRAME_WIDTH))
-            for _ in range(5):  # discard the first post-switch frames
-                ca.read(); cb.read()
-            fps = _measure_pair_fps([ca, cb])
-            honoured = wa >= w * 0.9 and wb >= w * 0.9
             if honoured and fps >= min_fps:
-                if last_opened is not None:
-                    last_opened[0].release(); last_opened[1].release()
-                print(f"🎥🎥 Dual capture: {wa}x{h} @ ~{fps:.0f}fps/cam "
-                      f"(shared-bus negotiated, no 1080p cap)")
-                log.info(f"dual capture negotiated {wa}x{h}@{fps:.1f}fps/cam")
-                return ca, cb, (wa, h), fps
-            if last_opened is not None:
-                last_opened[0].release(); last_opened[1].release()
-            last_opened = (ca, cb, wa, h, fps)
-        if last_opened is not None:
-            fa, fb, fw, fh, ffps = last_opened
-            print(f"⚠️  Dual capture: the shared USB bus can't sustain >= {min_fps:.0f}fps for "
-                  f"both cameras above {fw}x{fh} (~{ffps:.0f}fps). Using {fw}x{fh}.\n"
-                  f"    For higher resolution give each camera its OWN USB controller: plug them "
-                  f"into ports on different physical buses (e.g. one front + one rear header, a "
-                  f"USB PCIe/ExpressCard add-in card, or one on a USB-C / Thunderbolt port). A "
-                  f"powered USB3 hub does NOT help — it still shares one upstream bus.")
-            log.warning(f"dual capture bus-limited to {fw}x{fh}@{ffps:.1f}fps/cam")
-            return fa, fb, (fw, fh), ffps
-        return None
+                winner = (dw, dh, fps)
+                break
+            if honoured and fps < min_fps:
+                bus_limited = True  # this mode fits the cameras but starves the bus
+            last_meta = (dw or w, dh or h, fps)
+        if winner is not None:
+            fw, fh, ffps = winner
+            print(f"🎥🎥 Dual capture: {fw}x{fh} @ ~{ffps:.0f}fps/cam "
+                  f"(shared-bus negotiated, no 1080p cap)")
+            log.info(f"dual capture negotiated {fw}x{fh}@{ffps:.1f}fps/cam")
+        elif last_meta is not None:
+            fw, fh, ffps = last_meta
+            if bus_limited:
+                print(f"⚠️  Dual capture: the shared USB bus can't sustain >= {min_fps:.0f}fps for "
+                      f"both cameras at a higher mode (~{ffps:.0f}fps). Using {fw}x{fh}.\n"
+                      f"    For higher resolution give each camera its OWN USB controller: plug them "
+                      f"into ports on different physical buses (e.g. one front + one rear header, a "
+                      f"USB PCIe/ExpressCard add-in card, or one on a USB-C / Thunderbolt port). A "
+                      f"powered USB3 hub does NOT help — it still shares one upstream bus.")
+                log.warning(f"dual capture bus-limited to {fw}x{fh}@{ffps:.1f}fps/cam")
+            else:
+                print(f"🎥🎥 Dual capture: {fw}x{fh} @ ~{ffps:.0f}fps/cam (both cameras' max).")
+                log.info(f"dual capture at cameras' max {fw}x{fh}@{ffps:.1f}fps/cam")
+        else:
+            return None
+        # Re-open the chosen mode ONCE, fresh (one handle per device index).
+        ca = _open_camera_pinned(idx_a, fw, fh, dshow_only=True)
+        cb = _open_camera_pinned(idx_b, fw, fh, dshow_only=True)
+        if not (ca.isOpened() and cb.isOpened()):
+            ca.release(); cb.release()
+            return None
+        return ca, cb, (fw, fh), ffps
 
     def select_camera_interactively(detected_cameras, default_camera, force=False):
         """
@@ -3486,32 +3559,35 @@ def main():
             contexts[0].cap = cap
             cap2 = cv2.VideoCapture()  # closed → single-camera path below
         else:
-            # Both cameras open. Free the primary + probe handles, then negotiate
-            # the highest resolution the shared USB bus can sustain for BOTH at
-            # once (no 1080p cap — 4K is kept when the bus can carry it).
+            # Both cameras open. Build the SECOND engagement system FIRST, then
+            # open + negotiate the cameras LAST. Constructing a second
+            # MultiPersonEngagementSystem (YOLO on CUDA + MediaPipe graphs) while
+            # two DShow capture graphs sit open freezes BOTH feeds — they read
+            # fine right up to the model load, then every read returns False.
+            # So do all the heavy init while no camera is open, and start the
+            # read loop immediately after negotiation.
             cap2.release()
             cap.release()
+            system2 = MultiPersonEngagementSystem(
+                MODEL_PATH, device=args.device,
+                redis_host=args.redis_host, redis_port=args.redis_port)
+            system2.sequence_length = calculated_seq_length
             _neg = _negotiate_dual_capture(_cam_index, args.camera2)
             if _neg is not None:
                 cap, cap2, _dmode, _dfps = _neg
                 contexts[0].cap = cap  # CAM0 context was built with the old handle
+                # One merged crowd publish from the main loop instead of each
+                # camera racing to overwrite engagement_score.
+                system.publish_crowd = False
+                system2.publish_crowd = False
+                contexts.append(CameraContext(1, cap2, system2, name='CAM1'))
+                cam_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='cam')
+                print(f"🎥🎥 DUAL-CAMERA mode enabled (cam {args.camera2} as CAM1)")
             else:
                 print("⚠️  Could not bring both cameras up together — continuing single-camera.")
                 cap = _ensure_high_res_capture(_open_camera(_cam_index), _cam_index)
                 contexts[0].cap = cap
                 cap2 = cv2.VideoCapture()
-        if cap2.isOpened():
-            system2 = MultiPersonEngagementSystem(
-                MODEL_PATH, device=args.device,
-                redis_host=args.redis_host, redis_port=args.redis_port)
-            system2.sequence_length = calculated_seq_length
-            # One merged crowd publish from the main loop instead of each
-            # camera racing to overwrite engagement_score.
-            system.publish_crowd = False
-            system2.publish_crowd = False
-            contexts.append(CameraContext(1, cap2, system2, name='CAM1'))
-            cam_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='cam')
-            print(f"🎥🎥 DUAL-CAMERA mode enabled (cam {args.camera2} as CAM1)")
 
     # Name of the main display window. The window itself is created lazily on
     # the first imshow below (with WINDOW_NORMAL) so that any earlier OpenCV
@@ -3523,11 +3599,35 @@ def main():
     # second camera in a bandwidth-shared dual rig — often return empty on
     # their first reads, which would otherwise end the session with 0 frames.
     for c in contexts:
+        _wok = 0
+        _wfail = 0
         for _ in range(10):
             wr, wf = c.cap.read()
             if wr and wf is not None:
-                break
+                _wok += 1
+                if _wok >= 1:
+                    break
+            else:
+                _wfail += 1
             time.sleep(0.05)
+        log.info("warmup %s: opened=%s ok=%d fail=%d backend_handle=%s",
+                 c.name, c.cap.isOpened(), _wok, _wfail, c.cap.getBackendName())
+
+    # Verbose per-camera delivery probe: read each feed ~15x back-to-back and
+    # log unique-frame counts so a stalled camera (ok=True but frozen buffer) is
+    # visible in the log before the main loop starts.
+    for c in contexts:
+        _seen = set()
+        _reads = _okc = 0
+        for _ in range(15):
+            r, f = c.cap.read()
+            _reads += 1
+            if r and f is not None:
+                _okc += 1
+                _seen.add(hash(f[::17, ::17].tobytes()))
+            time.sleep(0.02)
+        log.info("delivery-probe %s: reads=%d ok=%d unique=%d (frozen=%s)",
+                 c.name, _reads, _okc, len(_seen), len(_seen) <= 1)
 
     _read_fail_since = None            # wall-clock of the first of a failure run
     LIVE_READ_GRACE_S = 5.0            # end the session only after this long with no frames
@@ -3611,6 +3711,15 @@ def main():
             if _read_fail_since is None:
                 _read_fail_since = now
                 print(f"\u26a0\ufe0f  {failed_cam or 'camera'} returned no frame — retrying...")
+                _fc = next((c for c in contexts if c.name == failed_cam), None)
+                if _fc is not None:
+                    log.warning("read-fail %s: opened=%s backend=%s — probing 5 reads",
+                                failed_cam, _fc.cap.isOpened(), _fc.cap.getBackendName())
+                    for _pi in range(5):
+                        _pr, _pf = _fc.cap.read()
+                        log.warning("  probe %d: ret=%s frame=%s", _pi, _pr,
+                                    None if _pf is None else _pf.shape)
+                        time.sleep(0.05)
             elif now - _read_fail_since > LIVE_READ_GRACE_S:
                 print(f"\u274c {failed_cam or 'camera'} delivered no frames for "
                       f"{LIVE_READ_GRACE_S:.0f}s — ending session. In dual mode this is "

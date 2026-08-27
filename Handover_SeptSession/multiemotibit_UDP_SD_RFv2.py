@@ -1383,8 +1383,8 @@ def main():
         if not args.no_discover:
             print("Looking for the Redis broker on the network (mDNS)...")
             try:
-                from redis_discovery import discover_redis_broker
-                found = discover_redis_broker(timeout=5.0)
+                from redis_discovery import resolve_redis_broker
+                found = resolve_redis_broker(timeout=6.0)
             except Exception as e:
                 print(f"   Discovery unavailable ({e}); falling back to localhost.")
         if found:
