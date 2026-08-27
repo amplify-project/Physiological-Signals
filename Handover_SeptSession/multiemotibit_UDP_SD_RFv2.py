@@ -1366,15 +1366,37 @@ def main():
     global REDIS_HOST, REDIS_PORT
     parser = argparse.ArgumentParser(
         description='EmotiBit UDP → Redis physiological publisher')
-    parser.add_argument('--redis-host', default=os.environ.get('REDIS_HOST', REDIS_HOST),
-                        help='Redis server host/IP (default: env REDIS_HOST or localhost). '
-                             'Set this to the hub machine when Redis runs on another device.')
+    parser.add_argument('--redis-host', default=os.environ.get('REDIS_HOST', 'auto'),
+                        help='Redis server host/IP. Default "auto" finds the broker over the '
+                             'network via mDNS (the advertiser must run on the hub, see '
+                             '1B_START_REDIS_ADVERTISER.bat), then falls back to localhost. '
+                             'Pass an explicit IP to skip discovery.')
     parser.add_argument('--redis-port', type=int,
                         default=int(os.environ.get('REDIS_PORT', REDIS_PORT)),
                         help='Redis server port (default: env REDIS_PORT or 6379).')
+    parser.add_argument('--no-discover', action='store_true',
+                        help='Disable mDNS auto-discovery; use localhost when no host is given.')
     args, _ = parser.parse_known_args()
-    REDIS_HOST = args.redis_host
     REDIS_PORT = args.redis_port
+    if args.redis_host == 'auto':
+        found = None
+        if not args.no_discover:
+            print("Looking for the Redis broker on the network (mDNS)...")
+            try:
+                from redis_discovery import discover_redis_broker
+                found = discover_redis_broker(timeout=5.0)
+            except Exception as e:
+                print(f"   Discovery unavailable ({e}); falling back to localhost.")
+        if found:
+            REDIS_HOST, REDIS_PORT = found
+            print(f"> Discovered Redis broker at {REDIS_HOST}:{REDIS_PORT}")
+        else:
+            REDIS_HOST = 'localhost'
+            if not args.no_discover:
+                print("> No advertised broker found; using localhost "
+                      "(pass --redis-host <ip> to target another device).")
+    else:
+        REDIS_HOST = args.redis_host
 
     setup_logging('emotibit', extra_context={
         'redis': f'{REDIS_HOST}:{REDIS_PORT}',

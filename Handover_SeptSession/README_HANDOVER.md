@@ -12,17 +12,18 @@ This is a **self-contained package**. No other repositories needed.
 ```
 handover_ar_v1/
 ├── SETUP.bat                        ← Run this ONCE on first install
-├── 1_START_REDIS.bat                ← Step 1: start Redis server
-├── 1B_START_REDIS_ADVERTISER.bat    ← Step 1b: advertise Redis to the AR glasses (auto-discovery)
-├── 2_START_EMOTIBIT.bat             ← Step 2: start EmotiBit publisher
-├── 3_START_ENGAGEMENT.bat           ← Step 3: start camera + AI inference
+├── 1_START_REDIS.bat                ← Step 1 (hub PC): start Redis + mDNS advertiser (one window each)
+├── 1B_START_REDIS_ADVERTISER.bat    ← Optional: run the advertiser on its own (1_START_REDIS already launches it)
+├── 2_START_EMOTIBIT.bat             ← Step 2: start EmotiBit publisher (auto-discovers the hub)
+├── 3_START_ENGAGEMENT.bat           ← Step 3: start camera + AI inference (auto-discovers the hub)
 ├── requirements.txt                 ← All Python deps, fully pinned
 │
 ├── live_multiperson_binary_v2.py    ← Main engagement inference + GUI
 ├── gaze_rules.py                    ← Gaze-first rules engine (focal point, performer detection)
 ├── botsort_gaze.yaml                ← Tuned BoT-SORT tracker config (stable IDs in crowds)
 ├── face_identifier.py               ← Face registration module
-├── redis_service_advertiser.py      ← mDNS/DNS-SD advertiser so glasses auto-find Redis (no IP typing)
+├── redis_service_advertiser.py      ← mDNS/DNS-SD advertiser so clients + glasses auto-find Redis (no IP typing)
+├── redis_discovery.py               ← Shared client-side mDNS browse helper (used by the publisher + GUI)
 ├── multiemotibit_UDP_SD_RFv2.py     ← EmotiBit SD metrics → Valence/Arousal → Redis (multi-device)
 ├── redis_subscriber_all_devices.py  ← CLI diagnostic: prints all Redis channels
 ├── test_subscriber.py               ← CLI diagnostic: prints engagement scores
@@ -93,27 +94,34 @@ This will:
 
 ## � Running Redis on a separate PC (Redis as the network hub)
 
-Redis is the comms hub and does **not** have to run on the same machine as the EmotiBit publisher and the engagement GUI. A common setup is a dedicated **broker PC** running Redis, with the physio + vision clients on another laptop on the **same LAN**.
+Redis is the comms hub and does **not** have to run on the same machine as the EmotiBit publisher and the engagement GUI. A common setup is a dedicated **broker PC** running Redis, with the physio + vision clients on another laptop on the **same LAN**. Thanks to **mDNS auto-discovery**, the clients find the hub automatically — no IP typing.
 
 **On the broker PC** (the one that runs Redis):
 
-1. Double-click **`1_START_REDIS.bat`**. The bundled `redis.windows.conf` already binds to all interfaces (`bind 0.0.0.0`) and ships with `protected-mode no` so LAN clients are accepted. *(This is safe only on a trusted, isolated venue/lab network — never expose port 6379 to the public internet. To lock it down, set `protected-mode yes` + a `requirepass` in the conf and pass the password from the clients.)*
-2. Note the broker PC's **LAN IP** (`ipconfig` → IPv4 Address, e.g. `192.168.1.50`).
-3. Allow inbound **TCP 6379** through Windows Firewall on the broker PC (first connection usually prompts; otherwise add a rule).
+1. Double-click **`1_START_REDIS.bat`**. It starts **two** things: Redis (main window) *and* the **mDNS advertiser** (its own "Redis Advertiser" window). The advertiser waits for Redis to answer PING, then announces this PC's LAN IP:6379 on the network (service `_amplify-redis._tcp.local.`) and re-announces if the address changes. The bundled `redis.windows.conf` binds all interfaces (`bind 0.0.0.0`) with `protected-mode no` so LAN clients are accepted. *(Safe only on a trusted, isolated venue/lab network — never expose port 6379 to the public internet. To lock it down, set `protected-mode yes` + a `requirepass` and pass the password from the clients.)*
+2. Allow inbound **TCP 6379** through Windows Firewall on the broker PC (first connection usually prompts; otherwise add a rule).
 
-**On this laptop** (EmotiBit publisher + engagement GUI) — pass the broker IP to every client with `--redis-host`:
+**On this laptop** (EmotiBit publisher + engagement GUI) — just run the launchers, **no IP needed**:
 
 ```powershell
-# EmotiBit physiological publisher
-.\2_START_EMOTIBIT.bat --redis-host 192.168.1.50
+.\2_START_EMOTIBIT.bat        # discovers the hub over mDNS
+.\3_START_ENGAGEMENT.bat      # discovers the hub over mDNS
+```
 
-# Engagement camera + GUI
+Each client defaults to `--redis-host auto`: it browses mDNS for ~5 s and prints e.g. `Discovered Redis broker at 192.168.1.50:6379`. **Resolution order:** explicit `--redis-host` → env `REDIS_HOST` → mDNS discovery → `localhost`. The engagement GUI's built-in EmotiBit **subscriber** follows the same resolved host, so the physio sidebar and the per-participant/crowd publishes all track the broker.
+
+**If mDNS is blocked** (some guest/enterprise Wi-Fi filter multicast or isolate clients) or you prefer a fixed target, pass the IP explicitly — this skips discovery:
+
+```powershell
+.\2_START_EMOTIBIT.bat --redis-host 192.168.1.50
 .\3_START_ENGAGEMENT.bat --redis-host 192.168.1.50
 ```
 
-Both `.bat` files forward extra arguments straight to their Python script, so `--redis-host` / `--redis-port` (default `6379`) work through them. The engagement GUI's built-in EmotiBit **subscriber** uses the same `--redis-host`, so the physio sidebar and the per-participant/crowd publishes all follow the broker. On startup each client prints the broker it connected to (the publisher prints `> Connected to Redis at 192.168.1.50:6379`); if it can't reach the broker it prints `!! Could not reach Redis at …` with a hint to pass `--redis-host <ip>` and open port 6379.
+Use `--no-discover` to force the localhost fallback without the ~5 s browse. Both `.bat` files forward extra arguments straight to their Python script. On startup the publisher prints the broker it connected to (`> Connected to Redis at HOST:PORT`), or `!! Could not reach Redis at …` with a hint if it can't.
 
-> The AR-glasses **auto-discovery** advertiser (`1B_START_REDIS_ADVERTISER.bat`) also takes `--redis-host` for its health check and `--advertise-address` to announce the broker's LAN IP — run it on (or pointed at) the broker PC so the glasses find the right machine.
+> **Venue tip:** for maximum reliability give the hub PC a **DHCP reservation** (fixed IP) on the router and/or run on a dedicated router/AP — public/guest Wi-Fi with *AP client isolation* blocks all peer traffic (including Redis itself), which no discovery method can work around.
+
+> `1B_START_REDIS_ADVERTISER.bat` still exists to run the advertiser **on its own** (e.g. if you start Redis a different way); `1_START_REDIS.bat` already launches it, so you normally don't need 1B. The advertiser also takes `--advertise-address <ip>` to force a specific interface.
 
 ---
 
@@ -272,7 +280,7 @@ A 1080p/80° webcam yields ~24 px faces at 7 m: reliable *detection* + tracked i
 
 ## �📡 Redis Channels — What Gets Published
 
-All AR data flows over Redis pub/sub. By default the broker is `localhost:6379`; point every client at a networked broker with `--redis-host <IP>` (see *Running Redis on a separate PC* above). Channel names and payloads are identical wherever the broker runs.
+All AR data flows over Redis pub/sub. By default the broker is auto-discovered over mDNS (falling back to `localhost:6379`); point every client at a specific broker with `--redis-host <IP>` (see *Running Redis on a separate PC* above). Channel names and payloads are identical wherever the broker runs.
 
 ### Engagement (Vision system)
 

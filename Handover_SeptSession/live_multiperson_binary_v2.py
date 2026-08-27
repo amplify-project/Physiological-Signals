@@ -2407,10 +2407,16 @@ def main():
                         help='Simulate a fixed sensor budget: the first N tracked people '
                              'become the registered set for the whole session; everyone '
                              'else is an unscored bystander. (Concert: 8 EmotiBits.)')
-    parser.add_argument('--redis-host', type=str, default=DEFAULT_REDIS_HOST,
-                        help=f'Redis server host/IP address (default: {DEFAULT_REDIS_HOST})')
+    parser.add_argument('--redis-host', type=str,
+                        default=os.environ.get('REDIS_HOST', 'auto'),
+                        help='Redis server host/IP. Default "auto" finds the broker over the '
+                             'network via mDNS (hub must run 1_START_REDIS.bat, which also '
+                             'advertises), then falls back to localhost. Pass an explicit IP '
+                             'to skip discovery.')
     parser.add_argument('--redis-port', type=int, default=DEFAULT_REDIS_PORT,
                         help=f'Redis server port (default: {DEFAULT_REDIS_PORT})')
+    parser.add_argument('--no-discover', action='store_true',
+                        help='Disable mDNS auto-discovery; use localhost when no host is given.')
     parser.add_argument('--device', type=str, default='auto', 
                         choices=['auto', 'cuda', 'mps', 'cpu'],
                         help='Device for inference: auto (best available), cuda (NVIDIA), mps (Apple Silicon), cpu')
@@ -2429,6 +2435,27 @@ def main():
                         help='Disable facial identification (skip FaceIdentifier loading)')
     args = parser.parse_args()
     
+    # Resolve the Redis broker: explicit host wins; "auto" discovers the hub
+    # over mDNS (advertiser runs alongside Redis on the hub) then falls back to
+    # localhost, so a networked broker needs no hardcoded IP.
+    if args.redis_host == 'auto':
+        found = None
+        if not args.no_discover:
+            print("🔎 Looking for the Redis broker on the network (mDNS)...")
+            try:
+                from redis_discovery import discover_redis_broker
+                found = discover_redis_broker(timeout=5.0)
+            except Exception as e:
+                print(f"   Discovery unavailable ({e}); falling back to localhost.")
+        if found:
+            args.redis_host, args.redis_port = found
+            print(f"✅ Discovered Redis broker at {args.redis_host}:{args.redis_port}")
+        else:
+            args.redis_host = 'localhost'
+            if not args.no_discover:
+                print("ℹ️  No advertised broker found; using localhost "
+                      "(pass --redis-host <ip> to target another device).")
+
     # Detect platform and device
     platform_info = get_platform_info()
     actual_device = get_best_device() if args.device == 'auto' else args.device
