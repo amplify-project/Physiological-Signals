@@ -12,6 +12,7 @@
 # ===============================================================
 
 import atexit
+import argparse
 import csv
 import queue
 import time, threading, json
@@ -1357,6 +1358,24 @@ def _ensure_firewall_rules():
 
 # ----------------------------- MAIN -----------------------------
 def main():
+    # Redis is the comms hub: it may live on this machine or on a different
+    # device (e.g. the AR/engagement laptop). Resolve the target from CLI flags,
+    # then environment variables, then the localhost defaults — and write the
+    # result back to the module globals so every connection and the log context
+    # below use the same host/port.
+    global REDIS_HOST, REDIS_PORT
+    parser = argparse.ArgumentParser(
+        description='EmotiBit UDP → Redis physiological publisher')
+    parser.add_argument('--redis-host', default=os.environ.get('REDIS_HOST', REDIS_HOST),
+                        help='Redis server host/IP (default: env REDIS_HOST or localhost). '
+                             'Set this to the hub machine when Redis runs on another device.')
+    parser.add_argument('--redis-port', type=int,
+                        default=int(os.environ.get('REDIS_PORT', REDIS_PORT)),
+                        help='Redis server port (default: env REDIS_PORT or 6379).')
+    args, _ = parser.parse_known_args()
+    REDIS_HOST = args.redis_host
+    REDIS_PORT = args.redis_port
+
     setup_logging('emotibit', extra_context={
         'redis': f'{REDIS_HOST}:{REDIS_PORT}',
         'window_seconds': str(WINDOW_SECONDS),
@@ -1383,6 +1402,12 @@ def main():
     print("> Models loaded successfully")
 
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+    try:
+        r.ping()
+        print(f"> Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+    except Exception as e:
+        print(f"!! Could not reach Redis at {REDIS_HOST}:{REDIS_PORT}: {e}")
+        print("   If Redis runs on another device, pass --redis-host <ip> (and open port 6379).")
 
     # ---- NETWORK SOCKETS ----
     # NOTE: no SO_REUSEADDR on the UDP sockets. UDP has no TIME_WAIT so it is

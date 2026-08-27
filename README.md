@@ -2,6 +2,13 @@
 
 Real-time audience engagement estimation for live performances using pose-based machine learning and EmotiBit physiological signal processing.
 
+> **Release V3.2 — Fused Dual-Camera Scoring & Networked Redis (2026-11):**
+> *(landed in the `Handover_SeptSession/` reference build)*
+> - **One fused engagement score per person across both cameras** — in dual-camera mode a registered person seen on both feeds previously got a value that flipped between the two independent pipelines. Sightings are now merged by EmotiBit serial into a **single reliability-weighted, temporally-smoothed score** (fuller buffer + more confident identity weigh more), shown identically on both overlays and published once on `device:{serial}:engagement`.
+> - **Redis as a true network hub** — the EmotiBit publisher (`multiemotibit_UDP_SD_RFv2.py`) now accepts `--redis-host` / `--redis-port` (with `REDIS_HOST` / `REDIS_PORT` env fallbacks) and the `2_START_EMOTIBIT.bat` launcher forwards them, so physio + engagement clients on one laptop can target a Redis broker on a different PC. The bundled `redis.windows.conf` ships `protected-mode no` (trusted-LAN only) so remote clients are accepted. Each client prints the broker it connected to.
+> - **Bandwidth-aware dual-camera resolution (4K-capable, not 1080p-capped)** — two USB cameras on one bus are opened together, their **concurrent** frame rate measured, and the highest sustainable mode kept (4K → 1440p → 1080p → 720p). If the shared bus can't sustain it, the app steps down and advises putting each camera on its **own USB controller** (powered hubs don't help).
+> - **Scalable overlay** — the physio sidebar lays out in 1–3 columns for 11+ wearers and overlay fonts scale with capture resolution so labels stay legible at 4K.
+
 > **Release V3.1 — Individual Engagement Channels (2026-08):**
 > *(landed in the `Handover_JulySession/` reference build)*
 > - **Per-participant engagement over Redis** — in addition to the crowd average (`engagement_score`), each registered participant's engagement is now published on its own `device:{serial}:engagement` channel, keyed by the **same EmotiBit serial** the physio publisher uses, so an AR client can pattern-subscribe `device:*:engagement` and merge each person's engagement with their HR/EDA/valence/arousal. Payload carries a `confirmed` flag (positive face ID = green vs appearance-inferred guess = red) plus a numeric `confidence`.

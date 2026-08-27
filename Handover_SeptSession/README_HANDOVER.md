@@ -91,7 +91,33 @@ This will:
 
 ---
 
-## 🎮 Using the Engagement GUI
+## � Running Redis on a separate PC (Redis as the network hub)
+
+Redis is the comms hub and does **not** have to run on the same machine as the EmotiBit publisher and the engagement GUI. A common setup is a dedicated **broker PC** running Redis, with the physio + vision clients on another laptop on the **same LAN**.
+
+**On the broker PC** (the one that runs Redis):
+
+1. Double-click **`1_START_REDIS.bat`**. The bundled `redis.windows.conf` already binds to all interfaces (`bind 0.0.0.0`) and ships with `protected-mode no` so LAN clients are accepted. *(This is safe only on a trusted, isolated venue/lab network — never expose port 6379 to the public internet. To lock it down, set `protected-mode yes` + a `requirepass` in the conf and pass the password from the clients.)*
+2. Note the broker PC's **LAN IP** (`ipconfig` → IPv4 Address, e.g. `192.168.1.50`).
+3. Allow inbound **TCP 6379** through Windows Firewall on the broker PC (first connection usually prompts; otherwise add a rule).
+
+**On this laptop** (EmotiBit publisher + engagement GUI) — pass the broker IP to every client with `--redis-host`:
+
+```powershell
+# EmotiBit physiological publisher
+.\2_START_EMOTIBIT.bat --redis-host 192.168.1.50
+
+# Engagement camera + GUI
+.\3_START_ENGAGEMENT.bat --redis-host 192.168.1.50
+```
+
+Both `.bat` files forward extra arguments straight to their Python script, so `--redis-host` / `--redis-port` (default `6379`) work through them. The engagement GUI's built-in EmotiBit **subscriber** uses the same `--redis-host`, so the physio sidebar and the per-participant/crowd publishes all follow the broker. On startup each client prints the broker it connected to (the publisher prints `> Connected to Redis at 192.168.1.50:6379`); if it can't reach the broker it prints `!! Could not reach Redis at …` with a hint to pass `--redis-host <ip>` and open port 6379.
+
+> The AR-glasses **auto-discovery** advertiser (`1B_START_REDIS_ADVERTISER.bat`) also takes `--redis-host` for its health check and `--advertise-address` to announce the broker's LAN IP — run it on (or pointed at) the broker PC so the glasses find the right machine.
+
+---
+
+## �🎮 Using the Engagement GUI
 
 The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera view with a sidebar:
 
@@ -101,7 +127,7 @@ The main engagement window (`3_START_ENGAGEMENT.bat`) opens an OpenCV camera vie
 - **Gaze rays** — thin lines from each audience member's head toward where they are looking, projected to the crowd's shared focal point. Performers never get a ray, and rays are clipped at performer boxes.
 - The **HUD** shows the gaze engine state: `Gaze: PRE-SHOW` (no shared focal point yet — pure action-model scoring) or `Gaze: LIVE perf:N` (focal point locked, N performers detected). `SHIFT!` flags a synchronized crowd gaze shift (e.g. a door opening).
 - A small **cyan dot** in the top-right of a bounding box means that person received fresh MediaPipe extraction this frame (the rest reuse their last score). When the system is throttling under crowd load the HUD shows e.g. `MP: 1/3 rr2`.
-- **Sidebar** shows one row per enrolled person with their EmotiBit serial. Each row has:
+- **Sidebar** shows one row per enrolled person with their EmotiBit serial. The panel lays out in **1–3 columns** so up to ~12 wearers (e.g. 11+ infant/parent pairs) stay legible at once. Each row has:
   - **Header readouts** — three small colour-coded values right-aligned next to the serial: `HR ±z.zz`, `EDA ±z.zz`, `TEMP ±z.zz`. Values are per-wearer session z-scores (deviation from this wearer's own running mean, in their own SD units). When `|z| ≥ 2` the readout switches to bold with a faint coloured pill behind it.
   - **Unified physio panel** — single rolling spline plot on a fixed ±3 SD axis with reference lines at 0 and ±2 SD. Three traces share the panel: HR (green), EDA (yellow / cyan), TEMP (magenta). Each segment darkens and thickens past `|z| = 2` and the latest sample is marked with a small dot (plus a white halo when in the alert band). Window is the most recent **10 seconds** — older points scroll off the left.
   - **Calibration** — for the first ~2 s after a wearer is assigned the panel shows `calibrating Ns` while the Welford baseline reaches its minimum sample floor; no splines are drawn yet. Plotting then begins almost immediately and the baseline keeps **expanding** (converging over ~60 s, then frozen at a 60 s cap) so early z-scores refine as more samples arrive.
@@ -137,12 +163,13 @@ A single machine can drive **two cameras** to cover a wide or U-shaped audience 
 How it works:
 
 - Each camera runs its **own** full pipeline (tracker, MediaPipe, action model, face-ID) in a **worker thread**, so per-camera track ids never collide and the two feeds process concurrently to recover frame rate.
-- People are **merged by EmotiBit serial**: the same enrolled parent seen on both cameras (e.g. straddling the seam) is published **once**, keeping the higher-confidence/larger-face sighting. Un-enrolled bystanders are not de-duplicated but also don't contribute to the crowd score.
+- People are **merged by EmotiBit serial**, and a registered person seen on **both** feeds gets **one fused engagement score**, not two. Each camera scores that person independently (separate trackers/buffers), so the two raw scores differ; the merge combines every scored sighting of a serial into a single reliability-weighted value (a fuller temporal buffer and a more confident identity count for more) and smooths it frame-to-frame. That **one** score is shown identically on **both** overlays and published once — no more a value that flips between the two feeds. Un-enrolled bystanders are not de-duplicated but also don't contribute to the crowd score.
 - The GUI shows both feeds **side-by-side** with the shared physio sidebar; a **single merged crowd average** is published to `engagement_score` and per-participant channels are published once per serial.
+- **Resolution is negotiated against the shared USB bus, not capped at 1080p.** Two USB cameras on one controller share bandwidth, so the app opens both, measures their **concurrent** frame rate, and keeps the highest mode (4K → 1440p → 1080p → 720p) the pair can sustain — 4K stays on a fast USB3 bus. If the bus can't sustain a higher mode it steps down and prints a warning recommending you give each camera its **own USB controller** (see performance note below). Watch the startup line `🎥🎥 Dual capture: WxH @ ~Nfps/cam`.
 - **2D only** — dual mode is not available for 360° cameras. Position the two cameras to cover each half of the audience with **minimal overlap**.
 - Enroll each face on whichever camera sees it: press **`V`** to switch the active enrollment feed, then **`R`** / **`SPACE`** as usual. An enrollment done on one camera is recognised on the other (the face repo is shared).
 
-> **Performance:** two pipelines on one PC roughly share one GPU + the CPU MediaPipe budget, so expect a lower per-camera frame rate than single-camera. For post-hoc analysis resolution matters more than frame rate; a frame-skip option can be added later if needed.
+> **Performance & USB bandwidth:** two pipelines on one PC roughly share one GPU + the CPU MediaPipe budget, so expect a lower per-camera frame rate than single-camera. For **capture resolution**, the limiter is usually the **USB bus**: two cameras on the same controller share it, and two 4K MJPG streams will starve each other. To run both at high resolution, give each camera its **own USB controller** — plug them into ports on **different physical buses** (e.g. one front-header + one rear port, a **USB PCIe/ExpressCard add-in card**, or one on a **USB-C / Thunderbolt** port). A *powered hub does not help* — it still shares one upstream bus. For post-hoc analysis resolution matters more than frame rate; a frame-skip option can be added later if needed.
 
 ### EmotiBit device discovery (Window 2)
 
@@ -245,7 +272,7 @@ A 1080p/80° webcam yields ~24 px faces at 7 m: reliable *detection* + tracked i
 
 ## �📡 Redis Channels — What Gets Published
 
-All AR data flows over Redis pub/sub on `localhost:6379`.
+All AR data flows over Redis pub/sub. By default the broker is `localhost:6379`; point every client at a networked broker with `--redis-host <IP>` (see *Running Redis on a separate PC* above). Channel names and payloads are identical wherever the broker runs.
 
 ### Engagement (Vision system)
 

@@ -60,6 +60,15 @@ def _silence_native_stderr():
     """Redirect OS fd 2 to devnull (call right before MediaPipe init)."""
     os.dup2(_devnull, 2)
 
+def _restore_native_stderr():
+    """Point OS fd 2 back at the real stderr. Safe to call repeatedly and even
+    after the saved fd is closed, so the crash handler can un-hide a traceback
+    when the app dies while stderr is still silenced."""
+    try:
+        os.dup2(_stderr_fd, 2)
+    except OSError:
+        pass
+
 import cv2
 if not hasattr(cv2, 'VideoCapture'):
     print("ERROR: cv2 imported but is non-functional (opencv-python may be broken).")
@@ -920,7 +929,7 @@ class MultiPersonEngagementSystem:
         
         # 3. Initialize MediaPipe Holistic
         print("Initializing MediaPipe...")
-        _silence_native_stderr()  # MediaPipe C++ init spams fd 2; restored after first frame
+        _silence_native_stderr()  # MediaPipe C++ constructor spams fd 2
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
             # static_image_mode=True: process() runs on DIFFERENT people's
@@ -933,6 +942,10 @@ class MultiPersonEngagementSystem:
             refine_face_landmarks=True,
             min_detection_confidence=0.5
         )
+        # Restore stderr straight after the noisy constructor so later startup
+        # errors (camera probing, checkpoint load, first inference) are NOT
+        # swallowed and mistaken for a silent exit.
+        _restore_native_stderr()
         
         # 4. Load Engagement Model
         print(f"Loading Engagement Model from {model_path}...")
@@ -1671,9 +1684,11 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             + [(s, False) for s in unassigned])
     n = len(rows)
 
-    # Two-column layout once more than 4 wearers connect (up to 8 infant/parent
-    # combos). The image widens to sidebar_w * cols so each panel stays legible.
-    cols = 2 if n > 4 else 1
+    # Column layout scales with wearer count so up to ~12 EmotiBits stay
+    # legible: 1 col ≤4, 2 cols ≤8, 3 cols beyond (concerts can run 11+ infant/
+    # parent pairs). The image widens to sidebar_w * cols so each panel keeps
+    # its width.
+    cols = 3 if n > 8 else (2 if n > 4 else 1)
     total_w = sidebar_w * cols
     sidebar = np.full((h, total_w, 3), 28, dtype=np.uint8)
     cv2.putText(sidebar, "EmotiBit", (8, 20),
@@ -1710,11 +1725,11 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         _draw_reconnect_button()
         return sidebar
 
-    # Two-column layout: rows_per_col / row height derive from cols decided above.
+    # Column layout: rows_per_col / row height derive from cols decided above.
     col_w = sidebar_w
     rows_per_col = (n + cols - 1) // cols
     available_h = h - 28 - (_BTN_H + 2 * _BTN_M)
-    row_h = max(60, min(140, available_h // max(rows_per_col, 1)))
+    row_h = max(52, min(140, available_h // max(rows_per_col, 1)))
     for i, (serial, is_enrolled) in enumerate(rows):
         col = i // rows_per_col
         row_in_col = i % rows_per_col
@@ -1961,18 +1976,32 @@ class CameraContext:
         self.crowd_avg = None
 
 
-def merge_people_by_serial(context_people):
-    """Merge people lists from all cameras, de-duplicated by EmotiBit serial.
+def merge_people_by_serial(context_people, fused_scores=None, ema_alpha=0.5):
+    """Merge people lists from all cameras, de-duplicated by EmotiBit serial,
+    and FUSE each participant's engagement into ONE canonical score.
 
-    The same participant may appear on both feeds in the small overlap seam.
-    Identity is the EmotiBit serial (globally unique), so we keep the single
-    best sighting per serial — a confirmed face outranks an inferred guess, and
-    within a class the larger face / higher confidence wins. Unidentified people
-    are kept as-is (they never collide across cameras and are not published).
+    The same participant may appear on both feeds. Each camera runs its own
+    tracker, temporal buffer and transformer pass, so it produces an
+    INDEPENDENT engagement score for that person. Picking one feed's raw score
+    (the old behaviour) makes the published/displayed value jump between feeds
+    as the "winner" flips frame to frame. Instead we combine every scored
+    sighting of a serial into a single reliability-weighted score — a fuller
+    temporal buffer and a more confident identity count for more — then
+    EMA-smooth it against the previous frame in ``fused_scores``. The result:
+    one registered person yields exactly one stable engagement score, shown
+    identically on both overlays and published once to Redis.
 
-    Returns (merged_people, crowd_average).
+    Identity metadata (bbox, face size, confidence) still comes from the single
+    best sighting so the highlight/label track the clearest view. Unidentified
+    people are kept as-is (they never collide across cameras, not published).
+
+    Returns (merged_people, crowd_average). Mutates ``fused_scores`` in place
+    and rewrites the winning person dict's 'score' to the fused value.
     """
+    if fused_scores is None:
+        fused_scores = {}
     best_by_serial = {}
+    sightings_by_serial = {}
     unidentified = []
 
     def _rank(p):
@@ -1989,12 +2018,34 @@ def merge_people_by_serial(context_people):
             cur = best_by_serial.get(serial)
             if cur is None or _rank(p) > _rank(cur):
                 best_by_serial[serial] = p
+            if p.get('scored'):
+                sightings_by_serial.setdefault(serial, []).append(p)
+
+    # Fuse each serial's scored sightings into one canonical, smoothed score and
+    # stamp it onto that serial's representative dict (used for publishing).
+    for serial, rep in best_by_serial.items():
+        sightings = sightings_by_serial.get(serial)
+        if not sightings:
+            continue  # nobody scorable this frame → keep the prior fused value
+        w_sum = 0.0
+        s_sum = 0.0
+        for p in sightings:
+            w = (max(0.05, float(p.get('buffer_fill', 1.0) or 0.0))
+                 * max(0.1, float(p.get('id_confidence') or 0.0)))
+            s_sum += w * float(p['score'])
+            w_sum += w
+        new_score = s_sum / w_sum if w_sum > 0 else float(rep['score'])
+        prev = fused_scores.get(serial)
+        fused = new_score if prev is None else ema_alpha * new_score + (1.0 - ema_alpha) * prev
+        fused_scores[serial] = fused
+        rep['score'] = fused
+        rep['scored'] = True
 
     merged = list(best_by_serial.values()) + unidentified
 
-    # Crowd average over unique scored participants (each person once, so a
-    # seam duplicate can't drag or inflate the average).
-    scored = [p['score'] for p in best_by_serial.values() if p.get('scored')]
+    # Crowd average over the unique fused per-serial scores (each person once,
+    # so a seam duplicate can't drag or inflate the average).
+    scored = [fused_scores[s] for s in best_by_serial if s in sightings_by_serial]
     # Also count unidentified scored people (only relevant when face ID is off).
     scored += [p['score'] for p in unidentified if p.get('scored')]
     crowd_average = (sum(scored) / len(scored)) if scored else None
@@ -2017,13 +2068,20 @@ ENROLL_POSES = ['front', 'left', 'right']  # guided 3-pose capture order
 
 
 def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
-                         enroll_session, args, is_360=False):
+                         enroll_session, args, is_360=False, fused_scores=None):
     """Run one camera's full 2D pipeline and draw its overlays onto its own
     frame. All per-camera state lives on ``ctx`` so two contexts can run in
     parallel worker threads. The only shared resource touched is ``face_id``
     (read-only match), guarded by ``face_id_lock``. Publishing, the crowd bar,
     the physio sidebar, the window and key handling stay on the main thread and
     run once on the merged result.
+
+    ``fused_scores`` (serial -> smoothed cross-camera engagement) is the shared
+    dual-camera fusion state from the previous frame. When a drawn person is
+    identified as a serial that already has a fused value, that value is shown
+    (and colours the box) instead of this camera's local score, so a person in
+    both feeds reads the SAME engagement number on both overlays. Empty/None in
+    single-camera mode, where the local score is already the only score.
 
     Returns (display_frame, people_data, crowd_avg) and also stashes them on
     ``ctx`` for the caller.
@@ -2249,6 +2307,12 @@ def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
 
     # ---- Draw gaze rays + person boxes (2D only) ----
     if not is_360:
+        # Scale overlay text/line weight with capture resolution so labels stay
+        # legible at 1080p/4K (a fixed 0.5 scale is unreadable once a 4K feed is
+        # shrunk into the window). Baselined at 720p.
+        _fs = max(0.5, display_frame.shape[0] / 720.0)
+        _ft = max(1, int(round(_fs)))
+        _yo = int(10 * _fs)
         _gres = system.last_gaze_result
         if _gres is not None:
             _perf_boxes = [p['bbox'] for p in people_data if p.get('performer')]
@@ -2264,6 +2328,11 @@ def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
             identified = person.get('identified_as')
             if person.get('performer'):
                 continue
+            # Dual-camera: show the ONE fused engagement for this serial so the
+            # same person reads identically on both feeds (falls back to the
+            # local score in single-camera mode or before the first fusion).
+            if fused_scores and identified in fused_scores:
+                score = fused_scores[identified]
             if system.registered_only and not identified and int(pid) not in system.registered_ids:
                 continue
             fresh_mp = person.get('keypoints') is not None
@@ -2274,16 +2343,16 @@ def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
             show_highlight = (identified and focus_target == identified)
             if show_highlight:
                 color = IDENTIFIED_COLOR
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 3)
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, _ft + 2)
                 _sid = _short_identity(identified)
                 if person.get('id_source') == 'inferred':
                     _sid = f"~{_sid}?"
                 name_label = f"{_sid} {score:.0%}{gaze_tag}{face_tag}"
-                cv2.putText(display_frame, name_label, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(display_frame, name_label, (x1, y1 - _yo),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6 * _fs, color, _ft + 1)
             else:
                 color = (0, int(255 * score), int(255 * (1-score)))
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, _ft + 1)
                 if identified:
                     _sid = _short_identity(identified)
                     id_str = f"~{_sid}?" if person.get('id_source') == 'inferred' else _sid
@@ -2291,18 +2360,18 @@ def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
                     id_str = system.display_label(pid)
                 if bf < 0.9:
                     label = f"{id_str} {score:.0%}{gaze_tag}{face_tag} conf:{bf:.0%}"
-                    cv2.putText(display_frame, label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.putText(display_frame, label, (x1, y1 - _yo),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * _fs, color, _ft)
                     bar_w_px = x2 - x1
                     bar_y_top = y2 + 2
-                    bar_y_bot = y2 + 6
+                    bar_y_bot = y2 + 2 + 4 * _ft
                     cv2.rectangle(display_frame, (x1, bar_y_top), (x2, bar_y_bot), (50, 50, 50), -1)
                     cv2.rectangle(display_frame, (x1, bar_y_top), (x1 + int(bar_w_px * bf), bar_y_bot), (255, 200, 0), -1)
                 else:
-                    cv2.putText(display_frame, f"{id_str} {score:.0%}{gaze_tag}{face_tag}", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.putText(display_frame, f"{id_str} {score:.0%}{gaze_tag}{face_tag}", (x1, y1 - _yo),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * _fs, color, _ft)
             if fresh_mp:
-                cv2.circle(display_frame, (x2 - 5, y1 + 5), 3, (0, 255, 255), -1)
+                cv2.circle(display_frame, (x2 - 5, y1 + 5), 2 * _ft, (0, 255, 255), -1)
 
     ctx.display_frame = display_frame
     ctx.people_data = people_data
@@ -2634,10 +2703,45 @@ def main():
                 # No fallback requested — return a closed capture
                 return cv2.VideoCapture()
             else:
+                # DSHOW couldn't open this index at all — some cameras only
+                # enumerate on MSMF, so fall back before giving up.
                 c.release()
+                if try_msmf_fallback:
+                    m = cv2.VideoCapture(index)  # MSMF
+                    if m.isOpened():
+                        return m
+                    m.release()
                 return cv2.VideoCapture()  # closed cap — no camera at this index
         # Non-Windows: default backend
         return cv2.VideoCapture(index)
+
+    def _open_camera_pinned(index, target_w, target_h):
+        """Open one specific camera index at target MJPG resolution WITHOUT the
+        cross-index MSMF scan _ensure_high_res_capture performs. Dual mode needs
+        each feed pinned to its own device — otherwise both cameras' scans pick
+        the same 'best' index and one panel just mirrors the other. Tries DSHOW
+        then MSMF on the SAME index; accepts any real (even dim) frame so a dark
+        venue camera isn't rejected. Returns a closed capture if none stream."""
+        backends = ((cv2.CAP_DSHOW, cv2.CAP_MSMF)
+                    if platform.system() == 'Windows' else (None,))
+        for backend in backends:
+            c = cv2.VideoCapture(index, backend) if backend is not None else cv2.VideoCapture(index)
+            if not c.isOpened():
+                c.release()
+                continue
+            c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+            # A camera on a contended USB bus routinely drops its first few reads
+            # after a mode switch; retry briefly before rejecting the index so a
+            # slow-to-wake second camera isn't misreported as absent.
+            for _ in range(8):
+                ret, frame = c.read()
+                if ret and frame is not None:
+                    return c
+                time.sleep(0.03)
+            c.release()
+        return cv2.VideoCapture()  # closed — nothing streams at this index
 
     def _ensure_high_res_capture(cap, index, target_w=None, target_h=None):
         """Renegotiate the live camera to its highest usable resolution.
@@ -2772,6 +2876,66 @@ def main():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w if not auto else 7680)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h if not auto else 4320)
         return cap
+
+    def _measure_pair_fps(caps, secs=0.8):
+        """Read every cap in lockstep and return the MIN sustained fps across
+        them. Shared-USB-bus starvation only shows when both cameras stream at
+        once, so the pair must be measured together, not one at a time."""
+        counts = [0] * len(caps)
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            for i, c in enumerate(caps):
+                if c.read()[0]:
+                    counts[i] += 1
+        dt = max(1e-3, time.time() - t0)
+        return min(counts) / dt
+
+    def _negotiate_dual_capture(idx_a, idx_b, min_fps=10.0):
+        """Pick the HIGHEST resolution both cameras can stream simultaneously.
+
+        Two USB cameras on one controller share the bus, so a mode each can do
+        alone (e.g. 4K) can starve to ~0 fps when run together. We walk a shared
+        ladder from 4K down, open both feeds pinned to their own index (no
+        cross-index scan, so neither mirrors the other), warm up, and measure the
+        pair's concurrent fps. The first (highest) rung the pair sustains at
+        >= min_fps wins — there is NO 1080p cap, so a fast PC on a USB3 bus keeps
+        4K while a bandwidth-starved USB2 bus steps down and warns. Returns
+        (cap_a, cap_b, (w, h), fps) or None if the pair never opens."""
+        ladder = [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)]
+        last_opened = None  # lowest rung that at least opened, as a last resort
+        for w, h in ladder:
+            ca = _open_camera_pinned(idx_a, w, h)
+            cb = _open_camera_pinned(idx_b, w, h)
+            if not (ca.isOpened() and cb.isOpened()):
+                ca.release(); cb.release()
+                continue
+            wa = int(ca.get(cv2.CAP_PROP_FRAME_WIDTH))
+            wb = int(cb.get(cv2.CAP_PROP_FRAME_WIDTH))
+            for _ in range(5):  # discard the first post-switch frames
+                ca.read(); cb.read()
+            fps = _measure_pair_fps([ca, cb])
+            honoured = wa >= w * 0.9 and wb >= w * 0.9
+            if honoured and fps >= min_fps:
+                if last_opened is not None:
+                    last_opened[0].release(); last_opened[1].release()
+                print(f"🎥🎥 Dual capture: {wa}x{h} @ ~{fps:.0f}fps/cam "
+                      f"(shared-bus negotiated, no 1080p cap)")
+                log.info(f"dual capture negotiated {wa}x{h}@{fps:.1f}fps/cam")
+                return ca, cb, (wa, h), fps
+            if last_opened is not None:
+                last_opened[0].release(); last_opened[1].release()
+            last_opened = (ca, cb, wa, h, fps)
+        if last_opened is not None:
+            fa, fb, fw, fh, ffps = last_opened
+            print(f"⚠️  Dual capture: the shared USB bus can't sustain >= {min_fps:.0f}fps for "
+                  f"both cameras above {fw}x{fh} (~{ffps:.0f}fps). Using {fw}x{fh}.\n"
+                  f"    For higher resolution give each camera its OWN USB controller: plug them "
+                  f"into ports on different physical buses (e.g. one front + one rear header, a "
+                  f"USB PCIe/ExpressCard add-in card, or one on a USB-C / Thunderbolt port). A "
+                  f"powered USB3 hub does NOT help — it still shares one upstream bus.")
+            log.warning(f"dual capture bus-limited to {fw}x{fh}@{ffps:.1f}fps/cam")
+            return fa, fb, (fw, fh), ffps
+        return None
 
     def select_camera_interactively(detected_cameras, default_camera, force=False):
         """
@@ -3119,7 +3283,18 @@ def main():
     # VIDEO FORMAT DETECTION (2D vs 360°)
     # =========================================================================
     if not args.video and _cam_index is not None:
-        cap = _ensure_high_res_capture(cap, _cam_index)
+        if args.camera2 is not None:
+            # Dual mode: just grab a frame for format detection here. The real
+            # capture resolution is negotiated later against the shared USB bus,
+            # once both camera indices are known (see _negotiate_dual_capture),
+            # so 4K is kept when the bus can carry it. Pin to this exact index
+            # (no cross-index MSMF scan) so the two feeds can't converge on the
+            # same physical camera.
+            cap.release()
+            _pinned = _open_camera_pinned(_cam_index, 1280, 720)
+            cap = _pinned if _pinned.isOpened() else _open_camera(_cam_index)
+        else:
+            cap = _ensure_high_res_capture(cap, _cam_index)
     ret, first_frame = cap.read()
     if not ret:
         print("❌ Error: Could not read first frame")
@@ -3244,9 +3419,6 @@ def main():
     if args.camera2 is not None and not is_360:
         print("Press 'v' to switch which camera the next enrollment targets.")
     
-    # Restore OS stderr after first MediaPipe inference triggers C++ init warnings
-    _stderr_restored = False
-    
     # Live FPS tracking
     fps_frame_times = deque(maxlen=30)  # Rolling window for FPS calculation
     last_frame_time = time.time()
@@ -3261,7 +3433,6 @@ def main():
     # tracker/MediaPipe/face-caches so two feeds never collide on track ids;
     # the face-enrollment repo, physio sidebar and Redis publishing stay shared
     # and run once on the merged result. Dual mode is 2D-only. ---
-    import threading
     from concurrent.futures import ThreadPoolExecutor
     face_id_lock = threading.Lock()
     contexts = [CameraContext(0, cap, system, name='CAM0')]
@@ -3270,9 +3441,39 @@ def main():
     if args.camera2 is not None and not is_360:
         cap2 = _open_camera(args.camera2)
         if not cap2.isOpened():
-            print(f"⚠️  --camera2 {args.camera2}: could not open — continuing single-camera")
+            # Diagnose why the explicitly-picked second camera won't open: probe
+            # both backends directly so we can tell a dark-frame rejection (a
+            # backend reads OK here but _open_camera discarded it) from a truly
+            # busy/absent index (both False → the laptop has one usable camera).
+            _d = cv2.VideoCapture(args.camera2, cv2.CAP_DSHOW)
+            _d_ok = _d.isOpened() and bool(_d.read()[0])
+            _d.release()
+            _m = cv2.VideoCapture(args.camera2)  # MSMF
+            _m_ok = _m.isOpened() and bool(_m.read()[0])
+            _m.release()
+            print(f"⚠️  --camera2 {args.camera2}: could not open — continuing single-camera "
+                  f"(DSHOW reads={_d_ok}, MSMF reads={_m_ok})")
+            # Give the surviving single feed the full high-res treatment.
+            cap.release()
+            cap = _ensure_high_res_capture(_open_camera(_cam_index), _cam_index)
+            contexts[0].cap = cap
+            cap2 = cv2.VideoCapture()  # closed → single-camera path below
         else:
-            _ensure_high_res_capture(cap2, args.camera2)
+            # Both cameras open. Free the primary + probe handles, then negotiate
+            # the highest resolution the shared USB bus can sustain for BOTH at
+            # once (no 1080p cap — 4K is kept when the bus can carry it).
+            cap2.release()
+            cap.release()
+            _neg = _negotiate_dual_capture(_cam_index, args.camera2)
+            if _neg is not None:
+                cap, cap2, _dmode, _dfps = _neg
+                contexts[0].cap = cap  # CAM0 context was built with the old handle
+            else:
+                print("⚠️  Could not bring both cameras up together — continuing single-camera.")
+                cap = _ensure_high_res_capture(_open_camera(_cam_index), _cam_index)
+                contexts[0].cap = cap
+                cap2 = cv2.VideoCapture()
+        if cap2.isOpened():
             system2 = MultiPersonEngagementSystem(
                 MODEL_PATH, device=args.device,
                 redis_host=args.redis_host, redis_port=args.redis_port)
@@ -3291,6 +3492,56 @@ def main():
     # don't leave a grey placeholder window on screen.
     _WIN_NAME = 'Concert Engagement System'
 
+    # Warm up every capture before the loop. Freshly-opened cameras — and the
+    # second camera in a bandwidth-shared dual rig — often return empty on
+    # their first reads, which would otherwise end the session with 0 frames.
+    for c in contexts:
+        for _ in range(10):
+            wr, wf = c.cap.read()
+            if wr and wf is not None:
+                break
+            time.sleep(0.05)
+
+    _read_fail_since = None            # wall-clock of the first of a failure run
+    LIVE_READ_GRACE_S = 5.0            # end the session only after this long with no frames
+
+    # Dual-camera engagement fusion: serial -> smoothed cross-camera score.
+    # Persists across frames so a person in both feeds gets ONE stable score on
+    # both overlays and in Redis (see merge_people_by_serial). Stays empty in
+    # single-camera mode, where each serial already has a single score.
+    fused_scores = {}
+
+    # Release the cameras on EVERY exit path. 'q' reaches the cleanup below, but
+    # Ctrl+C (SIGINT), SIGTERM and unhandled exceptions previously skipped it and
+    # left the capture devices held. Idempotent so the atexit/signal/normal
+    # paths can all call it without double-closing.
+    import atexit
+    _cleaned_up = False
+    def _cleanup():
+        nonlocal _cleaned_up
+        if _cleaned_up:
+            return
+        _cleaned_up = True
+        if prefetcher:
+            prefetcher.stop()
+        if cam_pool is not None:
+            cam_pool.shutdown(wait=False)
+        for _c in contexts:
+            try:
+                _c.cap.release()
+            except Exception:
+                pass
+        cv2.destroyAllWindows()
+        if logger:
+            logger.close()
+    atexit.register(_cleanup)
+
+    def _signal_shutdown(signum=None, frame=None):
+        _cleanup()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _signal_shutdown)
+    signal.signal(signal.SIGTERM, _signal_shutdown)
+
     while True:
         frame_start_time = time.time()
         
@@ -3300,10 +3551,12 @@ def main():
                 contexts[0]._frame = frame
         else:
             ret = True
+            failed_cam = None
             for c in contexts:
                 r, fr = c.cap.read()
                 if not r:
                     ret = False
+                    failed_cam = c.name
                     break
                 c._frame = fr
             frame = contexts[0]._frame if ret else None
@@ -3324,7 +3577,21 @@ def main():
                     vy.predictor = None
                 print("\n\U0001f501 Video looped — tracker reset")
                 continue
-            break
+            # Live camera: a single dropped frame must not end the session
+            # (two USB cameras sharing bandwidth can stall briefly). Tolerate
+            # gaps up to LIVE_READ_GRACE_S, naming the offending camera.
+            now = time.time()
+            if _read_fail_since is None:
+                _read_fail_since = now
+                print(f"\u26a0\ufe0f  {failed_cam or 'camera'} returned no frame — retrying...")
+            elif now - _read_fail_since > LIVE_READ_GRACE_S:
+                print(f"\u274c {failed_cam or 'camera'} delivered no frames for "
+                      f"{LIVE_READ_GRACE_S:.0f}s — ending session. In dual mode this is "
+                      f"usually USB bandwidth: try the cameras on separate USB controllers.")
+                break
+            time.sleep(0.03)
+            continue
+        _read_fail_since = None
         
         # =====================================================================
         # PROCESS FRAME (2D vs 360°)
@@ -3451,26 +3718,19 @@ def main():
                 display_frame = c0.display_frame
             else:
                 _futs = [cam_pool.submit(process_and_annotate, c, c._frame, face_id,
-                                         face_id_lock, focus_target, enroll_session, args)
+                                         face_id_lock, focus_target, enroll_session, args,
+                                         False, fused_scores)
                          for c in contexts]
                 for _f in _futs:
                     _f.result()
                 people_data, crowd_avg = merge_people_by_serial(
-                    [c.people_data for c in contexts])
+                    [c.people_data for c in contexts], fused_scores)
                 _frames = [c.display_frame for c in contexts]
                 _h0 = _frames[0].shape[0]
                 _frames = [f if f.shape[0] == _h0 else
                            cv2.resize(f, (int(f.shape[1] * _h0 / f.shape[0]), _h0))
                            for f in _frames]
                 display_frame = np.hstack(_frames)
-        
-        # Restore OS stderr after first frame (MediaPipe C++ init warnings now past)
-        if not _stderr_restored:
-            import time as _t; _t.sleep(0.1)  # Let background threads finish writing
-            os.dup2(_stderr_fd, 2)
-            os.close(_devnull)
-            os.close(_stderr_fd)
-            _stderr_restored = True
         
         # =================================================================
         # MERGED PUBLISH — face-ID, registered-only gating, enrollment banner
@@ -3634,8 +3894,10 @@ def main():
             video_w_box[0] = w
             _mouse_cb_set[0] = True
             # Fit the window to the composited frame width on first frame,
-            # but cap at 1600px so it never opens larger than typical laptop screens.
-            _full_w = w + SIDEBAR_W
+            # but cap at 1600px so it never opens larger than typical laptop
+            # screens. Uses the real sidebar width (it widens to 2–3 columns
+            # with more wearers) so the aspect ratio stays correct.
+            _full_w = w + _sidebar.shape[1]
             _init_w = min(_full_w, 1600)
             _init_h = int(h * (_init_w / _full_w))
             cv2.resizeWindow(_WIN_NAME, _init_w, _init_h)
@@ -3825,19 +4087,42 @@ def main():
     # =========================================================================
     # CLEANUP
     # =========================================================================
-    if prefetcher:
-        prefetcher.stop()
-    if cam_pool is not None:
-        cam_pool.shutdown(wait=False)
-    for _c in contexts:
-        try:
-            _c.cap.release()
-        except Exception:
-            pass
-    cv2.destroyAllWindows()
-    
-    if logger:
-        logger.close()
+    _cleanup()
 
 if __name__ == "__main__":
-    main()
+    import faulthandler
+    import traceback
+
+    # Write any crash (Python exception OR hard native crash) to a log file next
+    # to this script, so a silent exit always leaves evidence to send back.
+    _crash_log_path = Path(__file__).parent / 'crash_last_run.log'
+    try:
+        _crash_log = open(_crash_log_path, 'w', encoding='utf-8')
+    except OSError:
+        _crash_log = None
+    if _crash_log is not None:
+        # Dumps a C-level stack on an access violation / segfault before the
+        # process dies (catches native OpenCV / CUDA / MediaPipe crashes).
+        faulthandler.enable(file=_crash_log, all_threads=True)
+
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _restore_native_stderr()  # un-hide the traceback if stderr is still silenced
+        _tb = traceback.format_exc()
+        _stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
+        sys.stderr.write("\n" + "=" * 68 + "\n")
+        sys.stderr.write(f"  FATAL: engagement app crashed at {_stamp}\n")
+        sys.stderr.write("=" * 68 + "\n")
+        sys.stderr.write(_tb + "\n")
+        sys.stderr.flush()
+        if _crash_log is not None:
+            _crash_log.write(f"\nFATAL {_stamp}\n{_tb}\n")
+            _crash_log.flush()
+        print(f"\n\U0001f4c4 Full error written to: {_crash_log_path}")
+        sys.exit(1)
+    finally:
+        if _crash_log is not None:
+            _crash_log.close()
