@@ -84,6 +84,8 @@ import signal
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
+import hashlib
+import subprocess
 from face_identifier import FaceIdentifier, IDENTIFIED_COLOR
 
 # Shared async logger (writes to data/logs/engagement/<ts>.log).
@@ -521,6 +523,27 @@ def check_disk_space_for_save(output_dir):
 # ENGAGEMENT DATA LOGGER
 # =============================================================================
 
+def _file_sha256(path, _bufsize=1 << 20):
+    """Short SHA256 of a file (model checkpoint fingerprint), or None."""
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(_bufsize), b''):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def _git_commit():
+    try:
+        return subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'], cwd=str(SCRIPT_DIR),
+            stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+
 class EngagementLogger:
     """Logs per-frame engagement data to JSONL for post-experience analysis.
     
@@ -581,8 +604,56 @@ class EngagementLogger:
         self.jsonl_file = open(self.jsonl_path, 'a', encoding='utf-8')
         self._flush_counter = 0
         self._flush_interval = 30  # Flush to disk every 30 frames
-        
+
+        # Session metadata — written at START (not exit) so a crash/window-close
+        # never loses it; enriched via update_meta() once cameras are known.
+        self.meta_path = self.output_dir / 'session_meta.json'
+        self._meta = {
+            'session_id': self.session_id,
+            'session_folder': session_folder_name,
+            'start_time_utc': self.start_time.isoformat(),
+            'video_source': self.video_source,
+            'video_format': self.video_format,
+            'device': self.device,
+            'model_path': self.model_path,
+            'sequence_length': self.sequence_length,
+            'target_duration_seconds': TARGET_DURATION_SECONDS,
+            'model_input_frames': MODEL_INPUT_FRAMES,
+            'min_inference_seconds': MIN_INFERENCE_SECONDS,
+        }
+        self._write_meta()
+
+        # Track-lifecycle / identity events go to a SEPARATE file so
+        # pd.read_json(engagement_data.jsonl, lines=True) stays rectangular.
+        self.events_path = self.output_dir / 'events.jsonl'
+        self._events_file = open(self.events_path, 'a', encoding='utf-8')
+
         print(f"📊 Data Logging: {self.jsonl_path}")
+
+    def _write_meta(self):
+        try:
+            with open(self.meta_path, 'w', encoding='utf-8') as f:
+                json.dump(self._meta, f, indent=2)
+        except OSError as e:
+            print(f"⚠️  session_meta.json write failed: {e}")
+
+    def update_meta(self, extra):
+        """Merge extra fields and rewrite session_meta.json."""
+        self._meta.update(extra)
+        self._write_meta()
+
+    def log_event(self, event, **fields):
+        """Append one lifecycle/identity event (track eviction, id match, ...)
+        to events.jsonl for post-hoc identity stitching."""
+        if self.disk_full or self._events_file is None:
+            return
+        rec = {'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + '+00:00',
+               'frame': self.frame_number, 'event': event}
+        rec.update(fields)
+        try:
+            self._events_file.write(json.dumps(rec) + '\n')
+        except (OSError, MemoryError) as e:
+            self._halt_logging(f"events.jsonl write failed ({e})")
 
     def _halt_logging(self, reason):
         """Disable all future file writes and clear buffered keypoints."""
@@ -606,7 +677,9 @@ class EngagementLogger:
             frame_size: (width, height) of the source frame in pixels
         """
         now = time.time()
-        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')
+        # Explicit +00:00 so cross-machine alignment never has to guess the
+        # zone again (July lab: naive UTC vs +01:00 audio cost an hour offset).
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + '+00:00'
         self.frame_number += 1
         
         # Capture frame dimensions once for NPZ export
@@ -666,6 +739,8 @@ class EngagementLogger:
             if self.jsonl_file and not self.disk_full:
                 try:
                     self.jsonl_file.flush()
+                    if self._events_file:
+                        self._events_file.flush()
                 except (OSError, MemoryError) as e:
                     self._halt_logging(f"JSONL flush failed ({e})")
             self._flush_counter = 0
@@ -719,6 +794,12 @@ class EngagementLogger:
                 self.jsonl_file.close()
             except (OSError, MemoryError) as e:
                 print(f"\u26a0\ufe0f  Error closing JSONL: {e}")
+        if self._events_file:
+            try:
+                self._events_file.flush()
+                self._events_file.close()
+            except (OSError, MemoryError):
+                pass
 
         duration = (datetime.now(timezone.utc) - self.start_time).total_seconds()
         n_chunks  = len(self._kp_chunk_files)
@@ -904,6 +985,9 @@ class MultiPersonEngagementSystem:
         # Updated each time a track is seen; consulted by _evict_stale_tracks().
         self.person_last_seen = {}
         self._frame_counter = 0
+        # Lifecycle events (evictions, id matches) buffered here; the main loop
+        # drains them into EngagementLogger.log_event() each frame.
+        self.track_events = []
 
         # Display-label remap (issue 5): YOLO's bytetrack inflates the id space
         # in crowded scenes (2k+ ids over a 47 min run). The raw ids are still
@@ -1186,6 +1270,8 @@ class MultiPersonEngagementSystem:
             self.person_last_seen.pop(tid, None)
             self._release_display_id(tid)
             self.gaze_engine.evict(int(tid))
+            self.track_events.append({'event': 'track_evicted',
+                                      'track_id': int(tid), 'reason': 'stale'})
         if len(self.person_buffers) > MAX_TRACKED_IDS:
             ordered = sorted(self.person_last_seen.items(), key=lambda kv: kv[1])
             n_drop = len(self.person_buffers) - MAX_TRACKED_IDS
@@ -1197,6 +1283,8 @@ class MultiPersonEngagementSystem:
                 self.person_last_seen.pop(tid, None)
                 self._release_display_id(tid)
                 self.gaze_engine.evict(int(tid))
+                self.track_events.append({'event': 'track_evicted',
+                                          'track_id': int(tid), 'reason': 'id_cap'})
 
     # --- Display-label remap -------------------------------------------------
     def display_label(self, track_id):
@@ -1706,12 +1794,33 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     (plot_x + 2, plot_y + plot_ph - 3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.22, lbl_col, 1, cv2.LINE_AA)
 
+        # Panel watermark helper: centered label + optional sub-line over a
+        # dimmed panel, same visual treatment as OFF-WRIST so every "not
+        # plotting yet" state reads as intentional rather than broken.
+        def _panel_watermark(text, sub=None, col=(110, 200, 110)):
+            overlay = sidebar.copy()
+            cv2.rectangle(overlay, (plot_x, plot_y),
+                          (plot_x + plot_pw, plot_y + plot_ph), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.35, sidebar, 0.65, 0, sidebar)
+            (tw_wm, th_wm), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            tx_wm = plot_x + max(2, (plot_pw - tw_wm) // 2)
+            ty_wm = plot_y + (plot_ph + th_wm) // 2 - (5 if sub else 0)
+            cv2.putText(sidebar, text, (tx_wm, ty_wm),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+            if sub:
+                (sw_wm, sh_wm), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, 0.26, 1)
+                sx_wm = plot_x + max(2, (plot_pw - sw_wm) // 2)
+                cv2.putText(sidebar, sub, (sx_wm, ty_wm + sh_wm + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.26,
+                            tuple(int(c * 0.7) for c in col), 1, cv2.LINE_AA)
+
         if is_calibrating and not any((snap_hr_z, snap_eda_z, snap_stroc_z)):
+            # Plots are deviation-from-baseline, so nothing CAN render until
+            # the wearer's baseline exists. Say so loudly (July lab feedback:
+            # blank panels + 8 connected EmotiBits read as a broken GUI).
             remaining = snap_metrics.get('calibration_remaining_s')
-            msg = f"calibrating {remaining:.0f}s" if remaining is not None else "calibrating..."
-            cv2.putText(sidebar, msg,
-                        (plot_x + 4, plot_y + plot_ph // 2 + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (110, 160, 110), 1, cv2.LINE_AA)
+            wm_txt = f"CALIBRATING {remaining:.0f}s" if remaining is not None else "CALIBRATING"
+            _panel_watermark(wm_txt, "learning wearer baseline")
         else:
             any_drawn = False
             for label, hist, _key, light, full in TRACES:
@@ -1760,9 +1869,15 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                     cv2.circle(sidebar, (int(xs[-1]), int(ys[-1])),
                                dot_r + 2, (255, 255, 255), 1, cv2.LINE_AA)
             if not any_drawn:
-                cv2.putText(sidebar, "Physio: no signal",
-                            (plot_x + 4, plot_y + plot_ph // 2 + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (65, 65, 65), 1, cv2.LINE_AA)
+                if not snap_metrics:
+                    # Raw samples seen but no physio_metrics packet yet: the
+                    # publisher's 1 Hz metrics loop hasn't started for this
+                    # serial (or Sowmya's script isn't running).
+                    _panel_watermark("WAITING FOR STREAM", "no metrics received yet",
+                                     (160, 160, 160))
+                else:
+                    _panel_watermark("NO PHYSIO SIGNAL", "check sensor contact",
+                                     (140, 140, 140))
 
         # Off-wrist watermark: drawn over everything so it's unambiguous that
         # the panel content is stale / suppressed and not a real "near baseline"
@@ -2476,6 +2591,23 @@ def main():
             sys.exit(0)
         signal.signal(signal.SIGINT, graceful_shutdown)
         signal.signal(signal.SIGTERM, graceful_shutdown)
+
+        # Enrich session_meta.json now that runtime facts are known.
+        logger.update_meta({
+            'cli_args': {k: (str(v) if v is not None else None) for k, v in vars(args).items()},
+            'is_360': bool(is_360),
+            'measured_fps': round(measured_fps, 1),
+            'model_sha256': _file_sha256(MODEL_PATH),
+            'git_commit': _git_commit(),
+        })
+
+        # Cross-stream join key: physio/audio writers stamp this into their
+        # CSVs so post-concert alignment is deterministic, not clock-forensic.
+        if system.redis_client:
+            try:
+                system.redis_client.set('engagement:session_id', logger.output_dir.name)
+            except Exception as _e:
+                print(f"⚠️  Could not publish session id to Redis: {_e}")
     
     print(f"🚀 System Running!")
     print(f"📡 Publishing to Redis Channel: '{REDIS_CHANNEL}'")
@@ -2891,6 +3023,14 @@ def main():
         # --- DATA LOGGING ---
         if logger:
             logger.log_frame(people_data, crowd_avg, live_fps, is_360=is_360, frame_size=(w, h))
+            # Drain buffered lifecycle events (evictions, id matches)
+            if system.track_events:
+                for _ev in system.track_events:
+                    logger.log_event(_ev.pop('event'), **_ev)
+                system.track_events.clear()
+        else:
+            # No logger: still clear so the buffer can't grow unbounded.
+            system.track_events.clear()
 
         # Disk-full warning banner (bottom of frame, red background)
         if logger and logger.disk_full:

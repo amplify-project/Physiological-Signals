@@ -308,6 +308,10 @@ class DataLogger:
             "quality_hr", "quality_eda", "quality_ibi",
             "quality_temperature_roc", "quality_scr_frequency", "quality_scr_amplitude",
             "swap_detected",
+            "off_wrist",
+            # Join key from the engagement PC (Redis 'engagement:session_id') —
+            # makes cross-stream alignment deterministic instead of clock-based.
+            "engagement_session_id",
             "processing_time_ms"
             # Note: end_to_end_latency_ms removed - unreliable without proper clock sync
         ]
@@ -454,6 +458,9 @@ class DeviceAggregator:
         self.clf_val = clf_val
         self.clf_aro = clf_aro
         self.redis = redis_client
+        # Engagement session join key, re-fetched from Redis every ~10 s
+        self._eng_session_id = None
+        self._eng_session_check = 0.0
         self.filtered_hr = []
         self.filtered_eda = []
         # Track 5 signals for Redis SD metrics
@@ -509,6 +516,19 @@ class DeviceAggregator:
         """Reset Welford state and calibration window. Call on wearer swap."""
         with self.lock:
             self._reset_baseline_unlocked(reason)
+
+    def _engagement_session_id(self):
+        """Current engagement session folder name from Redis (10 s cache).
+        Engagement may start/stop mid-physio-run, so poll rather than read once."""
+        now = time.time()
+        if now - self._eng_session_check >= 10.0:
+            self._eng_session_check = now
+            try:
+                v = self.redis.get('engagement:session_id')
+                self._eng_session_id = v.decode() if isinstance(v, bytes) else v
+            except Exception:
+                pass  # keep last known value on transient Redis errors
+        return self._eng_session_id
 
     def _reset_baseline_unlocked(self, reason):
         for w in self.welford.values():
@@ -949,6 +969,7 @@ class DeviceAggregator:
             signal_dict["quality_scr_amplitude"] = self.channel_quality.get('scr_amplitude', '')
             signal_dict["swap_detected"] = bool(extras['swap_detected'])
             signal_dict["off_wrist"] = bool(extras.get('off_wrist', False))
+            signal_dict["engagement_session_id"] = self._engagement_session_id() or ""
 
             # Add performance metric (for CSV storage)
             signal_dict["processing_time_ms"] = processing_time_ms
