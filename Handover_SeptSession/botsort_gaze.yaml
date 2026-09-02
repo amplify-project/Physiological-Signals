@@ -14,4 +14,10 @@ fuse_score: True
 gmc_method: sparseOptFlow   # camera is static; cheap global motion compensation
 proximity_thresh: 0.5
 appearance_thresh: 0.25
+# ReID benchmark toggle (concert machine): set with_reid: True and model: auto
+# to add learned appearance embeddings to association — more robust than the
+# colour registry under stage lighting, at real FPS cost. Measure the live FPS
+# readout before/after on the target machine; revert to False if it drops the
+# dual-camera rate below ~8 fps (inference buffers need ~10 s of frames).
 with_reid: False            # clothes-colour registry in the engine handles re-ID
+# model: auto               # uncomment with with_reid: True (native YOLO features)

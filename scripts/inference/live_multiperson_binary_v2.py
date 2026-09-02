@@ -1694,7 +1694,11 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         # ------ Snapshot subscriber state under lock ------
         with emotibit_lock:
             d = emotibit_data.get(serial, {})
-            snap_eda_z   = list(d.get('eda_z',  []))
+            # SCR-frequency z replaces tonic eda_z on the spline: tonic EDA drifts
+            # for minutes after fitting, so its z saturates >3 SD; phasic SCR
+            # frequency is the better-behaved arousal readout. eda_z stays in the
+            # CSV/Redis payload for offline analysis.
+            snap_scr_z   = list(d.get('scr_frequency_z',  []))
             snap_hr_z    = list(d.get('hr_z',   []))
             snap_stroc_z = list(d.get('temperature_roc_z', []))
             snap_metrics = dict(d.get('metrics', {}))
@@ -1719,7 +1723,7 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         TRACES = (
             # (label, source_list, last_metric_key, light_col, full_col)
             ('HR',   snap_hr_z,    'hr_z',              (180, 235, 180), ( 70, 220,  70)),
-            ('EDA',  snap_eda_z,   'eda_z',             (220, 230, 190), (255, 200,  60)),
+            ('SCR',  snap_scr_z,   'scr_frequency_z',   (220, 230, 190), (255, 200,  60)),
             ('TEMP', snap_stroc_z, 'temperature_roc_z', (220, 200, 230), (200, 100, 200)),
         )
 
@@ -1814,7 +1818,7 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.26,
                             tuple(int(c * 0.7) for c in col), 1, cv2.LINE_AA)
 
-        if is_calibrating and not any((snap_hr_z, snap_eda_z, snap_stroc_z)):
+        if is_calibrating and not any((snap_hr_z, snap_scr_z, snap_stroc_z)):
             # Plots are deviation-from-baseline, so nothing CAN render until
             # the wearer's baseline exists. Say so loudly (July lab feedback:
             # blank panels + 8 connected EmotiBits read as a broken GUI).
@@ -2063,6 +2067,7 @@ def main():
                                 # ±3 SD spline panel. 180 samples ≈ 3 min at the
                                 # publisher's 1Hz emit cadence for *_z values.
                                 'eda_z':  deque(maxlen=180),
+                                'scr_frequency_z': deque(maxlen=180),
                                 'hr_z':   deque(maxlen=180),
                                 'temperature_roc_z': deque(maxlen=180),
                                 'metrics': {},
@@ -2117,6 +2122,7 @@ def main():
                                 for zk, deque_key in (
                                     ('hr_z', 'hr_z'),
                                     ('eda_z', 'eda_z'),
+                                    ('scr_frequency_z', 'scr_frequency_z'),
                                     ('temperature_roc_z', 'temperature_roc_z'),
                                 ):
                                     if zk in data and data[zk] is not None:

@@ -1856,7 +1856,11 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         # ------ Snapshot subscriber state under lock ------
         with emotibit_lock:
             d = emotibit_data.get(serial, {})
-            snap_eda_z   = list(d.get('eda_z',  []))
+            # SCR-frequency z replaces tonic eda_z on the spline: tonic EDA drifts
+            # for minutes after fitting, so its z saturates >3 SD; phasic SCR
+            # frequency is the better-behaved arousal readout. eda_z stays in the
+            # CSV/Redis payload for offline analysis.
+            snap_scr_z   = list(d.get('scr_frequency_z',  []))
             snap_hr_z    = list(d.get('hr_z',   []))
             snap_stroc_z = list(d.get('temperature_roc_z', []))
             snap_metrics = dict(d.get('metrics', {}))
@@ -1881,7 +1885,7 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
         TRACES = (
             # (label, source_list, last_metric_key, light_col, full_col)
             ('HR',   snap_hr_z,    'hr_z',              (180, 235, 180), ( 70, 220,  70)),
-            ('EDA',  snap_eda_z,   'eda_z',             (220, 230, 190), (255, 200,  60)),
+            ('SCR',  snap_scr_z,   'scr_frequency_z',   (220, 230, 190), (255, 200,  60)),
             ('TEMP', snap_stroc_z, 'temperature_roc_z', (220, 200, 230), (200, 100, 200)),
         )
 
@@ -1976,7 +1980,7 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.26,
                             tuple(int(c * 0.7) for c in col), 1, cv2.LINE_AA)
 
-        if is_calibrating and not any((snap_hr_z, snap_eda_z, snap_stroc_z)):
+        if is_calibrating and not any((snap_hr_z, snap_scr_z, snap_stroc_z)):
             # Plots are deviation-from-baseline, so nothing CAN render until
             # the wearer's baseline exists. Say so loudly (July lab feedback:
             # blank panels + 8 connected EmotiBits read as a broken GUI).
@@ -2182,6 +2186,13 @@ REBIND_SIG_MIN = 0.85   # appearance-only correlation to accept a re-bind guess
 REBIND_SIG_POS = 0.70   # looser floor when last-known position corroborates
 REBIND_POS_FRAC = 0.20  # position radius as a fraction of the frame diagonal
 REBIND_MAX_GAP_S = 5.0  # ignore last-known positions older than this (s)
+# Torso-colour veto for coasting identities: a label riding on the tracker with
+# no face confirmation must still LOOK like its owner. Correlation below the
+# floor on consecutive face-id cycles strips the identity (bystanders stealing
+# a track id via motion association keep the box, not the name). Floor is
+# deliberately low + 2-strike so stage lighting flashes don't cause false vetoes.
+TORSO_VETO_CORR   = 0.35
+TORSO_VETO_CHECKS = 2
 ENROLL_POSES = ['front', 'left', 'right']  # guided 3-pose capture order
 
 
@@ -2250,6 +2261,7 @@ def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
                         if cached and cached['name'] == name:
                             cached['similarity'] = res['similarity']
                             cached['miss'] = 0
+                            cached.pop('veto_miss', None)
                             cached.pop('inferred', None)
                             face_id_pending.pop(tid, None)
                             newly_face_matched.add(tid)
@@ -2294,6 +2306,25 @@ def process_and_annotate(ctx, frame, face_id, face_id_lock, focus_target,
 
             # Apply cached result
             cached = face_id_cache.get(tid)
+            if cached and run_face_id and tid not in newly_face_matched:
+                ref = registered_profiles.get(cached['name'], {}).get('sig')
+                _vsig = appearance_sig(frame, person['bbox']) if ref is not None else None
+                if _vsig is not None:
+                    _corr = float(cv2.compareHist(_vsig, ref, cv2.HISTCMP_CORREL))
+                    if _corr < TORSO_VETO_CORR:
+                        cached['veto_miss'] = cached.get('veto_miss', 0) + 1
+                        if cached['veto_miss'] >= TORSO_VETO_CHECKS:
+                            ctx.system.track_events.append({
+                                'event': 'id_veto', 'track_id': int(tid),
+                                'emotibit_id': cached['name'],
+                                'confidence': round(_corr, 3), 'camera': ctx.name})
+                            log.info(f"[{ctx.name}] id-veto: track {tid} stripped of "
+                                     f"{cached['name']} (torso corr={_corr:.2f})")
+                            face_id_cache.pop(tid, None)
+                            face_id_pending.pop(tid, None)
+                            cached = None
+                    else:
+                        cached['veto_miss'] = 0
             if cached:
                 serial = cached['name']
                 person['identified_as'] = serial
@@ -2718,6 +2749,7 @@ def main():
                                 # ±3 SD spline panel. 180 samples ≈ 3 min at the
                                 # publisher's 1Hz emit cadence for *_z values.
                                 'eda_z':  deque(maxlen=180),
+                                'scr_frequency_z': deque(maxlen=180),
                                 'hr_z':   deque(maxlen=180),
                                 'temperature_roc_z': deque(maxlen=180),
                                 'metrics': {},
@@ -2772,6 +2804,7 @@ def main():
                                 for zk, deque_key in (
                                     ('hr_z', 'hr_z'),
                                     ('eda_z', 'eda_z'),
+                                    ('scr_frequency_z', 'scr_frequency_z'),
                                     ('temperature_roc_z', 'temperature_roc_z'),
                                 ):
                                     if zk in data and data[zk] is not None:

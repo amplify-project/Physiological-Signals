@@ -111,6 +111,14 @@ BASELINE_MIN_SAMPLES = 2      # Welford samples needed before a z-score is valid
 # the elevation normalises itself away. Welford has converged by ~60 s anyway, so
 # freezing then keeps sustained elevations visible at negligible accuracy cost.
 BASELINE_CAP_SECONDS = 60
+# EDA-only delayed baseline. Tonic EDA drifts upward for minutes after fitting
+# while the skin-electrode interface hydrates, so a baseline taken in the first
+# minute freezes a too-low mean with a tiny SD and eda_z saturates >3 forever.
+# Skip the settling minute entirely, then accumulate for the following minute
+# (eda_z publishes from ~62 s once BASELINE_MIN_SAMPLES is met, frozen at 120 s).
+# Kept short for infant wearers; a swap/off-wrist reset restarts this schedule.
+EDA_SETTLE_SECONDS       = 60
+EDA_BASELINE_CAP_SECONDS = EDA_SETTLE_SECONDS + 60
 Z_SOFT_THRESHOLD = 1.5        # amber GUI indicator (~13% fire rate)
 Z_HARD_THRESHOLD = 2.0        # red GUI indicator + logged event (~5%, matches published methodology)
 # Wearer-swap auto-detection (pinned-floor heuristic).
@@ -750,10 +758,12 @@ class DeviceAggregator:
         # reference instead of inflating it.
         if age_s < BASELINE_CAP_SECONDS:
             if hr_repr is not None: self.welford['hr'].update(hr_repr)
-            if eda_repr is not None: self.welford['eda'].update(eda_repr)
             if ibi_repr is not None: self.welford['ibi'].update(ibi_repr)
             if temp_roc_repr is not None: self.welford['temperature_roc'].update(temp_roc_repr)
             if scr_repr is not None: self.welford['scr_frequency'].update(scr_repr)
+        # EDA runs its own delayed window (see EDA_SETTLE_SECONDS).
+        if EDA_SETTLE_SECONDS <= age_s < EDA_BASELINE_CAP_SECONDS:
+            if eda_repr is not None: self.welford['eda'].update(eda_repr)
 
         # Capture baseline skin temperature at end of calibration window
         # (used as the reference for swap detection's temperature step).
@@ -1039,7 +1049,9 @@ class DeviceAggregator:
             if not extras['calibrating']:
                 eda_z_val = extras['z_scores'].get('eda_z')
                 now_ts = time.time()
-                if eda_z_val is None:
+                # eda_z is legitimately absent during the EDA settle window.
+                eda_expected = (now_ts - self.baseline_session_start) >= (EDA_SETTLE_SECONDS + 5)
+                if eda_z_val is None and eda_expected:
                     last = self._missing_metric_last_warn.get('eda_z', 0.0)
                     if now_ts - last >= self._missing_metric_warn_interval:
                         log.warning(
