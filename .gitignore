@@ -116,3 +116,6 @@ Handover_SeptSession/model/20180402-114759-vggface2.pt
 
 # Redis persistence snapshots (runtime data)
 dump.rdb
+
+# AR dev's Unity project drop (reference only, 140 MB — not part of this repo)
+ampPortable_xrGlassesDemo-rayNeoPort/

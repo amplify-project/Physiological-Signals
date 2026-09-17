@@ -1,0 +1,43 @@
+@echo off
+title Audio time recording
+echo Starting real-time audio detection (music ^> CSV + WAV)...
+echo This runs saves audio timestamps to CSV alongside EmotiBit data.
+echo.
+cd /d "%~dp0"
+call .venv\Scripts\activate.bat 2>nul || (
+    echo ERROR: .venv not found. Run SETUP.bat first.
+    pause
+    exit /b 1
+)
+
+REM Check if required packages are installed
+python -c "import sounddevice, soundfile, onnxruntime, torch" 2>nul || (
+    echo ERROR: Audio packages not installed. Installing now...
+    REM constraints.txt locks torch to the cu124 build so this fallback
+    REM cannot downgrade the GPU torch to a CPU wheel.
+    pip install sounddevice==0.5.1 soundfile==0.13.1 onnxruntime==1.20.1 -c constraints.txt
+)
+
+REM Device selection: fully automatic by default (probes each mic for ~1s
+REM and picks the loudest). To force a specific device, pass its ID as an
+REM argument:  4_START_AUDIO_REALTIME.bat 1
+REM (run "python audio_monitor_csv.py --list-devices" to see the IDs)
+set ARGS=
+if "%~1"=="" (
+    echo Auto-detecting microphone by sound level...
+    set ARGS=--auto-device
+) else (
+    echo Using microphone device ID %~1
+    set ARGS=--device %~1
+)
+
+echo.
+echo Starting audio detection...
+echo Output: emotibit_recordings\audio_YYYY-MM-DD_HH-MM-SS.csv + .wav
+echo WAV auto-saves every 5 seconds (safe even if you forget to stop)
+echo Stop with Ctrl+C or just close this window (both save properly!)
+echo.
+
+python audio_monitor_csv.py --quiet %ARGS%
+
+pause

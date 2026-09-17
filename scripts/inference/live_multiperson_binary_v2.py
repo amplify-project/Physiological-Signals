@@ -1586,17 +1586,791 @@ class MultiPersonEngagementSystem:
 SIDEBAR_W = 280  # pixel width of the EmotiBit physio sidebar panel
 
 # =============================================================================
+# AR ABSTRACT PHYSIOLOGICAL VISUAL
+# =============================================================================
+# Lightweight cv2/NumPy port of the AR dev's Unity ParticleMeshVisualizer
+# (ampPortable_xrGlassesDemo-rayNeoPort). Rendered as a compact particle "blob"
+# under each wearer's +-SD spline panel, driven by the SAME per-wearer z-scores
+# from device:{serial}:physio_metrics:
+#   HR z    -> pulse rate + amplitude   (heart-rate response)
+#   SCR z   -> agitation + spark bursts (phasic arousal / SCR events)
+#   TEMP z  -> colour: neutral green -> hot red (+) / cold blue (-)
+# so no new data path is introduced. Per-serial state smooths the form between
+# frames, mirroring the Unity slow-form / fast-signal smoothing split.
+ENABLE_ABSTRACT_PANEL = True
+# BGR colours matched to the Unity capture: particles are a yellow-green.
+_ABS_NEUTRAL_BGR = np.array((51, 255, 184), dtype=np.float32)   # RGB(0.72,1.00,0.20)
+_ABS_HOT_BGR     = np.array((10,  71,  255), dtype=np.float32)  # RGB(1.00,0.28,0.04)
+_ABS_COLD_BGR    = np.array((255, 168, 26),  dtype=np.float32)  # RGB(0.10,0.66,1.00)
+_abstract_state = {}  # serial -> {smoothed signals, pulse phase, wall clock, seeds}
+
+# Keyboard-mocked signals (T/W/S/H/G keys, see main loop): channel -> (SD
+# value, wall time). Values decay back to neutral so a mock reads as a push.
+_ABS_MOCK_TAU = 2.5   # s
+_abs_mock = {}
+
+
+def _abs_mock_value(name, now):
+    """Effective mocked SD value for a channel, exponentially decayed; None when idle."""
+    m = _abs_mock.get(name)
+    if not m:
+        return None
+    eff = m[0] * float(np.exp(-(now - m[1]) / _ABS_MOCK_TAU))
+    if abs(eff) < 0.05:
+        _abs_mock.pop(name, None)
+        return None
+    return eff
+
+# -----------------------------------------------------------------------------
+# Faithful port of the AR developer's Unity ParticleMeshVisualizer. A flat grid
+# mesh in the XZ plane (each vertex is also a particle) deforms and recolours
+# from the same z-scored physiology the glasses use, viewed through an oblique
+# camera. Every mechanism below mirrors ParticleMeshVisualizer.cs one-to-one; no
+# extra channels or effects are invented:
+#   tonic EDA (eda_z)          -> slow "form" compression/lift of the plane
+#   SCR frequency (scr_freq_z) -> ring events (rise=up / fall=down+implosion) + sparks
+#   heart rate (hr_z)          -> particle-size pulse + corner halos
+#   temperature rate (roc_z)   -> hot/cold colour trend waves + lifted trails
+#   engagement                 -> rigidity (solid grid) vs looseness (drift)
+# Grid is 5x5, matching the particle count actually seen through the glasses;
+# all other tunables are his serialized
+# defaults. Colours already match the Unity neutral/hot/cold constants.
+_ABS_GRID_W = 5
+_ABS_GRID_H = 5
+_ABS_VISUAL_SCALE = 1.25
+_ABS_WHITE_BGR = np.array((255, 255, 255), dtype=np.float32)
+
+# --- AR default tunables (ParticleMeshVisualizer serialized fields) ---
+_ABS_SIG_FAST = 6.0            # signalSmoothing (HR / SCR / engagement)
+_ABS_SIG_SLOW = 0.35          # slowFormSmoothing (tonic EDA / temperature)
+_ABS_MESH_COHERENCE = 0.75
+_ABS_TURBULENCE = 0.35 * 0.22  # turbulenceStrength * motionTurbulence
+_ABS_MOTION_SPEED = 1.35
+_ABS_MORPH_TIME = 0.45 * 1.05  # baseMorphSmoothTime * morphSmoothMultiplier
+_ABS_RIGIDITY_POWER = 1.6
+_ABS_DRIFT_RADIUS = 0.28
+_ABS_DRIFT_SPEED = 0.65
+_ABS_VERT_DRIFT = 0.14
+_ABS_RADIAL_DRIFT = 0.35
+# SCR events / sparks
+_ABS_SCR_THRESH = 0.55
+_ABS_SCR_PER_SEC = 3.0
+_ABS_SCR_RISE_GAIN = 4.0
+_ABS_SCR_DISP = 0.28   # boosted from AR default 0.16: the small oblique 2D panel flattens bumps
+_ABS_SCR_LIFE = 1.4
+_ABS_SCR_RADIUS = 0.22
+_ABS_SPARKS_PER_EVENT = 8
+_ABS_SPARK_LIFE = 0.45
+_ABS_SPARK_SPREAD = 0.08
+_ABS_SPARK_LIFT = 0.28
+# Temperature trend waves
+_ABS_TW_THRESH = 0.18
+_ABS_TW_LIFE = 1.25
+_ABS_TW_WIDTH = 0.24
+_ABS_TW_INTERVAL = 0.26
+_ABS_TW_TINT = 0.78
+# Temperature rate trails
+_ABS_TT_STRIDE = 2
+_ABS_TT_HISTORY = 18
+_ABS_TT_LIFT = 0.018
+_ABS_TT_MAXALPHA = 0.42
+# Heart rate response / pulse / halo
+_ABS_HR_DEADBAND = 0.06
+_ABS_HR_BPM_MIN = 38.0
+_ABS_HR_BPM_NEUTRAL = 72.0
+_ABS_HR_BPM_MAX = 144.0
+_ABS_HR_PSCALE_NEG = 0.65
+_ABS_HR_PSCALE_POS = 1.75
+_ABS_HR_DEPTH_NEG = 0.18
+_ABS_HR_DEPTH_NEUTRAL = 0.08
+_ABS_HR_DEPTH_POS = 0.30
+_ABS_HR_ACTIVE_PHASE = 0.35
+_ABS_HR_HALO_RADIUS_MULT = 3.2
+_ABS_HR_HALO_SCALE_NEG = 0.82
+_ABS_HR_HALO_SCALE_POS = 1.18
+_ABS_PARTICLE_SIZE = 0.025
+# Blue halo colours (per the Unity capture: corner HR arches are blue), as BGR.
+_ABS_HALO_REF_BGR = np.array((255, 140, 89), dtype=np.float32)    # RGB(0.35,0.55,1.00)
+_ABS_HALO_ACT_BGR = np.array((255, 179, 115), dtype=np.float32)   # RGB(0.45,0.70,1.00)
+
+
+def _abs_stable_unit(index, salt):
+    """Deterministic per-vertex pseudo-random in [0,1) (Unity's fract(sin) hash)."""
+    val = np.sin((index + 1.0) * 12.9898 + salt * 78.233) * 43758.5453
+    return val - np.floor(val)
+
+
+def _abs_snoise(a, b, c):
+    """Smooth, cheap pseudo-noise in ~[-0.5,0.5] standing in for Mathf.PerlinNoise
+    (no external noise lib); only drives small turbulence/drift, as in his code."""
+    return 0.5 * (np.sin(a * 1.7 + b * 2.3 + c) * np.cos(b * 1.3 - c * 0.7 + a * 0.5))
+
+
+def _abs_smoothdamp(cur, tgt, vel, smooth_time, dt):
+    """Vectorised Unity Vector3.SmoothDamp (critically damped), maxSpeed=inf."""
+    smooth_time = max(1e-4, smooth_time)
+    omega = 2.0 / smooth_time
+    xv = omega * dt
+    exp = 1.0 / (1.0 + xv + 0.48 * xv * xv + 0.235 * xv * xv * xv)
+    change = cur - tgt
+    temp = (vel + omega * change) * dt
+    vel_new = (vel - omega * temp) * exp
+    out = tgt + (change + temp) * exp
+    over = ((tgt - cur) > 0.0) == (out > tgt)     # overshoot guard
+    out = np.where(over, tgt, out)
+    vel_new = np.where(over, (out - tgt) / max(dt, 1e-5), vel_new)
+    return out.astype(np.float32), vel_new.astype(np.float32)
+
+
+def _abs_build_grid(w, h):
+    xs = np.linspace(0.0, 1.0, w, dtype=np.float32)
+    zs = np.linspace(0.0, 1.0, h, dtype=np.float32)
+    u = np.tile(xs, h).astype(np.float32)
+    v = np.repeat(zs, w).astype(np.float32)
+    base = np.stack([(u - 0.5) * _ABS_VISUAL_SCALE,
+                     np.zeros_like(u),
+                     (v - 0.5) * _ABS_VISUAL_SCALE], axis=1).astype(np.float32)
+    idx = np.arange(w * h, dtype=np.float32)
+    ang = _abs_stable_unit(idx, 7.13) * (2.0 * np.pi)
+    vert = (_abs_stable_unit(idx, 11.91) - 0.5) * 2.0 * _ABS_VERT_DRIFT
+    rand = np.stack([np.cos(ang), vert, np.sin(ang)], axis=1).astype(np.float32)
+    radial = np.stack([u - 0.5, np.zeros_like(u), v - 0.5], axis=1).astype(np.float32)
+    rn = np.linalg.norm(radial, axis=1, keepdims=True)
+    radial = np.where(rn > 0.01, radial / np.maximum(rn, 1e-5), rand)
+    drift = rand + (radial - rand) * _ABS_RADIAL_DRIFT
+    dn = np.linalg.norm(drift, axis=1, keepdims=True)
+    drift = np.where(dn > 0.01, drift / np.maximum(dn, 1e-5),
+                     np.array([1.0, 0.0, 0.0], np.float32))
+    seed = np.stack([_abs_stable_unit(idx, 23.17) * 19.31,
+                     _abs_stable_unit(idx, 61.83) * 29.47], axis=1).astype(np.float32)
+    rows = [np.arange(r * w, r * w + w) for r in range(h)]
+    cols = [np.arange(c, c + w * h, w) for c in range(w)]
+    return u, v, base, drift.astype(np.float32), seed, rows, cols
+
+
+def _abs_trail_indices(w, h, stride, cap=64):
+    out = []
+    for yy in range(0, h, stride):
+        off = 0 if (yy // stride) % 2 == 0 else stride // 2
+        for xx in range(off, w, stride):
+            out.append(yy * w + xx)
+            if len(out) >= cap:
+                return np.array(out, dtype=np.int32)
+    return np.array(out, dtype=np.int32)
+
+
+(_ABS_GRID_U, _ABS_GRID_V, _ABS_GRID_BASE, _ABS_DRIFT_DIR, _ABS_DRIFT_SEED,
+ _ABS_GRID_ROWS, _ABS_GRID_COLS) = _abs_build_grid(_ABS_GRID_W, _ABS_GRID_H)
+_ABS_TRAIL_IDX = _abs_trail_indices(_ABS_GRID_W, _ABS_GRID_H, _ABS_TT_STRIDE)
+# 4 grid corners (bottom-left, bottom-right, top-left, top-right) for HR halos.
+_ABS_CORNERS = (0, _ABS_GRID_W - 1,
+                (_ABS_GRID_H - 1) * _ABS_GRID_W,
+                (_ABS_GRID_H - 1) * _ABS_GRID_W + _ABS_GRID_W - 1)
+# Default oblique camera: tilted so the plane is seen at an angle (like the AR
+# glasses). Each wearer gets its own copy that the mouse callback orbits/zooms.
+_ABS_DEFAULT_VIEW = {'yaw': 0.6, 'pitch': 1.0, 'zoom': 1.0}
+
+
+def _abs_new_state(now):
+    """Per-wearer persistent mesh/particle/event state."""
+    n = _ABS_GRID_W * _ABS_GRID_H
+    m = int(_ABS_TRAIL_IDX.shape[0])
+    return {
+        'kind': 'mesh', 't': now, 'local': 0.0,
+        'eda': 0.0, 'temp': 0.0, 'scr': 0.0, 'hr': 0.0, 'eng': 0.5,
+        'hr_phase': 0.0,
+        'verts': _ABS_GRID_BASE.copy(), 'vel': np.zeros((n, 3), np.float32),
+        'scr_events': [], 'scr_acc': 0.0, 'scr_next': 0, 'prev_scr': 0.0,
+        'sparks': np.zeros((0, 7), np.float32), 'spark_next': 0,
+        'waves': [], 'w_remaining': 0, 'w_dir': 0.0, 'w_mag': 0.0, 'w_timer': 0.0,
+        'trail_buf': np.zeros((m, _ABS_TT_HISTORY, 3), np.float32),
+        'trail_head': 0, 'trail_fill': 0, 'trail_active': False, 'trail_dir': 0.0,
+        'trail_avail': 0, 'trail_strength': 0.0,
+        'hr_fresh_t': -1e9, 'halo_alpha': 0.0,
+        'halo_xy': np.full((4, 2), -1.0, np.float32),
+    }
+
+
+def _abs_spawn_sparks(st, cu, cv, signed):
+    """White SCR sparks bursting up (rising) / down (falling) from an event site."""
+    direction = -1.0 if signed < 0.0 else 1.0
+    inten = min(1.0, abs(signed))
+    count = int(round(1.0 + (_ABS_SPARKS_PER_EVENT - 1.0) * inten))
+    if count <= 0:
+        return
+    ox = (cu - 0.5) * _ABS_VISUAL_SCALE
+    oz = (cv - 0.5) * _ABS_VISUAL_SCALE
+    life = _ABS_SPARK_LIFE * (0.75 + 0.5 * inten)
+    spread = _ABS_SPARK_SPREAD * (0.55 + 0.8 * inten)
+    lift = _ABS_SPARK_LIFT * (0.65 + 0.7 * inten)
+    new = np.zeros((count, 7), np.float32)
+    for i in range(count):
+        seed = (st['spark_next'] + 1) * 1.6180339
+        ang = seed * 2.0 * np.pi
+        rad = spread * (0.25 + 0.75 * ((seed * 0.7548777) % 1.0))
+        lx = np.cos(ang) * rad
+        lz = np.sin(ang) * rad
+        if direction > 0.0:
+            vx, vy, vz = lx / life, lift, lz / life
+        else:
+            vx, vy, vz = -lx / life, -lift, -lz / life
+        new[i] = (ox + lx * 0.2, 0.0, oz + lz * 0.2, vx, vy, vz, life)
+        st['spark_next'] += 1
+    st['sparks'] = np.vstack([st['sparks'], new]) if len(st['sparks']) else new
+
+
+def _abs_inject_scr_event(serial, direction=1.0):
+    """Debug hook (E key): fire one full-strength SCR ring event + sparks on a
+    wearer's panel, bypassing the z-score threshold, to verify the rendering."""
+    st = _abstract_state.get(serial)
+    if st is None or st.get('kind') != 'mesh' or len(st['scr_events']) >= 12:
+        return
+    pi = float(st['scr_next'])
+    eu = (pi * 0.6180339 + st['local'] * 0.037) % 1.0
+    ev = (pi * 0.381966 + np.sin(st['local'] * 0.11 + pi) * 0.17) % 1.0
+    st['scr_events'].append({'cu': eu, 'cv': ev, 'age': 0.0,
+                             'life': _ABS_SCR_LIFE * 1.35,
+                             'radius': _ABS_SCR_RADIUS * 1.4,
+                             'inten': 1.0, 'dir': direction})
+    _abs_spawn_sparks(st, eu, ev, direction)
+    st['scr_next'] += 1
+
+
+def _abs_scr_events(st, scr_s, dt, off_wrist):
+    """Update/spawn SCR ring events; return per-vertex (offset (N,3), energy (N,))."""
+    u, v = _ABS_GRID_U, _ABS_GRID_V
+    n = u.shape[0]
+    events = [e for e in st['scr_events'] if (e['age'] + dt) < e['life']]
+    for e in events:
+        e['age'] += dt
+    mag = abs(scr_s)
+    prevmag = abs(st['prev_scr'])
+    if not off_wrist:
+        sustained = 0.0 if mag <= _ABS_SCR_THRESH else (mag - _ABS_SCR_THRESH) / (1.0 - _ABS_SCR_THRESH)
+        rise = max(0.0, mag - prevmag) * _ABS_SCR_RISE_GAIN
+        st['scr_acc'] += sustained * _ABS_SCR_PER_SEC * dt + rise
+        spawned = 0
+        while st['scr_acc'] >= 1.0 and spawned < 4 and len(events) < 12:
+            direction = -1.0 if scr_s < 0.0 else 1.0
+            inten = min(1.0, max(mag, sustained))
+            pi = float(st['scr_next'])
+            eu = (pi * 0.6180339 + st['local'] * 0.037) % 1.0
+            ev = (pi * 0.381966 + np.sin(st['local'] * 0.11 + pi) * 0.17) % 1.0
+            events.append({'cu': eu, 'cv': ev, 'age': 0.0,
+                           'life': _ABS_SCR_LIFE * (0.75 + 0.6 * inten),
+                           'radius': _ABS_SCR_RADIUS * (0.75 + 0.65 * inten),
+                           'inten': 0.35 + 0.65 * inten, 'dir': direction})
+            _abs_spawn_sparks(st, eu, ev, direction * inten)
+            st['scr_next'] += 1
+            st['scr_acc'] -= 1.0
+            spawned += 1
+        st['scr_acc'] = min(st['scr_acc'], 4.0)
+    st['prev_scr'] = scr_s
+    st['scr_events'] = events
+
+    offset = np.zeros((n, 3), np.float32)
+    energy = np.zeros(n, np.float32)
+    for e in events:
+        nage = min(1.0, e['age'] / max(1e-4, e['life']))
+        ed = -1.0 if e['dir'] < 0.0 else 1.0
+        ring_r = e['radius'] * ((1.0 - nage) if ed < 0.0 else nage)
+        # Floor the band at ~60% of vertex spacing so rings still catch
+        # particles on a sparse 5x5 grid.
+        ring_w = max(0.025 + (0.07 - 0.025) * e['inten'],
+                     0.6 / max(_ABS_GRID_W - 1, 1))
+        d = np.sqrt((u - e['cu']) ** 2 + (v - e['cv']) ** 2)
+        ring = 1.0 - np.clip(np.abs(d - ring_r) / ring_w, 0.0, 1.0)
+        env = np.sin(nage * np.pi) * (1.0 - nage * 0.35)
+        en = (ring * env * e['inten']).astype(np.float32)
+        if ed < 0.0:
+            imp = np.stack([e['cu'] - u, np.zeros_like(u), e['cv'] - v], axis=1)
+            nrm = np.linalg.norm(imp, axis=1, keepdims=True)
+            imp = np.where(nrm > 1e-3, imp / np.maximum(nrm, 1e-5), 0.0)
+            down = np.array([0.0, -1.0, 0.0], np.float32)[None, :]
+            offset += (down + imp * 0.65) * (en * _ABS_SCR_DISP)[:, None]
+        else:
+            # Positive events push the local surface upward AND outward
+            # (mirror of the negative implosion), per the mapping guide.
+            outw = np.stack([u - e['cu'], np.zeros_like(u), v - e['cv']], axis=1)
+            nrm = np.linalg.norm(outw, axis=1, keepdims=True)
+            outw = np.where(nrm > 1e-3, outw / np.maximum(nrm, 1e-5), 0.0)
+            up = np.array([0.0, 1.0, 0.0], np.float32)[None, :]
+            offset += (up + outw * 0.65) * (en * _ABS_SCR_DISP)[:, None]
+        energy = np.maximum(energy, en)
+    return offset, np.clip(energy, 0.0, 1.0)
+
+
+def _abs_update_temp_waves(st, temp_s, dt, off_wrist):
+    """Spawn/age hot(rising)/cold(falling) colour waves that sweep across the mesh."""
+    st['waves'] = [w for w in st['waves'] if (w['age'] + dt) < w['life']]
+    for w in st['waves']:
+        w['age'] += dt
+    if off_wrist:
+        st['w_remaining'] = 0
+        st['w_dir'] = 0.0
+        st['w_timer'] = 0.0
+        return
+    mag = abs(temp_s)
+    rel = _ABS_TW_THRESH * 0.65
+    if mag >= _ABS_TW_THRESH:
+        direction = -1.0 if temp_s < 0.0 else 1.0
+        if st['w_dir'] == 0.0 or (st['w_dir'] < 0.0) != (direction < 0.0):
+            drive = max(0.0, min(1.0, (min(1.0, mag) - _ABS_TW_THRESH) / (1.0 - _ABS_TW_THRESH)))
+            st['w_dir'] = direction
+            st['w_mag'] = min(1.0, mag)
+            st['w_remaining'] = int(round(3.0 + (4.0 - 3.0) * drive))
+            st['w_timer'] = min(st['w_timer'], 0.0)
+    elif mag <= rel and st['w_remaining'] == 0:
+        st['w_dir'] = 0.0
+        st['w_mag'] = 0.0
+        st['w_timer'] = 0.0
+    if st['w_remaining'] > 0 and st['w_dir'] != 0.0:
+        st['w_timer'] -= dt
+        spawned = 0
+        while st['w_timer'] <= 0.0 and st['w_remaining'] > 0 and spawned < 4:
+            inten = min(1.0, abs(st['w_mag']))
+            st['waves'].append({'age': 0.0, 'life': _ABS_TW_LIFE * (0.85 + 0.4 * inten),
+                                'inten': 0.35 + 0.65 * inten, 'dir': st['w_dir'],
+                                'width': _ABS_TW_WIDTH * (0.75 + 0.5 * inten)})
+            st['w_remaining'] -= 1
+            spawned += 1
+            drive = max(0.0, min(1.0, (st['w_mag'] - _ABS_TW_THRESH) / (1.0 - _ABS_TW_THRESH)))
+            st['w_timer'] += max(0.05, _ABS_TW_INTERVAL) * (1.25 + (0.65 - 1.25) * drive)
+
+
+def _abs_wave_energy(st):
+    """Per-vertex trend-wave energy (N,) and hot/cold mask (N,) for colour tinting."""
+    u = _ABS_GRID_U
+    n = u.shape[0]
+    energy = np.zeros(n, np.float32)
+    is_hot = np.zeros(n, dtype=bool)
+    for w in st['waves']:
+        nage = min(1.0, w['age'] / max(1e-4, w['life']))
+        width = max(1e-4, w['width'])
+        direction = 1.0 if w['dir'] > 0.0 else -1.0
+        if direction > 0.0:
+            front = -width + (1.0 + width - (-width)) * nage
+            dist = front - u
+        else:
+            front = (1.0 + width) + (-width - (1.0 + width)) * nage
+            dist = u - front
+        mask = (dist >= 0.0) & (dist <= width)
+        t = 1.0 - np.clip(dist / width, 0.0, 1.0)
+        tail = t * t * (3.0 - 2.0 * t)            # smoothstep
+        en = np.where(mask, tail * np.sin(nage * np.pi) * w['inten'], 0.0).astype(np.float32)
+        upd = en > energy
+        energy = np.where(upd, en, energy)
+        is_hot = np.where(upd, direction > 0.0, is_hot)
+    return np.clip(energy, 0.0, 1.0), is_hot
+
+
+def _abs_update_trails(st, verts, temp_s, dt, off_wrist):
+    """Record lifted vertex trajectories (up=warming / down=cooling); the fading
+    streaks these produce are the 'arrows' seen through the glasses."""
+    mag = abs(temp_s)
+    active = (not off_wrist) and (mag >= _ABS_TW_THRESH * 0.65) and (st['trail_active'] or mag >= _ABS_TW_THRESH)
+    if not active:
+        st['trail_active'] = False
+        st['trail_dir'] = 0.0
+        st['trail_fill'] = 0
+        st['trail_head'] = 0
+        return
+    direction = st['trail_dir']
+    if mag >= _ABS_TW_THRESH:
+        direction = 1.0 if temp_s > 0.0 else -1.0
+    if st['trail_dir'] != 0.0 and (st['trail_dir'] < 0.0) != (direction < 0.0):
+        st['trail_fill'] = 0
+        st['trail_head'] = 0
+    st['trail_active'] = True
+    st['trail_dir'] = direction
+    st['trail_strength'] = max(0.0, min(1.0, (mag - _ABS_TW_THRESH) / (1.0 - _ABS_TW_THRESH)))
+    lift = np.array([0.0, _ABS_TT_LIFT * direction, 0.0], np.float32)
+    st['trail_buf'][:, st['trail_head'], :] = verts[_ABS_TRAIL_IDX] + lift
+    st['trail_head'] = (st['trail_head'] + 1) % _ABS_TT_HISTORY
+    if st['trail_head'] == 0:
+        st['trail_fill'] = 1
+    st['trail_avail'] = _ABS_TT_HISTORY if st['trail_fill'] else st['trail_head']
+
+
+def _abs_project(P, x, y, w, h, yaw, pitch, zoom):
+    """Oblique perspective projection of mesh points (N,3) into panel pixels.
+    Returns (screen_x, screen_y, depth, perspective)."""
+    cyaw, syaw = np.cos(yaw), np.sin(yaw)
+    cpit, spit = np.cos(pitch), np.sin(pitch)
+    Dcam = 3.4
+    cx = x + w * 0.5
+    cy = y + h * 0.5
+    span = 0.72
+    vfac = abs(spit) * span + 0.35 * abs(cpit) + 0.1
+    f = min((w * 0.5 - 3) / (span + 0.05), (h * 0.5 - 3) / max(0.3, vfac)) * zoom
+    f = max(4.0, f)
+    Xr = P[:, 0] * cyaw + P[:, 2] * syaw
+    Zr = -P[:, 0] * syaw + P[:, 2] * cyaw
+    Yr = P[:, 1]
+    Yr2 = Yr * cpit - Zr * spit
+    Zr2 = Yr * spit + Zr * cpit
+    persp = Dcam / np.clip(Dcam - Zr2, 0.35, None)
+    return cx + Xr * f * persp, cy - Yr2 * f * persp, Zr2, persp
+
+
+def _abstract_latest_z(metrics, hist, key):
+    """Latest z-score for a channel: prefer the live metric, else the history tail."""
+    val = metrics.get(key)
+    if val is None and hist:
+        val = hist[-1]
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def draw_abstract_particle_panel(img, x, y, w, h, serial, metrics,
+                                 hr_hist, scr_hist, stroc_hist,
+                                 view=None, dimmed=False, off_wrist=False):
+    """Faithful render of the AR ParticleMeshVisualizer for one wearer into
+    img[y:y+h, x:x+w]. A 20x20 flat grid mesh (each vertex is a particle) lives
+    in the XZ plane and is driven by the same physiology the glasses use:
+      * tonic EDA (eda_z)          -> slow form compression/lift of the plane;
+      * SCR frequency (scr_freq_z) -> ring events (rise=up, fall=down+implosion)
+        and white sparks;
+      * heart rate (hr_z)          -> particle-size pulse and corner halos;
+      * temperature rate (roc_z)   -> hot/cold colour trend waves and lifted
+        trails (the streaks read as up=warming / down=cooling);
+      * engagement                 -> rigidity vs looseness drift (defaults to
+        the AR neutral 0.5 when no engagement value is supplied).
+    When off_wrist, all signal targets are forced neutral, the panel is dimmed
+    and an 'OFF-WRIST' watermark is drawn, matching the SD plot treatment. The
+    per-wearer `view` dict (yaw/pitch/zoom) orbits/tilts/zooms the mesh to the
+    oblique angle seen through the glasses.
+    """
+    if w < 16 or h < 16:
+        return
+
+    cv2.rectangle(img, (x, y), (x + w, y + h), (18, 18, 20), -1)
+
+    if view is None:
+        view = _ABS_DEFAULT_VIEW
+    yaw = float(view.get('yaw', 0.6))
+    pitch = float(view.get('pitch', 1.0))
+    zoom = float(view.get('zoom', 1.0))
+
+    # ---- Read input channels (z-score / 3 -> ~[-1,1]); off-wrist = neutral ----
+    def _clamp1(v):
+        return max(-1.0, min(1.0, v))
+
+    now = time.time()
+
+    # ---- Off-wrist: no data arriving. Freeze to a static, greyed, flat mesh ----
+    # The publisher drops every *_z key while off the wrist, so there is nothing
+    # to animate. Stop the physics and just watermark it, matching the SD plot.
+    if off_wrist:
+        st = _abstract_state.get(serial)
+        if st is not None and st.get('kind') == 'mesh':
+            st['t'] = now                      # avoid a dt spike when contact returns
+        base = _ABS_GRID_BASE
+        sx, sy, _zr, _pn = _abs_project(base, x, y, w, h, yaw, pitch, zoom)
+        xi = np.clip(sx, x + 1, x + w - 2).astype(np.int32)
+        yi = np.clip(sy, y + 1, y + h - 2).astype(np.int32)
+        for gidx in _ABS_GRID_ROWS + _ABS_GRID_COLS:
+            pts = np.stack([xi[gidx], yi[gidx]], axis=1).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], False, (55, 55, 58), 1, cv2.LINE_AA)
+        for idx in range(base.shape[0]):
+            cv2.circle(img, (int(xi[idx]), int(yi[idx])), 1, (95, 95, 98), -1, cv2.LINE_AA)
+        ov = img.copy()
+        cv2.rectangle(ov, (x, y), (x + w, y + h), (0, 0, 0), -1)
+        cv2.addWeighted(ov, 0.5, img, 0.5, 0, img)
+        wm = "OFF-WRIST"
+        (ww, wh), _ = cv2.getTextSize(wm, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        cv2.putText(img, wm, (x + (w - ww) // 2, y + (h + wh) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 220), 1, cv2.LINE_AA)
+        cv2.putText(img, "abstract", (x + 3, y + h - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, (95, 95, 95), 1, cv2.LINE_AA)
+        return
+
+    eda_in = _clamp1(_abstract_latest_z(metrics, [], 'eda_z') / 3.0)
+    temp_in = _clamp1(_abstract_latest_z(metrics, stroc_hist, 'temperature_roc_z') / 3.0)
+    scr_in = _clamp1(_abstract_latest_z(metrics, scr_hist, 'scr_frequency_z') / 3.0)
+    # HR must NOT fall back to stale history: per the mapping guide, stale
+    # heart-rate data returns the particles to neutral and fades the active
+    # halos (reference rings stay). The publisher drops hr_z when it has no
+    # fresh reading, so 'missing from metrics' == stale.
+    hr_live = metrics.get('hr_z') is not None
+    hr_in = _clamp1(_abstract_latest_z(metrics, [], 'hr_z') / 3.0) if hr_live else 0.0
+    eng_in = max(0.0, min(1.0, float(metrics.get('engagement', 0.5))))
+
+    # Keyboard-mocked signals (see main-loop key handlers) override live data.
+    _mk = _abs_mock_value('eda', now)
+    if _mk is not None:
+        eda_in = _clamp1(_mk / 3.0)
+    _mk = _abs_mock_value('temp', now)
+    if _mk is not None:
+        temp_in = _clamp1(_mk / 3.0)
+    _mk = _abs_mock_value('scr', now)
+    if _mk is not None:
+        scr_in = _clamp1(_mk / 3.0)
+    _mk = _abs_mock_value('hr', now)
+    if _mk is not None:
+        hr_in = _clamp1(_mk / 3.0)
+        hr_live = True
+    _mk = _abs_mock_value('eng', now)
+    if _mk is not None:
+        eng_in = max(0.0, min(1.0, 0.5 + _mk / 5.0))
+
+    st = _abstract_state.get(serial)
+    if st is None or st.get('kind') != 'mesh':
+        st = _abs_new_state(now)
+        _abstract_state[serial] = st
+    dt = min(0.1, max(0.0, now - st['t']))
+    st['t'] = now
+    st['local'] += dt
+    if hr_live:
+        st['hr_fresh_t'] = now
+    hr_fresh = (now - st['hr_fresh_t']) <= 3.0
+    st['halo_alpha'] += ((1.0 if hr_fresh else 0.0) - st['halo_alpha']) * min(1.0, dt * 3.0)
+
+    fast = min(1.0, 1.0 - np.exp(-_ABS_SIG_FAST * dt))
+    slow = min(1.0, 1.0 - np.exp(-_ABS_SIG_SLOW * dt))
+    st['eda'] += (eda_in - st['eda']) * slow
+    st['temp'] += (temp_in - st['temp']) * slow
+    st['scr'] += (scr_in - st['scr']) * fast
+    st['hr'] += (hr_in - st['hr']) * fast
+    st['eng'] += (eng_in - st['eng']) * fast
+    eda_s, temp_s, scr_s, hr_s, eng_s = st['eda'], st['temp'], st['scr'], st['hr'], st['eng']
+
+    # ---- Heart-rate response: direction, magnitude, pulse phase ----
+    hr_abs = abs(hr_s)
+    hr_mag = 0.0
+    if hr_abs <= _ABS_HR_DEADBAND:
+        hr_dir = 0.0
+        base_scale = 1.0
+        bpm = _ABS_HR_BPM_NEUTRAL
+    else:
+        hr_dir = -1.0 if hr_s < 0.0 else 1.0
+        hr_mag = (hr_abs - _ABS_HR_DEADBAND) / (1.0 - _ABS_HR_DEADBAND)
+        if hr_dir < 0.0:
+            base_scale = 1.0 + (_ABS_HR_PSCALE_NEG - 1.0) * hr_mag
+            bpm = _ABS_HR_BPM_NEUTRAL + (_ABS_HR_BPM_MIN - _ABS_HR_BPM_NEUTRAL) * hr_mag
+        else:
+            base_scale = 1.0 + (_ABS_HR_PSCALE_POS - 1.0) * hr_mag
+            bpm = _ABS_HR_BPM_NEUTRAL + (_ABS_HR_BPM_MAX - _ABS_HR_BPM_NEUTRAL) * hr_mag
+    st['hr_phase'] = (st['hr_phase'] + (bpm / 60.0) * dt) % 1.0
+    ph = st['hr_phase']
+    if ph < _ABS_HR_ACTIVE_PHASE:
+        pulse_energy = float(np.sin((ph / _ABS_HR_ACTIVE_PHASE) * np.pi)) ** 2
+    else:
+        pulse_energy = 0.0
+    if hr_dir < 0.0:
+        pulse_scale = 1.0 - pulse_energy * _ABS_HR_DEPTH_NEG
+    elif hr_dir > 0.0:
+        pulse_scale = 1.0 + pulse_energy * _ABS_HR_DEPTH_POS
+    else:
+        pulse_scale = 1.0 + pulse_energy * _ABS_HR_DEPTH_NEUTRAL
+    particle_scale = max(0.1, base_scale * pulse_scale)
+
+    # ---- Slow "form" from tonic EDA (compression + pressure lift) ----
+    u, v = _ABS_GRID_U, _ABS_GRID_V
+    n = u.shape[0]
+    tonic_mag = abs(eda_s)
+    form_comp = 1.0 + ((0.62 if eda_s >= 0.0 else 1.45) - 1.0) * tonic_mag
+    form_lift = 0.02 + ((0.2 if eda_s >= 0.0 else -0.08) - 0.02) * tonic_mag
+    xx = (u - 0.5) * 2.0
+    zz = (v - 0.5) * 2.0
+    edge = np.clip(np.maximum(np.abs(xx), np.abs(zz)), 0.0, 1.0)
+    slow_form = np.stack([xx * form_comp, form_lift * (1.0 - edge), zz * form_comp], axis=1).astype(np.float32)
+
+    # ---- Engagement rigidity -> looseness drift / coherence -> turbulence ----
+    solidity = max(0.0, min(1.0, eng_s))
+    looseness = 1.0 - solidity
+    looseness_resp = looseness ** _ABS_RIGIDITY_POWER
+    coherence = max(0.0, min(1.0, solidity * _ABS_MESH_COHERENCE + 0.15))
+    noise_amount = _ABS_TURBULENCE * (1.0 + (0.65 - 1.0) * coherence)
+
+    # ---- SCR ring events + sparks (per-vertex offset/energy) ----
+    scr_offset, scr_energy = _abs_scr_events(st, scr_s, dt, off_wrist)
+
+    # ---- Turbulence + looseness drift ----
+    tl = st['local'] * _ABS_MOTION_SPEED
+    turb = np.stack([
+        _abs_snoise(u * 3.7, v * 3.7, tl),
+        _abs_snoise(u * 5.3 + 17.13, v * 5.3, tl),
+        _abs_snoise(u * 4.1, v * 4.1 + 29.77, -tl)], axis=1).astype(np.float32) * noise_amount
+    if looseness_resp > 1e-3:
+        dl = st['local'] * _ABS_DRIFT_SPEED
+        wander = np.stack([
+            _abs_snoise(_ABS_DRIFT_SEED[:, 0], v * 2.1, dl),
+            _abs_snoise(u * 2.1, _ABS_DRIFT_SEED[:, 1], dl * 0.7),
+            _abs_snoise(_ABS_DRIFT_SEED[:, 1], _ABS_DRIFT_SEED[:, 0], -dl)], axis=1).astype(np.float32)
+        drift = (_ABS_DRIFT_DIR + wander * 0.55) * (_ABS_DRIFT_RADIUS * looseness_resp)
+    else:
+        drift = 0.0
+
+    target = (slow_form + scr_offset) * _ABS_VISUAL_SCALE + turb + drift
+    st['verts'], st['vel'] = _abs_smoothdamp(st['verts'], target.astype(np.float32),
+                                             st['vel'], _ABS_MORPH_TIME, dt)
+    verts = st['verts']
+
+    # ---- Temperature trend waves + trails ----
+    _abs_update_temp_waves(st, temp_s, dt, off_wrist)
+    wave_energy, wave_is_hot = _abs_wave_energy(st)
+    _abs_update_trails(st, verts, temp_s, dt, off_wrist)
+
+    # ---- Per-vertex colour: neutral -> white (SCR energy) -> hot/cold (waves) ----
+    scr_e = np.clip(scr_energy * 0.65, 0.0, 1.0)[:, None]
+    col = _ABS_NEUTRAL_BGR[None, :] * (1.0 - scr_e) + _ABS_WHITE_BGR[None, :] * scr_e
+    trend = np.where(wave_is_hot[:, None], _ABS_HOT_BGR[None, :], _ABS_COLD_BGR[None, :])
+    we = (wave_energy * _ABS_TW_TINT)[:, None]
+    col = col * (1.0 - we) + trend * we
+    if dimmed:
+        col = col * 0.35
+
+    # ---- Camera + perspective projection (shared module helper) ----
+    def _proj(P):
+        return _abs_project(P, x, y, w, h, yaw, pitch, zoom)
+
+    sx, sy, zr, persp = _proj(verts)
+    xi = np.clip(sx, x + 1, x + w - 2).astype(np.int32)
+    yi = np.clip(sy, y + 1, y + h - 2).astype(np.int32)
+    pn = (persp - persp.min()) / (persp.max() - persp.min() + 1e-6)
+
+    # ---- Filled mesh surface (Unity look: cells between the wires shade green) ----
+    fill_shade = 0.06 if dimmed else 0.16
+    fill = tuple(int(c * fill_shade) for c in _ABS_NEUTRAL_BGR)
+    quads = []
+    for gy in range(_ABS_GRID_H - 1):
+        r0 = gy * _ABS_GRID_W
+        for gx in range(_ABS_GRID_W - 1):
+            a = r0 + gx
+            quads.append(np.array([[xi[a], yi[a]],
+                                   [xi[a + 1], yi[a + 1]],
+                                   [xi[a + _ABS_GRID_W + 1], yi[a + _ABS_GRID_W + 1]],
+                                   [xi[a + _ABS_GRID_W], yi[a + _ABS_GRID_W]]], np.int32))
+    cv2.fillPoly(img, quads, fill, cv2.LINE_AA)
+
+    # ---- Mesh wireframe (rows + columns) ----
+    wire_shade = 0.12 if dimmed else 0.25
+    wire = tuple(int(c * wire_shade) for c in _ABS_NEUTRAL_BGR)
+    for ridx in _ABS_GRID_ROWS:
+        pts = np.stack([xi[ridx], yi[ridx]], axis=1).reshape(-1, 1, 2)
+        cv2.polylines(img, [pts], False, wire, 1, cv2.LINE_AA)
+    for cidx in _ABS_GRID_COLS:
+        pts = np.stack([xi[cidx], yi[cidx]], axis=1).reshape(-1, 1, 2)
+        cv2.polylines(img, [pts], False, wire, 1, cv2.LINE_AA)
+
+    # ---- Temperature trails (fading lifted streaks) ----
+    if st['trail_active'] and st['trail_avail'] >= 2:
+        avail = st['trail_avail']
+        head = st['trail_head']
+        order_idx = [(head - 1 - k) % _ABS_TT_HISTORY for k in range(avail)]  # newest -> oldest
+        buf = st['trail_buf']
+        strength = st['trail_strength']
+        trail_col = _ABS_HOT_BGR if st['trail_dir'] > 0.0 else _ABS_COLD_BGR
+        maxa = _ABS_TT_MAXALPHA * strength * (0.35 if dimmed else 1.0)
+        tc = tuple(int(min(255, c * maxa)) for c in trail_col)
+        # Larger temperature magnitude -> stronger AND wider trails (spec).
+        tthick = 2 if strength >= 0.55 else 1
+        if maxa > 0.02:
+            for ti in range(buf.shape[0]):
+                pts3 = buf[ti, order_idx, :]
+                tsx, tsy, _, _ = _proj(pts3)
+                tpx = np.clip(tsx, x + 1, x + w - 2).astype(np.int32)
+                tpy = np.clip(tsy, y + 1, y + h - 2).astype(np.int32)
+                pts = np.stack([tpx, tpy], axis=1).reshape(-1, 1, 2)
+                cv2.polylines(img, [pts], False, tc, tthick, cv2.LINE_AA)
+
+    # ---- Particles (vertices), painter-sorted far -> near ----
+    order = np.argsort(zr)
+    # Particle radius scales inversely with grid density so a sparse 5x5 mesh
+    # keeps the chunky per-particle look of the glasses.
+    base_r = max(1.0, min(w, h) * _ABS_PARTICLE_SIZE * 20.0 * 0.04 * (10.0 / _ABS_GRID_W))
+    for idx in order:
+        c = col[idx]
+        cc = (int(c[0]), int(c[1]), int(c[2]))
+        r = max(1, int(round(base_r * particle_scale * (0.6 + 0.6 * float(pn[idx])))))
+        cv2.circle(img, (int(xi[idx]), int(yi[idx])), r, cc, -1, cv2.LINE_AA)
+
+    # ---- SCR sparks (integrate + draw white fading dots) ----
+    sp = st['sparks']
+    if len(sp):
+        sp[:, 0:3] += sp[:, 3:6] * dt
+        sp[:, 3:6] += (0.0 - sp[:, 3:6]) * min(1.0, dt * 1.8)
+        sp[:, 6] -= dt
+        sp = sp[sp[:, 6] > 0.0]
+    st['sparks'] = sp
+    if len(sp):
+        spx, spy, _, _ = _proj(sp[:, 0:3])
+        # Per the Unity capture, sparks are the particle shade rather than white.
+        spark_base = _ABS_NEUTRAL_BGR * 0.85 + _ABS_WHITE_BGR * 0.15
+        # Sparks scale with the (now chunky) particle size instead of fixed 1px.
+        spr = max(1, int(round(base_r * 0.45)))
+        for m in range(len(sp)):
+            life_f = min(1.0, float(sp[m, 6]) / _ABS_SPARK_LIFE)
+            sc = spark_base * (life_f * (0.35 if dimmed else 1.0))
+            X1 = int(np.clip(spx[m], x + 1, x + w - 2))
+            Y1 = int(np.clip(spy[m], y + 1, y + h - 2))
+            cv2.circle(img, (X1, Y1), spr, (int(sc[0]), int(sc[1]), int(sc[2])), -1, cv2.LINE_AA)
+
+    # ---- Heart-rate corner halos (upper semicircles, per the mapping guide):
+    # a FIXED neutral reference ring plus an active halo that sits outside it
+    # (HR high) or inside it (HR low), pulses on the shared clock without ever
+    # crossing the reference ring, follows its corner particle with slight
+    # centre smoothing, and fades out when HR data goes stale. ----
+    if not off_wrist:
+        neutral_r = max(3.0, min(w, h) * 0.16)
+        gap = max(2.0, neutral_r * 0.06)
+        if hr_dir > 0.0:
+            act_r = (neutral_r * (1.0 + (_ABS_HR_HALO_SCALE_POS - 1.0) * hr_mag)
+                     + pulse_energy * neutral_r * 0.10)
+            act_r = max(act_r, neutral_r + gap)
+        elif hr_dir < 0.0:
+            act_r = (neutral_r * (1.0 - (1.0 - _ABS_HR_HALO_SCALE_NEG) * hr_mag)
+                     - pulse_energy * neutral_r * 0.10)
+            act_r = min(act_r, neutral_r - gap)
+        else:
+            act_r = neutral_r
+        ref_dim = 0.35 if dimmed else 1.0
+        ref_c = tuple(int(c * 0.22 * ref_dim) for c in _ABS_HALO_REF_BGR)
+        halo_a = float(st['halo_alpha'])
+        act_alpha = (0.62 + 0.38 * pulse_energy) * ref_dim * halo_a
+        act_c = tuple(int(min(255, c * act_alpha)) for c in _ABS_HALO_ACT_BGR)
+        hxy = st['halo_xy']
+        follow = min(1.0, dt * 8.0)
+        rr = int(round(neutral_r))
+        ar = int(round(act_r))
+        for ci, corner in enumerate(_ABS_CORNERS):
+            txc, tyc = float(xi[corner]), float(yi[corner])
+            if hxy[ci, 0] < 0.0:
+                hxy[ci, 0], hxy[ci, 1] = txc, tyc
+            else:
+                hxy[ci, 0] += (txc - hxy[ci, 0]) * follow
+                hxy[ci, 1] += (tyc - hxy[ci, 1]) * follow
+            cxp, cyp = int(round(hxy[ci, 0])), int(round(hxy[ci, 1]))
+            if rr >= 2:
+                cv2.ellipse(img, (cxp, cyp), (rr, rr), 0, 180, 360, ref_c, 1, cv2.LINE_AA)
+            if halo_a > 0.03 and ar >= 2:
+                cv2.ellipse(img, (cxp, cyp), (ar, ar), 0, 180, 360, act_c, 1, cv2.LINE_AA)
+
+    cv2.putText(img, "abstract", (x + 3, y + h - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.22, (95, 95, 95), 1, cv2.LINE_AA)
+
+
+# =============================================================================
 # EMOTIBIT SIDEBAR
 # =============================================================================
 
 def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                           focus_target, sidebar_radio_rects, sidebar_w,
-                          reconnect_rect_out=None):
+                          reconnect_rect_out=None, abstract_views=None,
+                          abstract_rects_out=None, abstract_heights=None):
     """Return a (h, sidebar_w, 3) uint8 image for the physio sidebar.
     Mutates sidebar_radio_rects in place with (y_top, y_bot, serial) tuples.
     If reconnect_rect_out is given, it is filled with a single
-    (x0, y0, x1, y1) tuple (sidebar-local coords) for the reconnect button."""
+    (x0, y0, x1, y1) tuple (sidebar-local coords) for the reconnect button.
+    abstract_views maps serial -> its own {yaw,pitch,zoom} camera (independent
+    per wearer); abstract_rects_out, if given, is filled with each abstract
+    panel's (x0, y0, x1, y1, serial) sidebar-local rect for mouse hit-testing."""
     sidebar_radio_rects.clear()
+    if abstract_rects_out is not None:
+        abstract_rects_out.clear()
 
     # Snapshot connected device serials once under the lock
     with emotibit_lock:
@@ -1620,6 +2394,11 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
     cols = 2 if n > 4 else 1
     total_w = sidebar_w * cols
     sidebar = np.full((h, total_w, 3), 28, dtype=np.uint8)
+    # Grab handle for the draggable left border (see on_mouse resize logic):
+    # a subtle vertical ridge with grip dots so users find they can resize it.
+    cv2.line(sidebar, (1, 0), (1, h), (70, 70, 74), 2)
+    for _gy in range(h // 2 - 18, h // 2 + 19, 6):
+        cv2.circle(sidebar, (2, _gy), 1, (120, 120, 125), -1)
     cv2.putText(sidebar, "EmotiBit", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
 
@@ -1659,12 +2438,21 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
     rows_per_col = (n + cols - 1) // cols
     available_h = h - 28 - (_BTN_H + 2 * _BTN_M)
     row_h = max(60, min(140, available_h // max(rows_per_col, 1)))
+    # Rows stack per column: a wearer's row grows by the extra height the user
+    # dragged onto its abstract panel (bottom-border drag, see on_mouse), so
+    # enlarging one abstract plot pushes the rows below it down.
+    col_y = [28] * cols
     for i, (serial, is_enrolled) in enumerate(rows):
         col = i // rows_per_col
-        row_in_col = i % rows_per_col
         x_off = col * col_w
-        y0 = 28 + row_in_col * row_h
-        y1 = min(y0 + row_h - 2, h - 2)
+        extra_h = 0
+        if ENABLE_ABSTRACT_PANEL and abstract_heights is not None:
+            extra_h = int(min(400.0, max(0.0, float(abstract_heights.get(serial, 0.0)))))
+        y0 = col_y[col]
+        col_y[col] = y0 + row_h + extra_h
+        if y0 > h - 40:
+            continue   # pushed off-screen by enlarged rows above
+        y1 = min(y0 + row_h + extra_h - 2, h - 2)
         # Only enrolled rows are clickable focus targets
         if is_enrolled:
             sidebar_radio_rects.append((y0, y1, serial))
@@ -1773,6 +2561,22 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             if i < n - 1:
                 cv2.line(sidebar, (x_off + 4, y1), (x_off + col_w - 4, y1), (50, 50, 50), 1)
             continue
+
+        # Carve a band off the bottom of the panel for the AR abstract visual
+        # (ParticleMeshVisualizer port). The +-SD spline shrinks to make room so
+        # both share the wearer's row; skipped when the row is too short to split.
+        abstract_h = 0
+        if ENABLE_ABSTRACT_PANEL and plot_ph >= 46:
+            # Split the row between the objective +-SD spline (top) and the AR
+            # abstract visual (bottom). The base row is split evenly; any extra
+            # height dragged onto the row (abstract bottom-border drag, see
+            # on_mouse) goes entirely to the abstract visual, so it grows
+            # without shrinking the +-SD spline.
+            total_split = plot_ph - 3
+            base_split = max(0, total_split - extra_h)
+            abstract_h = int(min(total_split - 22,
+                                 max(22, round(base_split * 0.5) + extra_h)))
+            plot_ph = plot_ph - abstract_h - 3
 
         cv2.rectangle(sidebar, (plot_x, plot_y),
                       (plot_x + plot_pw, plot_y + plot_ph), (42, 42, 42), -1)
@@ -1900,6 +2704,35 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
             cv2.addWeighted(overlay, 0.45, sidebar, 0.55, 0, sidebar)
             cv2.putText(sidebar, wm, (wx, wy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 90, 220), 1, cv2.LINE_AA)
+
+        # ------ AR abstract physiological visual (under the +-SD panel) ------
+        if abstract_h > 0:
+            _abs_x0 = plot_x
+            _abs_y0 = plot_y + plot_ph + 3
+            cv2.line(sidebar, (plot_x + 6, plot_y + plot_ph + 1),
+                     (plot_x + plot_pw - 6, plot_y + plot_ph + 1), (70, 70, 74), 1)
+            _view = None
+            if abstract_views is not None:
+                _view = abstract_views.get(serial)
+                if _view is None:
+                    _view = {'yaw': _ABS_DEFAULT_VIEW['yaw'],
+                             'pitch': _ABS_DEFAULT_VIEW['pitch'],
+                             'zoom': _ABS_DEFAULT_VIEW['zoom']}
+                    abstract_views[serial] = _view
+            draw_abstract_particle_panel(
+                sidebar, _abs_x0, _abs_y0, plot_pw, abstract_h,
+                serial, snap_metrics, snap_hr_z, snap_scr_z, snap_stroc_z,
+                view=_view, dimmed=is_calibrating, off_wrist=is_off_wrist)
+            # Resize grip on the abstract plot's BOTTOM border: drag down to
+            # grow the abstract visual (its row grows with it), up to shrink.
+            _div_y = _abs_y0 + abstract_h
+            cv2.line(sidebar, (plot_x + 6, _div_y), (plot_x + plot_pw - 6, _div_y),
+                     (70, 70, 74), 1)
+            for _gx in range(plot_x + plot_pw // 2 - 12, plot_x + plot_pw // 2 + 13, 6):
+                cv2.circle(sidebar, (_gx, _div_y), 1, (120, 120, 125), -1)
+            if abstract_rects_out is not None:
+                abstract_rects_out.append((_abs_x0, _abs_y0,
+                                           _abs_x0 + plot_pw, _abs_y0 + abstract_h, serial))
         if i < n - 1:
             cv2.line(sidebar, (x_off + 4, y1), (x_off + col_w - 4, y1), (50, 50, 50), 1)
     _draw_reconnect_button()
@@ -2012,15 +2845,121 @@ def main():
     reconnect_btn_rect = []   # [(x0, y0, x1, y1)] sidebar-local, updated each frame
     video_w_box    = [0]      # video pixel width, set on first frame
     _mouse_cb_set  = [False]  # set mouse callback once after first imshow
+    sidebar_w_box  = [SIDEBAR_W]  # live sidebar width; user-draggable left border
+    abstract_panel_rects = []  # [(x0, y0, x1, y1, serial)] sidebar-local panels
+    abstract_views = {}        # serial -> {yaw, pitch, zoom}; independent per wearer
+    abstract_heights = {}      # serial -> extra abstract-panel px (0..400); drag its bottom border
+    _abstract_hover = {'serial': None}   # panel under the cursor (for wheel zoom)
+    _abstract_drag = {'serial': None, 'last': (0, 0)}  # active drag target
+    _abstract_hresize = {'serial': None, 'last_y': 0}  # dragging a panel's divider
+    _ABS_DIV_GRAB = 6         # px grab zone around an abstract panel's bottom border
+    _sidebar_resize = {'active': False, 'last_x': 0}   # dragging the left border
+    _SIDEBAR_GRAB = 8         # px grab zone around the sidebar's left border
+    _SIDEBAR_MIN = 160
+    _SIDEBAR_MAX = 900
 
     def on_mouse(event, x, y, flags, param):
         nonlocal focus_target, reconnect_flash_until, reconnect_flash_msg
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
         vw = video_w_box[0]
-        if vw == 0 or x < vw:   # click is inside the video, not the sidebar
+        if vw == 0:
             return
         lx = x - vw             # x relative to the sidebar's left edge
+
+        def _serial_at(px_local, py):
+            for (ax0, ay0, ax1, ay1, ser) in abstract_panel_rects:
+                if ax0 <= px_local <= ax1 and ay0 <= py <= ay1:
+                    return ser
+            return None
+
+        # --- Draggable left border of the sidebar (resize the plot margin) ---
+        # The border sits at screen x == video width. Grab it and drag left to
+        # widen the plot area / right to shrink it. Takes priority over the
+        # abstract-panel orbit drag and the radio-row clicks.
+        if event == cv2.EVENT_LBUTTONDOWN and abs(x - vw) <= _SIDEBAR_GRAB:
+            _sidebar_resize['active'] = True
+            _sidebar_resize['last_x'] = x
+            return
+        if _sidebar_resize['active']:
+            if event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+                dx = x - _sidebar_resize['last_x']
+                sidebar_w_box[0] = int(min(_SIDEBAR_MAX, max(_SIDEBAR_MIN,
+                                                             sidebar_w_box[0] - dx)))
+                _sidebar_resize['last_x'] = x
+                return
+            if event == cv2.EVENT_LBUTTONUP or not (flags & cv2.EVENT_FLAG_LBUTTON):
+                _sidebar_resize['active'] = False
+                return
+
+        # --- Drag an abstract panel's BOTTOM border to resize it vertically ---
+        # Drag down to grow the abstract plot (its row grows with it; the +-SD
+        # spline keeps its size), drag up to shrink it back.
+        def _divider_serial_at(px_local, py):
+            for (ax0, ay0, ax1, ay1, ser) in abstract_panel_rects:
+                if ax0 <= px_local <= ax1 and abs(py - ay1) <= _ABS_DIV_GRAB:
+                    return ser
+            return None
+        if event == cv2.EVENT_LBUTTONDOWN:
+            dser = _divider_serial_at(lx, y)
+            if dser is not None:
+                _abstract_hresize['serial'] = dser
+                _abstract_hresize['last_y'] = y
+                return
+        if _abstract_hresize['serial'] is not None:
+            if event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+                dy = y - _abstract_hresize['last_y']
+                ser = _abstract_hresize['serial']
+                cur = float(abstract_heights.get(ser, 0.0))
+                abstract_heights[ser] = float(min(400.0, max(0.0, cur + dy)))
+                _abstract_hresize['last_y'] = y
+                return
+            if event == cv2.EVENT_LBUTTONUP or not (flags & cv2.EVENT_FLAG_LBUTTON):
+                _abstract_hresize['serial'] = None
+                return
+
+        # --- Independent per-wearer view controls (drag orbit/tilt, wheel zoom) ---
+        if event == cv2.EVENT_MOUSEMOVE:
+            _abstract_hover['serial'] = _serial_at(lx, y)
+            if _abstract_drag['serial'] and (flags & cv2.EVENT_FLAG_LBUTTON):
+                v = abstract_views.get(_abstract_drag['serial'])
+                if v is not None:
+                    px, py = _abstract_drag['last']
+                    v['yaw'] += (x - px) * 0.012
+                    v['pitch'] = float(min(1.5, max(0.15, v['pitch'] + (y - py) * 0.012)))
+                    _abstract_drag['last'] = (x, y)
+            elif not (flags & cv2.EVENT_FLAG_LBUTTON):
+                _abstract_drag['serial'] = None
+            return
+        if event == cv2.EVENT_MOUSEWHEEL:
+            # Wheel events can report stale coords, so fall back to last hover,
+            # and if that still resolves nothing, zoom every panel so the wheel
+            # always does something regardless of the reported position.
+            factor = 1.1 if cv2.getMouseWheelDelta(flags) > 0 else 1.0 / 1.1
+            ser = _serial_at(lx, y) or _abstract_hover['serial']
+            targets = [abstract_views[ser]] if (ser and ser in abstract_views) else list(abstract_views.values())
+            for v in targets:
+                v['zoom'] = float(min(3.5, max(0.4, v['zoom'] * factor)))
+            return
+        if event == cv2.EVENT_RBUTTONDOWN:
+            v = abstract_views.get(_serial_at(lx, y))
+            if v is not None:
+                v['yaw'] = _ABS_DEFAULT_VIEW['yaw']
+                v['pitch'] = _ABS_DEFAULT_VIEW['pitch']
+                v['zoom'] = 1.0
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            ser = _serial_at(lx, y)
+            if ser is not None:
+                _abstract_drag['serial'] = ser
+                _abstract_drag['last'] = (x, y)
+                return
+        if event == cv2.EVENT_LBUTTONUP:
+            _abstract_drag['serial'] = None
+            return
+
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if x < vw:   # click is inside the video, not the sidebar
+            return
         # Reconnect button (sidebar-local coords) takes priority over radio rows.
         if reconnect_btn_rect:
             bx0, by0, bx1, by1 = reconnect_btn_rect[0]
@@ -3050,8 +3989,11 @@ def main():
         _sidebar = draw_emotibit_sidebar(
             h,
             face_id.enrolled_names if face_id and not is_360 else [],
-            emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, SIDEBAR_W,
+            emotibit_data, emotibit_lock, focus_target, sidebar_radio_rects, sidebar_w_box[0],
             reconnect_btn_rect,
+            abstract_views=abstract_views,
+            abstract_rects_out=abstract_panel_rects,
+            abstract_heights=abstract_heights,
         )
         # Lazily create the main window as resizable on the very first frame.
         # Doing this here (after any --select-camera preview has been torn
@@ -3069,16 +4011,61 @@ def main():
             _mouse_cb_set[0] = True
             # Fit the window to the composited frame width on first frame,
             # but cap at 1600px so it never opens larger than typical laptop screens.
-            _full_w = w + SIDEBAR_W
+            _full_w = w + _sidebar.shape[1]
             _init_w = min(_full_w, 1600)
             _init_h = int(h * (_init_w / _full_w))
             cv2.resizeWindow(_WIN_NAME, _init_w, _init_h)
 
-        key = cv2.waitKey(1) & 0xFF
+        # waitKeyEx, not waitKey: plain waitKey masks Windows extended key
+        # codes (arrow keys) to their low byte (0), which is why arrow-key
+        # zoom never fired. +/-/= still arrive as plain ASCII.
+        raw_key = cv2.waitKeyEx(1)
+        key = (raw_key & 0xFF) if raw_key != -1 else 255
         
         # --- KEY HANDLERS ---
         if key == ord('q'):
             break
+
+        # Up/Down arrows (or +/-) zoom the abstract panel under the cursor,
+        # falling back to every panel when none is hovered. Reliable stand-in
+        # for the mouse wheel, which is flaky on OpenCV's Windows HighGUI.
+        # 2490368/2621440 = Windows up/down arrows; 65362/65364 = GTK.
+        elif raw_key in (2490368, 65362) or key in (ord('+'), ord('=')):
+            _ser = _abstract_hover['serial']
+            _tgt = ([abstract_views[_ser]] if (_ser and _ser in abstract_views)
+                    else list(abstract_views.values()))
+            for _v in _tgt:
+                _v['zoom'] = float(min(3.5, max(0.4, _v['zoom'] * 1.1)))
+        elif raw_key in (2621440, 65364) or key in (ord('-'), ord('_')):
+            _ser = _abstract_hover['serial']
+            _tgt = ([abstract_views[_ser]] if (_ser and _ser in abstract_views)
+                    else list(abstract_views.values()))
+            for _v in _tgt:
+                _v['zoom'] = float(min(3.5, max(0.4, _v['zoom'] / 1.1)))
+
+        # E / Shift+E: inject a full-strength test SCR event (positive ring up /
+        # negative implosion down) into the hovered abstract panel, or all
+        # panels when none is hovered. Real events need |scr_frequency_z| to
+        # swing past ~1.65 SD, which is rare with calm wearers or the simulator.
+        elif key in (ord('e'), ord('E')):
+            _dir = -1.0 if key == ord('E') else 1.0
+            _ser = _abstract_hover['serial']
+            _targets = [_ser] if _ser else list(abstract_views.keys())
+            for _s in _targets:
+                _abs_inject_scr_event(_s, _dir)
+
+        # Mock physiology on ALL abstract panels: lowercase pushes the channel
+        # to +2.5 SD, Shift+key to -2.5 SD, decaying back to neutral (~2.5s
+        # tau; hold the key to sustain). Drives only the abstract visual --
+        # never the +-SD splines, Redis or logs. X clears all mocks.
+        # t=tonic EDA, w=temperature RoC (wave), s=SCR freq, h=HR, g=engagement.
+        elif key in (ord('t'), ord('T'), ord('w'), ord('W'), ord('s'), ord('S'),
+                     ord('h'), ord('H'), ord('g'), ord('G')):
+            _chan = {'t': 'eda', 'w': 'temp', 's': 'scr',
+                     'h': 'hr', 'g': 'eng'}[chr(key).lower()]
+            _abs_mock[_chan] = (2.5 if chr(key).islower() else -2.5, time.time())
+        elif key in (ord('x'), ord('X')):
+            _abs_mock.clear()
         
         # R = Register face — pick from detected EmotiBit serials
         elif key == ord('r') and face_id and not is_360:
@@ -3132,8 +4119,11 @@ def main():
                         h,
                         face_id.enrolled_names if face_id and not is_360 else [],
                         emotibit_data, emotibit_lock, focus_target,
-                        sidebar_radio_rects, SIDEBAR_W,
+                        sidebar_radio_rects, sidebar_w_box[0],
                         reconnect_btn_rect,
+                        abstract_views=abstract_views,
+                        abstract_rects_out=abstract_panel_rects,
+                        abstract_heights=abstract_heights,
                     )
                     cv2.imshow(_WIN_NAME, np.hstack([overlay, _sb_reg]))
                     k = cv2.waitKey(50) & 0xFF
