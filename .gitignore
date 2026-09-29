@@ -49,10 +49,10 @@ Handover_JuneSession/data/sessions/*.jsonl
 Handover_JuneSession/data/sessions/*_summary.json
 Handover_JuneSession/data/sessions/20*_*/
 Handover_JuneSession/data/logs/
-Handover_SeptSession/data/sessions/*.jsonl
-Handover_SeptSession/data/sessions/*_summary.json
-Handover_SeptSession/data/sessions/20*_*/
-Handover_SeptSession/data/logs/
+Handover_November_Session/data/sessions/*.jsonl
+Handover_November_Session/data/sessions/*_summary.json
+Handover_November_Session/data/sessions/20*_*/
+Handover_November_Session/data/logs/
 *.npy
 *.avi
 *.mp4
@@ -112,7 +112,10 @@ handover_ar/
 
 # Face ID weights are downloaded by SETUP.bat on first install (>100 MB,
 # exceeds GitHub's blob limit) — not committed with the handover bundle.
-Handover_SeptSession/model/20180402-114759-vggface2.pt
+Handover_November_Session/model/20180402-114759-vggface2.pt
+Handover_November_Session/model/face_detection_yunet_2023mar.onnx
+Handover_November_Session/model/face_recognition_sface_2021dec.onnx
+Handover_November_Session/yolo11n.pt
 
 # Redis persistence snapshots (runtime data)
 dump.rdb
