@@ -873,11 +873,30 @@ class DeviceAggregator:
 
     def process_window(self):
         processing_start = time.time()  # Start latency measurement
-        
-        with self.lock:
-            if len(self.values["HeartRate"]) < 10 or len(self.values["EDA"]) < 10:
-                return
 
+        with self.lock:
+            awaiting_data = (len(self.values["HeartRate"]) < 10
+                             or len(self.values["EDA"]) < 10)
+        if awaiting_data:
+            # Connected but no plausible HR+EDA yet (typically powered on but
+            # not worn). Publish a 1 Hz presence heartbeat so the GUI draws a
+            # greyed OFF-WRIST row for every detected sensor instead of the
+            # panic-inducing "No EmotiBits connected".
+            heartbeat = {
+                "device": self.source_id,
+                "timestamp": datetime.now().isoformat(),
+                "off_wrist": True,
+                "awaiting_data": True,
+                "calibrating": False,
+            }
+            try:
+                self.redis.publish(CHANNEL_PHYSIO.format(src=self.source_id),
+                                   json.dumps(heartbeat))
+            except Exception:
+                pass
+            return
+
+        with self.lock:
             hr_raw = np.array(self.values["HeartRate"]).copy()
             eda_raw = np.array(self.values["EDA"]).copy()
 

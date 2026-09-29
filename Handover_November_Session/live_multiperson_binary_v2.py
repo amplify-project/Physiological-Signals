@@ -2838,7 +2838,9 @@ def draw_emotibit_sidebar(h, enrolled_names, emotibit_data, emotibit_lock,
                 if last_abs >= Z_HARD:
                     cv2.circle(sidebar, (int(xs[-1]), int(ys[-1])),
                                dot_r + 2, (255, 255, 255), 1, cv2.LINE_AA)
-            if not any_drawn:
+            if not any_drawn and not is_off_wrist:
+                # (off-wrist rows get the OFF-WRIST watermark below instead,
+                # so the two centered labels never overlap)
                 if not snap_metrics:
                     # Raw samples seen but no physio_metrics packet yet: the
                     # publisher's 1 Hz metrics loop hasn't started for this
