@@ -106,6 +106,45 @@ def auto_select_device(probe_sec=1.0, min_rms=1e-4):
     return idx
 
 
+def interactive_select_device():
+    """List input devices and let the user pick one (original Salsa Sound UX).
+
+    Returns the chosen device ID, or None for the system default (Enter).
+    Restricted to the default host API so each physical mic appears once
+    (Windows exposes MME/DirectSound/WASAPI/WDM-KS duplicates).
+    """
+    try:
+        default_idx = sd.default.device[0]
+        default_api = sd.query_devices(default_idx)['hostapi']
+    except Exception:
+        default_idx, default_api = None, None
+    _SKIP_NAMES = ('sound mapper', 'primary sound')
+
+    print("\nAvailable input devices:")
+    valid = set()
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev.get('max_input_channels', 0) < 1:
+            continue
+        if default_api is not None and dev.get('hostapi') != default_api:
+            continue
+        if any(s in dev['name'].lower() for s in _SKIP_NAMES):
+            continue
+        tag = "  (default)" if idx == default_idx else ""
+        print(f"  [{idx:2d}] {dev['name']}{tag}")
+        valid.add(idx)
+
+    while True:
+        try:
+            choice = input("Select input device ID (Enter = system default): ").strip()
+        except EOFError:
+            return None
+        if not choice:
+            return None
+        if choice.isdigit() and int(choice) in valid:
+            return int(choice)
+        print(f"  Invalid ID '{choice}' - pick one of the listed IDs or press Enter.")
+
+
 class MusicDetector:
     def __init__(self, model_path, music_class=YAMNET_MUSIC_CLASS):
         self.session = ort.InferenceSession(model_path)
@@ -231,9 +270,12 @@ def main():
         print(sd.query_devices())
         return
 
-    if args.auto_device and args.device is None:
-        print("Auto-selecting input device (make some noise near the mic)...")
-        args.device = auto_select_device()
+    if args.device is None:
+        if args.auto_device:
+            print("Auto-selecting input device (make some noise near the mic)...")
+            args.device = auto_select_device()
+        else:
+            args.device = interactive_select_device()
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
