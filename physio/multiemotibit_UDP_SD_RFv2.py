@@ -148,6 +148,14 @@ EMOTIBIT_TCP_PORT     = 3133
 DISCOVERY_TIMEOUT_S   = 20
 RECONNECT_TIMEOUT_S   = 8     # non-interactive re-discovery window for runtime reconnects
 HEARTBEAT_INTERVAL_S  = 1
+# Auto-reconnect watchdog. Off-wrist units keep streaming junk, so packet
+# silence (not signal quality) is the disconnect tell. 15 s rides out Wi-Fi
+# blips that self-heal on their own; the backoff stops a permanently dead unit
+# from re-triggering the 8 s discovery scan (which pauses heartbeats) all night.
+WATCHDOG_POLL_S          = 5
+STALE_AFTER_S            = 15
+AUTO_RECONNECT_MIN_GAP_S = 30
+AUTO_RECONNECT_MAX_GAP_S = 120
 
 # EmotiBit type-tag ’ canonical stream name
 TYPE_TAG_MAP = {
@@ -873,11 +881,30 @@ class DeviceAggregator:
 
     def process_window(self):
         processing_start = time.time()  # Start latency measurement
-        
-        with self.lock:
-            if len(self.values["HeartRate"]) < 10 or len(self.values["EDA"]) < 10:
-                return
 
+        with self.lock:
+            awaiting_data = (len(self.values["HeartRate"]) < 10
+                             or len(self.values["EDA"]) < 10)
+        if awaiting_data:
+            # Connected but no plausible HR+EDA yet (typically powered on but
+            # not worn). Publish a 1 Hz presence heartbeat so the GUI draws a
+            # greyed OFF-WRIST row for every detected sensor instead of the
+            # panic-inducing "No EmotiBits connected".
+            heartbeat = {
+                "device": self.source_id,
+                "timestamp": datetime.now().isoformat(),
+                "off_wrist": True,
+                "awaiting_data": True,
+                "calibrating": False,
+            }
+            try:
+                self.redis.publish(CHANNEL_PHYSIO.format(src=self.source_id),
+                                   json.dumps(heartbeat))
+            except Exception:
+                pass
+            return
+
+        with self.lock:
             hr_raw = np.array(self.values["HeartRate"]).copy()
             eda_raw = np.array(self.values["EDA"]).copy()
 
@@ -1577,12 +1604,14 @@ def main():
     # Create one DeviceAggregator per discovered device
     device_aggs = {}   # ip ’ DeviceAggregator
     agg_list    = []
+    last_packet_ts = {}  # ip -> last UDP packet arrival (watchdog liveness)
     for dev_ip, dev_id in discovered.items():
         src_label = dev_id if dev_id != "unknown" else dev_ip.replace('.', '_')
         agg = DeviceAggregator(src_label, clf_val, clf_aro, r,
                                all_signal_types=signal_types)
         device_aggs[dev_ip] = agg
         agg_list.append(agg)
+        last_packet_ts[dev_ip] = time.time()
 
     # ---- HEARTBEAT ----
 
@@ -1666,10 +1695,25 @@ def main():
             finally:
                 ctrl_sock.settimeout(1.0)
         new_count = 0
+        rekeyed = 0
         with agg_lock:
+            serial_to_ip = {d_id: d_ip for d_ip, d_id in discovered.items()
+                            if d_id != "unknown"}
             for ip, dev_id in found.items():
+                last_packet_ts[ip] = time.time()  # grace period before watchdog re-arms
                 if ip in device_aggs:
                     continue  # known device -- EC handshake already re-sent, streaming resumes
+                old_ip = serial_to_ip.get(dev_id)
+                if old_ip is not None and old_ip in device_aggs:
+                    # Same serial back on a new DHCP IP: re-key the existing
+                    # aggregator so the wearer's calibrated baseline survives.
+                    device_aggs[ip] = device_aggs.pop(old_ip)
+                    discovered.pop(old_ip, None)
+                    discovered[ip] = dev_id
+                    last_packet_ts.pop(old_ip, None)
+                    rekeyed += 1
+                    print(f"[RECONNECT] {dev_id} re-joined on new IP {ip} (was {old_ip}) - baseline kept")
+                    continue
                 src_label = dev_id if dev_id != "unknown" else ip.replace('.', '_')
                 agg = DeviceAggregator(src_label, clf_val, clf_aro, r,
                                        all_signal_types=signal_types)
@@ -1679,11 +1723,14 @@ def main():
                 discovered[ip] = dev_id
                 new_count += 1
                 print(f"[RECONNECT] new device online: {ip} (ID: {dev_id}) - fresh baseline")
-        print(f"[RECONNECT] done. {len(found)} device(s) responded, {new_count} new.")
-        log.info('reconnect_done', extra={'responded': len(found), 'new': new_count})
+        print(f"[RECONNECT] done. {len(found)} device(s) responded, "
+              f"{new_count} new, {rekeyed} re-keyed.")
+        log.info('reconnect_done', extra={'responded': len(found), 'new': new_count,
+                                          'rekeyed': rekeyed})
         try:
             r.publish(CHANNEL_RECONNECT_STATUS,
                       json.dumps({'responded': len(found), 'new': new_count,
+                                  'rekeyed': rekeyed, 'trigger': trigger,
                                   'ts': time.time()}))
         except Exception:
             pass
@@ -1703,6 +1750,34 @@ def main():
 
     threading.Thread(target=reconnect_listener_thread, daemon=True).start()
 
+    # ---- AUTO-RECONNECT WATCHDOG ----
+    # Automates the GUI reconnect button: sustained UDP silence from a known
+    # device (off-wrist units never go silent, so silence = real drop) triggers
+    # the same do_reconnect() the button uses, with exponential backoff.
+    def watchdog_thread():
+        gap = AUTO_RECONNECT_MIN_GAP_S
+        last_attempt = 0.0
+        while not stop_flag.is_set():
+            time.sleep(WATCHDOG_POLL_S)
+            now = time.time()
+            with agg_lock:
+                stale = {ip: discovered.get(ip, ip)
+                         for ip, ts in last_packet_ts.items()
+                         if ip in device_aggs and now - ts > STALE_AFTER_S}
+            if not stale:
+                gap = AUTO_RECONNECT_MIN_GAP_S
+                continue
+            if now - last_attempt < gap:
+                continue
+            print(f"[WATCHDOG] no data from {', '.join(stale.values())} "
+                  f"for >{STALE_AFTER_S}s - auto-reconnecting")
+            log.info('watchdog_stale', extra={'stale': list(stale.values())})
+            last_attempt = now
+            do_reconnect(trigger='watchdog')
+            gap = min(gap * 2, AUTO_RECONNECT_MAX_GAP_S)
+
+    threading.Thread(target=watchdog_thread, daemon=True).start()
+
     # ---- UDP RECEIVE THREAD ----
     def udp_thread():
         while not stop_flag.is_set():
@@ -1721,6 +1796,8 @@ def main():
                 agg = device_aggs.get(src_ip)
                 if agg is None:
                     continue
+
+                last_packet_ts[src_ip] = time.time()
 
                 text = data.decode('ascii', errors='ignore')
 

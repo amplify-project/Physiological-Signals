@@ -2,15 +2,18 @@
 
 Real-time audience engagement estimation for live performances using pose-based machine learning and EmotiBit physiological signal processing.
 
+> **Release V3.4 — Oct–Dec Concerts lightweight bundle (2026-10):**
+> - **Bundle renamed `Handover_Oct-Dec_Concerts/`** (formerly `Handover_November_Session/`) and slimmed for handover: the `.venv`, session recordings/logs, face enrollments and all SETUP-downloadable public weights were removed — `SETUP.bat` recreates everything. The custom AMPLIFY weights remain included.
+
 > **Release V3.3 — Abstract Particle-Mesh Panel & Self-Contained Handover (2026-09):**
-> *(landed in the `Handover_November_Session/` bundle — formerly `Handover_PostSeptSession/`)*
+> *(landed in the `Handover_Oct-Dec_Concerts/` bundle — formerly `Handover_November_Session/`, `Handover_PostSeptSession/`)*
 > - **Abstract particle-mesh visualisation in the GUI sidebar** — a cv2/NumPy port of the AR glasses' Unity `ParticleMeshVisualizer` (RayNeo X3 Pro, XR Score Viewer v010alpha9): per wearer, a 5×5 yellow-green particle grid with green-shaded mesh cells whose slow form tracks tonic EDA, colour waves/trails track temperature RoC, ring “explosions” track SCR frequency, particle size/pulse + blue corner halos track heart rate, and dispersion tracks engagement — so the operator sees exactly what the glasses wearer sees. Full guide: [docs/abstract_mapping_guide.md](docs/abstract_mapping_guide.md).
 > - **Panel interaction** — per-panel orbit drag, wheel / arrow-key zoom, right-click view reset, and drag-to-resize on each panel's bottom border.
 > - **Mock-signal hotkeys** — `T/W/S/H/G` push each physiological channel to ±2.5 SD (Shift = negative) with a ~2.5 s decay, `E` injects a single SCR ring event, `X` clears — for demoing/verifying the visual without a wearer. Mocks never touch the ±SD splines, Redis, or logs.
-> - **`Handover_November_Session/` self-contained bundle** — end-user handover: sources, launchers, bundled Redis, pinned requirements, and **all custom AMPLIFY model weights included** (engagement checkpoint, valence/arousal RF models, audio models). `SETUP.bat` builds the venv and downloads the remaining public weights — nothing has to be requested separately.
+> - **`Handover_Oct-Dec_Concerts/` self-contained bundle** — end-user handover: sources, launchers, bundled Redis, pinned requirements, and **all custom AMPLIFY model weights included** (engagement checkpoint, valence/arousal RF models, audio models). `SETUP.bat` builds the venv and downloads the remaining public weights — nothing has to be requested separately.
 
 > **Release V3.2 — Fused Dual-Camera Scoring & Networked Redis (2026-11):**
-> *(landed in the former `Handover_SeptSession/` reference build, superseded by `Handover_November_Session/`)*
+> *(landed in the former `Handover_SeptSession/` reference build, superseded by `Handover_Oct-Dec_Concerts/`)*
 > - **One fused engagement score per person across both cameras** — in dual-camera mode a registered person seen on both feeds previously got a value that flipped between the two independent pipelines. Sightings are now merged by EmotiBit serial into a **single reliability-weighted, temporally-smoothed score** (fuller buffer + more confident identity weigh more), shown identically on both overlays and published once on `device:{serial}:engagement`.
 > - **Redis as a true network hub, with zero-config discovery** — `1_START_REDIS.bat` on the hub now also launches Bryan's mDNS advertiser (`_amplify-redis._tcp.local.`), and the EmotiBit publisher + engagement GUI default to `--redis-host auto`, discovering the hub over the network (env `REDIS_HOST` and an explicit `--redis-host <ip>` still override; `--no-discover` opts out). So physio + engagement clients on one laptop reach a Redis broker on another PC with **no IP typing**. The bundled `redis.windows.conf` ships `protected-mode no` (trusted-LAN only) so remote clients are accepted.
 > - **Bandwidth-aware dual-camera resolution (4K-capable, not 1080p-capped)** — two USB cameras on one bus are opened together, their **concurrent** frame rate measured, and the highest sustainable mode kept (4K → 1440p → 1080p → 720p). If the shared bus can't sustain it, the app steps down and advises putting each camera on its **own USB controller** (powered hubs don't help).
@@ -42,7 +45,7 @@ Work should proceed from Sowmya's `amplify-project/Physiological-Signals` remote
 - Sowmya's newer EmotiBit physiological pipeline is now the project-level Physio implementation in `physio/multiemotibit_UDP_SD_RFv2.py`.
 - Will's real-time audio classification (music + singing detection) is now the project-level implementation in `audio/` (script, config, YamNet ONNX + singing-head models).
 - The multiperson GUI consumes the new physiological standard-deviation stream (`eda_sd` and `hr_sd`) from `device:{serial}:physio_metrics`.
-- `Handover_November_Session/` is the single current handover bundle (self-contained: sources, launchers, bundled Redis, and all AMPLIFY model weights; `SETUP.bat` installs the venv and public weights). Earlier `Handover_*Session` folders have been removed.
+- `Handover_Oct-Dec_Concerts/` is the single current handover bundle (self-contained: sources, launchers, bundled Redis, and all AMPLIFY model weights; `SETUP.bat` installs the venv and public weights). Earlier `Handover_*Session` folders have been removed.
 
 In short: clone and work from this repository for future changes to either the vision or physiological parts of the pipeline.
 
