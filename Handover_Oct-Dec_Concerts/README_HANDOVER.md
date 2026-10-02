@@ -1,6 +1,6 @@
 # Concert Engagement AR System — Full Handover
 
-> **V3 — November 2026 (`Handover_November_Session`)**
+> **V3.4 — Oct–Dec 2026 Concerts (`Handover_Oct-Dec_Concerts`)**
 > Contains the complete real-time engagement pipeline: computer vision inference, physiological signal processing (EmotiBit), the abstract particle-mesh visualisation (mirroring the AR glasses), audio monitoring, Redis pub/sub streaming, and the Unity C# subscriber for AR glasses.
 
 This is a **self-contained bundle**: no virtual environment and no installed packages, but **all model weights are included** — the custom AMPLIFY weights ship inside the bundle and the public ones are fetched automatically. Run **`SETUP.bat`** once — it creates the venv, installs every pinned dependency, downloads the public weights, and verifies every model file is in place.
@@ -10,7 +10,7 @@ This is a **self-contained bundle**: no virtual environment and no installed pac
 ## 📦 Contents
 
 ```
-Handover_November_Session/
+Handover_Oct-Dec_Concerts/
 ├── SETUP.bat                        ← Run this ONCE on first install
 ├── 1_START_REDIS.bat                ← Step 1 (hub PC): start Redis + mDNS advertiser (one window each)
 ├── 1B_START_REDIS_ADVERTISER.bat    ← Optional: run the advertiser on its own (1_START_REDIS already launches it)
